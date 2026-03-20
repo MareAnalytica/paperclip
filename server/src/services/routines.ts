@@ -1016,7 +1016,14 @@ export function routineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeup
       const secretValue = await resolveTriggerSecret(trigger, routine.companyId);
       if (trigger.signingMode === "bearer") {
         const expected = `Bearer ${secretValue}`;
-        if (!input.authorizationHeader || input.authorizationHeader.trim() !== expected) {
+        const provided = input.authorizationHeader?.trim() ?? "";
+        const expectedBuf = Buffer.from(expected);
+        const providedBuf = Buffer.alloc(expectedBuf.length);
+        providedBuf.write(provided.slice(0, expectedBuf.length));
+        const valid =
+          provided.length === expected.length &&
+          crypto.timingSafeEqual(providedBuf, expectedBuf);
+        if (!valid) {
           throw unauthorized();
         }
       } else {
