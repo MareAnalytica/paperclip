@@ -1,0 +1,176 @@
+# Default deny all ingress and egress for all pods in the namespace
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: paperclip
+  labels:
+    app: paperclip
+    app.kubernetes.io/name: paperclip
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+---
+# Allow ingress from ingress-nginx namespace to paperclip pods on port 3100
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-ingress-from-nginx
+  namespace: paperclip
+  labels:
+    app: paperclip
+    app.kubernetes.io/name: paperclip
+spec:
+  podSelector:
+    matchLabels:
+      app: paperclip
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+      ports:
+        - protocol: TCP
+          port: 3100
+---
+# Allow egress to kube-system for DNS (port 53 TCP+UDP)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-egress-dns
+  namespace: paperclip
+  labels:
+    app: paperclip
+    app.kubernetes.io/name: paperclip
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: TCP
+          port: 53
+        - protocol: UDP
+          port: 53
+---
+# Allow egress to K8s API server on port 6443
+# Uses 0.0.0.0/0 with port restriction because API server IP varies across clusters
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-egress-k8s-api
+  namespace: paperclip
+  labels:
+    app: paperclip
+    app.kubernetes.io/name: paperclip
+spec:
+  podSelector:
+    matchLabels:
+      app: paperclip
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - protocol: TCP
+          port: 6443
+---
+# Allow egress on port 443 for LLM API calls (Anthropic, OpenAI, etc.)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-egress-https
+  namespace: paperclip
+  labels:
+    app: paperclip
+    app.kubernetes.io/name: paperclip
+spec:
+  podSelector:
+    matchLabels:
+      app: paperclip
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - protocol: TCP
+          port: 443
+---
+# Allow paperclip pods to reach paperclip-db on port 5432
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-db-from-paperclip
+  namespace: paperclip
+  labels:
+    app: paperclip
+    app.kubernetes.io/name: paperclip
+spec:
+  podSelector:
+    matchLabels:
+      app: paperclip-db
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: paperclip
+      ports:
+        - protocol: TCP
+          port: 5432
+---
+# Also allow paperclip app egress to the DB (needed due to default-deny egress)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-egress-db
+  namespace: paperclip
+  labels:
+    app: paperclip
+    app.kubernetes.io/name: paperclip
+spec:
+  podSelector:
+    matchLabels:
+      app: paperclip
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app: paperclip-db
+      ports:
+        - protocol: TCP
+          port: 5432
+---
+# Allow ingress from monitoring namespace for Prometheus scraping
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-monitoring
+  namespace: paperclip
+  labels:
+    app: paperclip
+    app.kubernetes.io/name: paperclip
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring

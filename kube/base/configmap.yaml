@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: paperclip-config
+  namespace: paperclip
+  labels:
+    app: paperclip
+    app.kubernetes.io/name: paperclip
+data:
+  PORT: "3100"
+  LOG_LEVEL: "info"
+  NODE_ENV: "production"

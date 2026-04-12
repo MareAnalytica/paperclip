@@ -1,0 +1,139 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: paperclip
+  namespace: paperclip
+  labels:
+    app: paperclip
+    app.kubernetes.io/name: paperclip
+    app.kubernetes.io/component: web
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: paperclip
+  template:
+    metadata:
+      labels:
+        app: paperclip
+        app.kubernetes.io/name: paperclip
+        app.kubernetes.io/component: web
+    spec:
+      serviceAccountName: paperclip-sa
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: paperclip
+          image: registry.mareanalytica.com/paperclip:latest
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 3100
+              protocol: TCP
+          env:
+            - name: NODE_OPTIONS
+              value: "--max-old-space-size=1536"
+            - name: DATABASE_URL
+              value: "postgresql://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@paperclip-db.paperclip.svc.cluster.local:5432/$(POSTGRES_DB)"
+            - name: PAPERCLIP_ALLOWED_HOSTNAMES
+              value: "paperclip.mareanalytica.com,paperclip-dev.mareanalytica.com"
+            - name: BETTER_AUTH_BASE_URL
+              value: "https://paperclip.mareanalytica.com"
+          envFrom:
+            - configMapRef:
+                name: paperclip-config
+            - secretRef:
+                name: paperclip-secrets
+            - secretRef:
+                name: paperclip-db-credentials
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+          readinessProbe:
+            tcpSocket:
+              port: 3100
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            tcpSocket:
+              port: 3100
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            failureThreshold: 5
+          startupProbe:
+            tcpSocket:
+              port: 3100
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 30
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: data
+              mountPath: /app/data
+            - name: paperclip-home
+              mountPath: /paperclip
+            - name: sa-token
+              mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+              readOnly: true
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 100Mi
+        - name: data
+          emptyDir:
+            sizeLimit: 500Mi
+        - name: paperclip-home
+          emptyDir:
+            sizeLimit: 1Gi
+        - name: sa-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  expirationSeconds: 3600
+                  path: token
+              - configMap:
+                  name: kube-root-ca.crt
+                  items:
+                    - key: ca.crt
+                      path: ca.crt
+              - downwardAPI:
+                  items:
+                    - path: namespace
+                      fieldRef:
+                        fieldPath: metadata.namespace
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: paperclip
+  namespace: paperclip
+  labels:
+    app: paperclip
+    app.kubernetes.io/name: paperclip
+    app.kubernetes.io/component: web
+spec:
+  type: ClusterIP
+  selector:
+    app: paperclip
+  ports:
+    - name: http
+      port: 3100
+      targetPort: 3100
+      protocol: TCP

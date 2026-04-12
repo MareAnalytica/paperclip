@@ -1,0 +1,18 @@
+name: Documentation Pipeline
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      full_generation:
+        type: boolean
+        default: false
+        description: "Generate all pages (not just changed packages)"
+
+jobs:
+  docs:
+    uses: MareAnalytica/doc-pipeline/.github/workflows/doc-pipeline.yml@main
+    with:
+      full_generation: ${{ inputs.full_generation || false }}
+    secrets: inherit

@@ -1,0 +1,37 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: paperclip
+  namespace: paperclip
+  labels:
+    app: paperclip
+    app.kubernetes.io/name: paperclip
+  annotations:
+    # TLS via cert-manager
+    cert-manager.io/cluster-issuer: mareanalytica-ca
+    # SSE timeout support (ADR-007)
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "300"
+    # SSL enforcement
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+    # Security headers (using server-snippet-free annotations)
+    nginx.ingress.kubernetes.io/enable-modsecurity: "false"
+    nginx.ingress.kubernetes.io/custom-http-errors: "502,503"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - paperclip.mareanalytica.com
+      secretName: paperclip-tls
+  rules:
+    - host: paperclip.mareanalytica.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: paperclip
+                port:
+                  number: 3100
