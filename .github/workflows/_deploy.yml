@@ -1,0 +1,96 @@
+# .github/workflows/_deploy.yml
+# ─────────────────────────────────────────────────────────────
+# Reusable workflow: deploy to Kubernetes using a kustomize overlay.
+# Assumes the selected runner already has kubectl credentials.
+# Copy this file as-is into any repo — no project-specific values.
+# ─────────────────────────────────────────────────────────────
+name: Deploy to k3s
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: "Target environment: 'dev' or 'prod'"
+        required: true
+        type: string
+      namespace:
+        description: "Kubernetes namespace to deploy into"
+        required: true
+        type: string
+      overlay_path:
+        description: "Path to kustomize overlay directory. Defaults to kube/overlays/<environment>."
+        required: false
+        type: string
+        default: ""
+      deployments:
+        description: >
+          Comma-separated list of Deployment names to rollout restart
+          (e.g. "frontend,backend,worker")
+        required: true
+        type: string
+      rollout_timeout:
+        description: "Timeout for each deployment rollout"
+        required: false
+        type: string
+        default: "300s"
+
+jobs:
+  deploy:
+    runs-on: arc-runner-set
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install kubectl
+        run: |
+          set -euo pipefail
+          curl -LO "https://dl.k8s.io/release/$(curl -Ls https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+          kubectl version --client
+
+      - name: Verify kubectl access
+        run: |
+          set -euo pipefail
+          echo "Checking kubectl via ServiceAccount..."
+          kubectl cluster-info
+          echo "✓ kubectl connected"
+
+      - name: Resolve overlay path
+        id: overlay
+        run: |
+          path="${{ inputs.overlay_path }}"
+          if [ -z "${path}" ]; then
+            path="kube/overlays/${{ inputs.environment }}"
+          fi
+          echo "path=${path}" >> "$GITHUB_OUTPUT"
+
+      - name: Apply kustomize overlay (${{ inputs.environment }})
+        run: |
+          set -euo pipefail
+          echo "Deploying: ${{ steps.overlay.outputs.path }} → namespace ${{ inputs.namespace }}"
+          kubectl apply -k "${{ steps.overlay.outputs.path }}"
+
+      - name: Rollout restart deployments
+        run: |
+          set -euo pipefail
+          NS="${{ inputs.namespace }}"
+          IFS=',' read -ra DEPS <<< "${{ inputs.deployments }}"
+          echo "Restarting ${#DEPS[@]} deployment(s) in namespace ${NS}"
+          for dep in "${DEPS[@]}"; do
+            dep="$(echo "${dep}" | xargs)"
+            echo "  → restarting ${dep}"
+            kubectl -n "${NS}" rollout restart "deployment/${dep}"
+          done
+
+      - name: Wait for rollout
+        run: |
+          set -euo pipefail
+          NS="${{ inputs.namespace }}"
+          IFS=',' read -ra DEPS <<< "${{ inputs.deployments }}"
+          for dep in "${DEPS[@]}"; do
+            dep="$(echo "${dep}" | xargs)"
+            echo "Waiting for ${dep}..."
+            kubectl -n "${NS}" rollout status "deployment/${dep}" --timeout=${{ inputs.rollout_timeout }}
+          done
+          echo "✓ All deployments rolled out in ${NS}"

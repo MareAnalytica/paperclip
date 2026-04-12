@@ -1,0 +1,85 @@
+# .github/workflows/_build.yml
+# ─────────────────────────────────────────────────────────────
+# Reusable workflow: build Docker images and push to in-cluster
+# registry. Runs on ARC (k3s) with Docker-in-Docker.
+# Copy this file as-is into any repo — no project-specific values.
+# ─────────────────────────────────────────────────────────────
+name: Build Images
+
+on:
+  workflow_call:
+    inputs:
+      images:
+        description: >
+          JSON array of images to build.
+          Each object: { "name": "<image-name>", "context": "<build-context>", "dockerfile": "<path>" }
+        required: true
+        type: string
+      registry:
+        description: "Registry host:port (in-cluster or external)"
+        required: false
+        type: string
+        default: "${{ vars.DOCKER_REGISTRY_HOST }}"
+      filter:
+        description: "Optional substring filter — only build images whose name contains this. Empty = all."
+        required: false
+        type: string
+        default: ""
+
+jobs:
+  build:
+    runs-on: arc-runner-set
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Wait for Docker (DinD)
+        run: |
+          echo "Waiting for Docker daemon..."
+          for i in $(seq 1 30); do
+            docker info > /dev/null 2>&1 && break
+            echo "  attempt ${i}/30..."
+            sleep 2
+          done
+          docker info > /dev/null 2>&1 || { echo "Docker not ready after 60s"; exit 1; }
+          echo "✓ Docker is ready"
+
+      - name: Verify registry connectivity
+        run: |
+          set -euo pipefail
+          echo "Testing registry at ${{ inputs.registry }}..."
+          curl -sf --cacert /etc/ssl/certs/registry-ca.crt https://${{ inputs.registry }}/v2/ > /dev/null && echo "✓ Registry reachable"
+
+      - name: Build and push images
+        env:
+          IMAGES_JSON: ${{ inputs.images }}
+          REGISTRY: ${{ inputs.registry }}
+          FILTER: ${{ inputs.filter }}
+        run: |
+          set -euo pipefail
+
+          mapfile -t NAMES       < <(echo "${IMAGES_JSON}" | jq -r '.[].name')
+          mapfile -t CONTEXTS    < <(echo "${IMAGES_JSON}" | jq -r '.[].context')
+          mapfile -t DOCKERFILES < <(echo "${IMAGES_JSON}" | jq -r '.[].dockerfile')
+
+          for i in "${!NAMES[@]}"; do
+            name="${NAMES[$i]}"
+            context="${CONTEXTS[$i]}"
+            dockerfile="${DOCKERFILES[$i]}"
+
+            if [ -n "${FILTER}" ] && [[ "${name}" != *"${FILTER}"* ]]; then
+              echo "⏭  Skipping ${name} (filter: ${FILTER})"
+              continue
+            fi
+
+            tag="${REGISTRY}/${name}:latest"
+            echo "══════════════════════════════════════════"
+            echo "Building ${name} → ${tag}"
+            echo "  context:    ${context}"
+            echo "  dockerfile: ${dockerfile}"
+            echo "══════════════════════════════════════════"
+            docker build -t "${tag}" -f "${dockerfile}" "${context}"
+            docker push "${tag}"
+            echo "✓ ${name} pushed"
+            echo ""
+          done

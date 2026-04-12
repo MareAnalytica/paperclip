@@ -1,0 +1,54 @@
+{
+  "engineering": {
+    "name": "Engineering",
+    "description": "Software development, architecture, and technical implementation"
+  },
+  "marketing": {
+    "name": "Marketing",
+    "description": "Marketing strategy, campaigns, and brand management"
+  },
+  "sales": {
+    "name": "Sales",
+    "description": "Sales operations, lead generation, and client acquisition"
+  },
+  "testing": {
+    "name": "Testing",
+    "description": "Quality assurance, test automation, and validation"
+  },
+  "design": {
+    "name": "Design",
+    "description": "UI/UX design, visual design, and design systems"
+  },
+  "support": {
+    "name": "Support",
+    "description": "Customer support, technical assistance, and issue resolution"
+  },
+  "product": {
+    "name": "Product",
+    "description": "Product management, roadmap planning, and feature prioritization"
+  },
+  "operations": {
+    "name": "Operations",
+    "description": "Business operations, process management, and operational efficiency"
+  },
+  "research": {
+    "name": "Research",
+    "description": "Research and development, experimentation, and innovation"
+  },
+  "data": {
+    "name": "Data",
+    "description": "Data engineering, analytics, and data science"
+  },
+  "security": {
+    "name": "Security",
+    "description": "Information security, compliance, and threat management"
+  },
+  "content": {
+    "name": "Content",
+    "description": "Content creation, copywriting, and editorial management"
+  },
+  "infrastructure": {
+    "name": "Infrastructure",
+    "description": "Cloud infrastructure, DevOps, and platform engineering"
+  }
+}

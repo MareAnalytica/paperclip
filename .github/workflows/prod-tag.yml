@@ -1,0 +1,28 @@
+# .github/workflows/prod-tag.yml
+# ─────────────────────────────────────────────────────────────
+# Tag v* → build all images → deploy to prod (paperclip namespace).
+# ─────────────────────────────────────────────────────────────
+name: Release → Prod
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    uses: ./.github/workflows/_build.yml
+    with:
+      images: >-
+        [
+          { "name": "paperclip", "context": ".", "dockerfile": "./Dockerfile" }
+        ]
+      registry: ${{ vars.DOCKER_REGISTRY_HOST }}
+
+  deploy:
+    needs: build
+    uses: ./.github/workflows/_deploy.yml
+    with:
+      environment: prod
+      namespace: paperclip
+      deployments: "paperclip"
+      rollout_timeout: "600s"

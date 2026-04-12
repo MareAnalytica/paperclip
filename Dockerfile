@@ -37,7 +37,13 @@ RUN test -f server/dist/index.js || (echo "ERROR: server build output missing" &
 FROM base AS production
 WORKDIR /app
 COPY --chown=node:node --from=build /app /app
+ARG KUBECTL_VERSION=v1.34.4
 RUN npm install --global --omit=dev @anthropic-ai/claude-code@latest @openai/codex@latest opencode-ai \
+  && curl -fsSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl" -o /usr/local/bin/kubectl \
+  && curl -fsSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl.sha256" -o /tmp/kubectl.sha256 \
+  && echo "$(cat /tmp/kubectl.sha256)  /usr/local/bin/kubectl" | sha256sum -c - \
+  && chmod +x /usr/local/bin/kubectl \
+  && rm /tmp/kubectl.sha256 \
   && mkdir -p /paperclip \
   && chown node:node /paperclip
 

@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: paperclip
+  labels:
+    app.kubernetes.io/name: paperclip
+    environment: prod
+    monitoring: "true"
+    # Pod Security Standards
+    # enforce=baseline: Paperclip requires SA token mount for kubectl (ADR-002)
+    pod-security.kubernetes.io/enforce: baseline
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/warn-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/audit-version: latest

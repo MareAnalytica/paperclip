@@ -1,0 +1,32 @@
+# .github/workflows/dev-push.yml
+# ─────────────────────────────────────────────────────────────
+# Push to main → build all images → deploy to dev (paperclip-dev namespace).
+# ─────────────────────────────────────────────────────────────
+name: CI → Dev
+
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: dev-push-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    uses: ./.github/workflows/_build.yml
+    with:
+      images: >-
+        [
+          { "name": "paperclip", "context": ".", "dockerfile": "./Dockerfile" }
+        ]
+      registry: ${{ vars.DOCKER_REGISTRY_HOST }}
+
+  deploy:
+    needs: build
+    uses: ./.github/workflows/_deploy.yml
+    with:
+      environment: dev
+      namespace: paperclip-dev
+      deployments: "paperclip"
+      rollout_timeout: "600s"

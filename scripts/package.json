@@ -1,0 +1,23 @@
+{
+  "name": "paperclip-agent-seeder",
+  "version": "1.0.0",
+  "description": "Seed script to import agency-agents definitions into Paperclip AI",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "seed": "tsx seed-agents.ts",
+    "seed:dry-run": "DRY_RUN=true tsx seed-agents.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "gray-matter": "^4.0.3"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0",
+    "tsx": "^4.19.0",
+    "@types/node": "^22.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
