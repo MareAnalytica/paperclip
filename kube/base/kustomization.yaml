@@ -14,6 +14,7 @@ resources:
   - configmap.yaml
   - limitrange.yaml
   - postgres-statefulset.yaml
+  - pvc.yaml
   - deployment.yaml
   - ingress.yaml
   - networkpolicies.yaml
