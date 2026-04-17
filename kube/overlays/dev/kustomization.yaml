@@ -65,10 +65,10 @@ patches:
                     value: "https://paperclip-dev.mareanalytica.com"
                 resources:
                   requests:
-                    memory: "128Mi"
+                    memory: "256Mi"
                     cpu: "50m"
                   limits:
-                    memory: "512Mi"
+                    memory: "2Gi"
                     cpu: "500m"
 
   # Reduce PostgreSQL StatefulSet resources for dev

@@ -100,8 +100,8 @@ spec:
           emptyDir:
             sizeLimit: 500Mi
         - name: paperclip-home
-          emptyDir:
-            sizeLimit: 1Gi
+          persistentVolumeClaim:
+            claimName: paperclip-home-pvc
         - name: sa-token
           projected:
             sources:
