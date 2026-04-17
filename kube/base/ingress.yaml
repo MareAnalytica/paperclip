@@ -7,23 +7,13 @@ metadata:
     app: paperclip
     app.kubernetes.io/name: paperclip
   annotations:
-    # TLS via cert-manager
-    cert-manager.io/cluster-issuer: mareanalytica-ca
-    # SSE timeout support (ADR-007)
-    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
-    nginx.ingress.kubernetes.io/proxy-send-timeout: "300"
-    # SSL enforcement
-    nginx.ingress.kubernetes.io/ssl-redirect: "true"
-    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
-    # Security headers (using server-snippet-free annotations)
-    nginx.ingress.kubernetes.io/enable-modsecurity: "false"
-    nginx.ingress.kubernetes.io/custom-http-errors: "502,503"
+    traefik.ingress.kubernetes.io/router.middlewares: kube-system-private-only@kubernetescrd
 spec:
-  ingressClassName: nginx
+  ingressClassName: traefik
   tls:
     - hosts:
         - paperclip.mareanalytica.com
-      secretName: paperclip-tls
+      secretName: wildcard-tls
   rules:
     - host: paperclip.mareanalytica.com
       http:

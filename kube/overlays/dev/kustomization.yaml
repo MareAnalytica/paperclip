@@ -25,7 +25,7 @@ patches:
         path: /metadata/labels/environment
         value: dev
 
-  # Override ingress host for dev
+  # Override ingress host for dev (wildcard-tls from base applies to all subdomains)
   - target:
       kind: Ingress
       name: paperclip
@@ -33,9 +33,6 @@ patches:
       - op: replace
         path: /spec/tls/0/hosts/0
         value: paperclip-dev.mareanalytica.com
-      - op: replace
-        path: /spec/tls/0/secretName
-        value: paperclip-dev-tls
       - op: replace
         path: /spec/rules/0/host
         value: paperclip-dev.mareanalytica.com
