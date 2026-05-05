@@ -26,4 +26,11 @@ if [ "$changed" = "1" ]; then
     chown -R node:node /paperclip
 fi
 
+
+# If Kubernetes already runs us as the target non-root UID/GID, gosu cannot switch
+# users under allowPrivilegeEscalation=false. Execute directly in that case.
+if [ "$(id -u)" -eq "$(id -u node)" ] && [ "$(id -g)" -eq "$(id -g node)" ]; then
+    exec "$@"
+fi
+
 exec gosu node "$@"
