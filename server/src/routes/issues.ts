@@ -3585,7 +3585,15 @@ export function issueRoutes(
       return;
     }
     assertCompanyAccess(req, issue.companyId);
-    if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
+    const isRoutedReviewerComment = req.body.mutationType === "routed_reviewer_comment";
+    if (isRoutedReviewerComment) {
+      if (req.actor.type !== "agent" || !req.actor.agentId) {
+        res.status(403).json({ error: "Routed reviewer comments require agent authentication" });
+        return;
+      }
+      const runId = requireAgentRunId(req, res);
+      if (!runId) return;
+    } else if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
     const closedExecutionWorkspace = await getClosedIssueExecutionWorkspace(issue);
     if (closedExecutionWorkspace) {
       respondClosedIssueExecutionWorkspace(res, closedExecutionWorkspace);
@@ -3685,6 +3693,10 @@ export function issueRoutes(
       agentId: actor.agentId ?? undefined,
       userId: actor.actorType === "user" ? actor.actorId : undefined,
       runId: actor.runId,
+      mutationType: req.body.mutationType ?? null,
+      routedReviewerOf: req.body.routedReviewerOf ?? null,
+      routingEvidenceLink: req.body.routingEvidenceLink ?? null,
+      routingMetadata: req.body.routingMetadata ?? null,
     });
     await issueReferencesSvc.syncComment(comment.id);
     const commentReferenceSummaryAfter = await issueReferencesSvc.listIssueReferenceSummary(currentIssue.id);
@@ -3715,6 +3727,13 @@ export function issueRoutes(
         ...(resumeRequested === true ? { resumeIntent: true, followUpRequested: true } : {}),
         ...(reopened ? { reopened: true, reopenedFrom: reopenFromStatus, source: "comment" } : {}),
         ...(interruptedRunId ? { interruptedRunId } : {}),
+        ...(req.body.mutationType === "routed_reviewer_comment"
+          ? {
+              mutationType: req.body.mutationType,
+              routedReviewerOf: req.body.routedReviewerOf ?? null,
+              routingEvidenceLink: req.body.routingEvidenceLink ?? null,
+            }
+          : {}),
         ...summarizeIssueReferenceActivityDetails({
           addedReferencedIssues: commentReferenceDiff.addedReferencedIssues.map(summarizeIssueRelationForActivity),
           removedReferencedIssues: commentReferenceDiff.removedReferencedIssues.map(summarizeIssueRelationForActivity),

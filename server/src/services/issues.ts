@@ -3722,7 +3722,7 @@ export function issueService(db: Db) {
     addComment: async (
       issueId: string,
       body: string,
-      actor: { agentId?: string; userId?: string; runId?: string | null },
+      actor: { agentId?: string; userId?: string; runId?: string | null; mutationType?: string | null; routedReviewerOf?: string | null; routingEvidenceLink?: string | null; routingMetadata?: Record<string, unknown> | null },
     ) => {
       const issue = await db
         .select({ companyId: issues.companyId })
@@ -3744,6 +3744,10 @@ export function issueService(db: Db) {
           authorAgentId: actor.agentId ?? null,
           authorUserId: actor.userId ?? null,
           createdByRunId: actor.runId ?? null,
+          mutationType: actor.mutationType ?? null,
+          routedReviewerOf: actor.routedReviewerOf ?? null,
+          routingEvidenceLink: actor.routingEvidenceLink ?? null,
+          routingMetadata: actor.routingMetadata ?? null,
           body: redactedBody,
         })
         .returning();

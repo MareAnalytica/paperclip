@@ -238,6 +238,18 @@ export const addIssueCommentSchema = z.object({
   reopen: z.boolean().optional(),
   resume: z.boolean().optional(),
   interrupt: z.boolean().optional(),
+  mutationType: z.enum(["routed_reviewer_comment"]).optional(),
+  routedReviewerOf: z.string().trim().min(1).max(128).optional(),
+  routingEvidenceLink: z.string().trim().min(1).max(512).optional(),
+  routingMetadata: z.record(z.unknown()).optional(),
+}).superRefine((value, ctx) => {
+  if (value.mutationType !== "routed_reviewer_comment") return;
+  if (!value.routedReviewerOf) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["routedReviewerOf"], message: "routedReviewerOf is required for routed reviewer comments" });
+  }
+  if (!value.routingEvidenceLink) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["routingEvidenceLink"], message: "routingEvidenceLink is required for routed reviewer comments" });
+  }
 });
 
 export type AddIssueComment = z.infer<typeof addIssueCommentSchema>;

@@ -453,6 +453,32 @@ describe("agent issue mutation checkout ownership", () => {
     expect(mockIssueService.addComment).not.toHaveBeenCalled();
   });
 
+  it("allows typed routed reviewer comments on another agent's issue with audit metadata", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "in_review", assigneeAgentId: ownerAgentId }));
+
+    const res = await request(await createApp(peerActor()))
+      .post(`/api/issues/${issueId}/comments`)
+      .send({
+        body: "Verdict: approve",
+        mutationType: "routed_reviewer_comment",
+        routedReviewerOf: "PAP-12",
+        routingEvidenceLink: "/PAP/issues/PAP-77#comment-routing",
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(mockIssueService.addComment).toHaveBeenCalledWith(
+      issueId,
+      "Verdict: approve",
+      expect.objectContaining({
+        agentId: peerAgentId,
+        runId: "66666666-6666-4666-8666-666666666666",
+        mutationType: "routed_reviewer_comment",
+        routedReviewerOf: "PAP-12",
+        routingEvidenceLink: "/PAP/issues/PAP-77#comment-routing",
+      }),
+    );
+  });
+
   it("allows same-company agent mutations on unassigned in-progress issues", async () => {
     mockIssueService.getById.mockResolvedValue(makeIssue({ assigneeAgentId: null }));
     mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
