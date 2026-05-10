@@ -314,3 +314,120 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
     ]));
   });
 });
+describeEmbeddedPostgres("issueService.listComments after-cursor pagination", () => {
+  let db!: ReturnType<typeof createDb>;
+  let svc!: ReturnType<typeof issueService>;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-issues-comments-pagination-");
+    db = createDb(tempDb.connectionString);
+    svc = issueService(db);
+  }, 20_000);
+
+  afterEach(async () => {
+    await db.delete(issueComments);
+    await db.delete(issues);
+    await db.delete(companies);
+  });
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  });
+
+  async function seedIssueWithComments() {
+    const companyId = randomUUID();
+    const issueId = randomUUID();
+    const commentIds = [randomUUID(), randomUUID(), randomUUID()];
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Comments pagination fixture",
+      status: "todo",
+      priority: "medium",
+    });
+
+    await db.insert(issueComments).values([
+      {
+        id: commentIds[0],
+        companyId,
+        issueId,
+        body: "first",
+        createdAt: new Date("2026-05-09T10:00:00.000Z"),
+        updatedAt: new Date("2026-05-09T10:00:00.000Z"),
+      },
+      {
+        id: commentIds[1],
+        companyId,
+        issueId,
+        body: "second",
+        createdAt: new Date("2026-05-09T11:00:00.000Z"),
+        updatedAt: new Date("2026-05-09T11:00:00.000Z"),
+      },
+      {
+        id: commentIds[2],
+        companyId,
+        issueId,
+        body: "third",
+        createdAt: new Date("2026-05-09T12:00:00.000Z"),
+        updatedAt: new Date("2026-05-09T12:00:00.000Z"),
+      },
+    ]);
+
+    return { companyId, issueId, commentIds };
+  }
+
+  it("returns later comments without a Date serialization error in asc order", async () => {
+    const { issueId, commentIds } = await seedIssueWithComments();
+
+    const page = await svc.listComments(issueId, {
+      order: "asc",
+      afterCommentId: commentIds[0],
+    });
+
+    expect(page.map((row) => row.id)).toEqual([commentIds[1], commentIds[2]]);
+    expect(page.map((row) => row.body)).toEqual(["second", "third"]);
+  });
+
+  it("returns earlier comments without a Date serialization error in desc order", async () => {
+    const { issueId, commentIds } = await seedIssueWithComments();
+
+    const page = await svc.listComments(issueId, {
+      order: "desc",
+      afterCommentId: commentIds[2],
+    });
+
+    expect(page.map((row) => row.id)).toEqual([commentIds[1], commentIds[0]]);
+    expect(page.map((row) => row.body)).toEqual(["second", "first"]);
+  });
+
+  it("returns an empty page when the cursor is the last comment in asc order", async () => {
+    const { issueId, commentIds } = await seedIssueWithComments();
+
+    const page = await svc.listComments(issueId, {
+      order: "asc",
+      afterCommentId: commentIds[2],
+    });
+
+    expect(page).toEqual([]);
+  });
+
+  it("returns an empty array when the cursor comment id does not exist", async () => {
+    const { issueId } = await seedIssueWithComments();
+
+    const page = await svc.listComments(issueId, {
+      order: "asc",
+      afterCommentId: randomUUID(),
+    });
+
+    expect(page).toEqual([]);
+  });
+});
