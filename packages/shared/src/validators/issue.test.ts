@@ -54,6 +54,34 @@ describe("issue validators", () => {
     expect(parsed.body).toBe("Progress update\n\nNext action.");
   });
 
+  it("requires mutationType when routed reviewer audit fields are present", () => {
+    const parsed = addIssueCommentSchema.safeParse({
+      body: "Verdict",
+      routedReviewerOf: "PAP-12",
+      routingEvidenceLink: "/PAP/issues/PAP-77#comment-routing",
+    });
+
+    expect(parsed.success).toBe(false);
+  });
+
+  it("accepts both legacy and v1 routed reviewer mutation types", () => {
+    const legacy = addIssueCommentSchema.parse({
+      body: "Legacy",
+      mutationType: "routed_reviewer_comment",
+      routedReviewerOf: "PAP-12",
+      routingEvidenceLink: "/PAP/issues/PAP-77#comment-routing",
+    });
+    const v1 = addIssueCommentSchema.parse({
+      body: "V1",
+      mutationType: "routed_reviewer_comment.v1",
+      routedReviewerOf: "PAP-12",
+      routingEvidenceLink: "/PAP/issues/PAP-77#comment-routing",
+    });
+
+    expect(legacy.mutationType).toBe("routed_reviewer_comment");
+    expect(v1.mutationType).toBe("routed_reviewer_comment.v1");
+  });
+
   it("normalizes escaped line breaks in generated task drafts", () => {
     const parsed = suggestedTaskDraftSchema.parse({
       clientKey: "task-1",

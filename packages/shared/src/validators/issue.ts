@@ -233,17 +233,34 @@ export const checkoutIssueSchema = z.object({
 
 export type CheckoutIssue = z.infer<typeof checkoutIssueSchema>;
 
-export const addIssueCommentSchema = z.object({
+const ROUTED_REVIEWER_COMMENT_MUTATION_TYPES = ["routed_reviewer_comment", "routed_reviewer_comment.v1"] as const;
+const routedReviewerCommentMutationTypeSchema = z.enum(ROUTED_REVIEWER_COMMENT_MUTATION_TYPES);
+
+export const addIssueCommentObjectSchema = z.object({
   body: multilineTextSchema.pipe(z.string().min(1)),
   reopen: z.boolean().optional(),
   resume: z.boolean().optional(),
   interrupt: z.boolean().optional(),
-  mutationType: z.enum(["routed_reviewer_comment"]).optional(),
+  mutationType: routedReviewerCommentMutationTypeSchema.optional(),
   routedReviewerOf: z.string().trim().min(1).max(128).optional(),
   routingEvidenceLink: z.string().trim().min(1).max(512).optional(),
   routingMetadata: z.record(z.unknown()).optional(),
-}).superRefine((value, ctx) => {
-  if (value.mutationType !== "routed_reviewer_comment") return;
+});
+
+export const addIssueCommentSchema = addIssueCommentObjectSchema.superRefine((value, ctx) => {
+  const hasRoutingAuditFields = value.routedReviewerOf !== undefined || value.routingEvidenceLink !== undefined;
+
+  if (!value.mutationType) {
+    if (hasRoutingAuditFields) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["mutationType"],
+        message: "mutationType is required when routedReviewerOf or routingEvidenceLink is provided",
+      });
+    }
+    return;
+  }
+
   if (!value.routedReviewerOf) {
     ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["routedReviewerOf"], message: "routedReviewerOf is required for routed reviewer comments" });
   }

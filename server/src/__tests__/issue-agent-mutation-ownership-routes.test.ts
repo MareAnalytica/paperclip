@@ -14,6 +14,7 @@ const mockIssueService = vi.hoisted(() => ({
   assertCheckoutOwner: vi.fn(),
   getAttachmentById: vi.fn(),
   getByIdentifier: vi.fn(),
+  getIdempotentComment: vi.fn(),
   getById: vi.fn(),
   getRelationSummaries: vi.fn(),
   getWakeableParentAfterChildCompletion: vi.fn(),
@@ -254,6 +255,7 @@ describe("agent issue mutation checkout ownership", () => {
     mockIssueService.assertCheckoutOwner.mockReset();
     mockIssueService.getAttachmentById.mockReset();
     mockIssueService.getByIdentifier.mockReset();
+    mockIssueService.getIdempotentComment.mockReset();
     mockIssueService.getById.mockReset();
     mockIssueService.getRelationSummaries.mockReset();
     mockIssueService.getWakeableParentAfterChildCompletion.mockReset();
@@ -285,6 +287,7 @@ describe("agent issue mutation checkout ownership", () => {
     mockCompanyService.getById.mockResolvedValue({ id: companyId, issuePrefix: "PAP" });
     mockIssueService.getById.mockResolvedValue(makeIssue());
     mockIssueService.getByIdentifier.mockResolvedValue(null);
+    mockIssueService.getIdempotentComment.mockResolvedValue(null);
     mockIssueService.assertCheckoutOwner.mockResolvedValue({ adoptedFromRunId: null });
     mockIssueService.getRelationSummaries.mockResolvedValue({ blockedBy: [], blocks: [] });
     mockIssueService.listWakeableBlockedDependents.mockResolvedValue([]);
@@ -460,7 +463,7 @@ describe("agent issue mutation checkout ownership", () => {
       .post(`/api/issues/${issueId}/comments`)
       .send({
         body: "Verdict: approve",
-        mutationType: "routed_reviewer_comment",
+        mutationType: "routed_reviewer_comment.v1",
         routedReviewerOf: "PAP-12",
         routingEvidenceLink: "/PAP/issues/PAP-77#comment-routing",
       });
@@ -472,11 +475,109 @@ describe("agent issue mutation checkout ownership", () => {
       expect.objectContaining({
         agentId: peerAgentId,
         runId: "66666666-6666-4666-8666-666666666666",
-        mutationType: "routed_reviewer_comment",
+        mutationType: "routed_reviewer_comment.v1",
         routedReviewerOf: "PAP-12",
         routingEvidenceLink: "/PAP/issues/PAP-77#comment-routing",
       }),
     );
+  });
+
+
+  it("rejects routed reviewer audit fields when mutationType is missing", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "in_review", assigneeAgentId: ownerAgentId }));
+
+    const res = await request(await createApp(peerActor()))
+      .post(`/api/issues/${issueId}/comments`)
+      .send({
+        body: "Verdict: approve",
+        routedReviewerOf: "PAP-12",
+        routingEvidenceLink: "/PAP/issues/PAP-77#comment-routing",
+      });
+
+    expect(res.status).toBe(400);
+    expect(mockIssueService.addComment).not.toHaveBeenCalled();
+  });
+
+  it("returns 200 and reuses the original routed reviewer comment on idempotent retry", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "in_review", assigneeAgentId: ownerAgentId }));
+    const existingComment = {
+      id: "88888888-8888-4888-8888-888888888888",
+      issueId,
+      companyId,
+      body: "Verdict: approve",
+    };
+    mockIssueService.getIdempotentComment
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(existingComment);
+
+    const app = await createApp(peerActor());
+
+    const first = await request(app)
+      .post(`/api/issues/${issueId}/comments`)
+      .set("Idempotency-Key", "retry-1")
+      .send({
+        body: "Verdict: approve",
+        mutationType: "routed_reviewer_comment",
+        routedReviewerOf: "PAP-12",
+        routingEvidenceLink: "/PAP/issues/PAP-77#comment-routing",
+      });
+
+    const second = await request(app)
+      .post(`/api/issues/${issueId}/comments`)
+      .set("Idempotency-Key", "retry-1")
+      .send({
+        body: "Verdict: approve",
+        mutationType: "routed_reviewer_comment",
+        routedReviewerOf: "PAP-12",
+        routingEvidenceLink: "/PAP/issues/PAP-77#comment-routing",
+      });
+
+    expect(first.status).toBe(201);
+    expect(second.status).toBe(200);
+    expect(second.body.id).toBe(existingComment.id);
+    expect(mockIssueService.addComment).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns 200 without replay metadata when service reports idempotent replay after insert conflict", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "in_review", assigneeAgentId: ownerAgentId }));
+    const existingComment = {
+      id: "99999999-9999-4999-8999-999999999999",
+      issueId,
+      companyId,
+      body: "Verdict: approve",
+    };
+    mockIssueService.getIdempotentComment.mockResolvedValue(null);
+    mockIssueService.addComment
+      .mockResolvedValueOnce(existingComment)
+      .mockResolvedValueOnce({ ...existingComment, __idempotentReplay: true });
+
+    const app = await createApp(peerActor());
+
+    const first = await request(app)
+      .post(`/api/issues/${issueId}/comments`)
+      .set("Idempotency-Key", "retry-race")
+      .send({
+        body: "Verdict: approve",
+        mutationType: "routed_reviewer_comment",
+        routedReviewerOf: "PAP-12",
+        routingEvidenceLink: "/PAP/issues/PAP-77#comment-routing",
+      });
+
+    const second = await request(app)
+      .post(`/api/issues/${issueId}/comments`)
+      .set("Idempotency-Key", "retry-race")
+      .send({
+        body: "Verdict: approve",
+        mutationType: "routed_reviewer_comment",
+        routedReviewerOf: "PAP-12",
+        routingEvidenceLink: "/PAP/issues/PAP-77#comment-routing",
+      });
+
+    expect(first.status).toBe(201);
+    expect(second.status).toBe(200);
+    expect(second.body.id).toBe(existingComment.id);
+    expect(second.body.__idempotentReplay).toBeUndefined();
+    expect(mockIssueService.addComment).toHaveBeenCalledTimes(2);
   });
 
   it("allows same-company agent mutations on unassigned in-progress issues", async () => {

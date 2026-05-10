@@ -92,6 +92,17 @@ const updateIssueRouteSchema = updateIssueSchema.extend({
   interrupt: z.boolean().optional(),
 });
 
+const ROUTED_REVIEWER_COMMENT_MUTATION_TYPE_V1 = "routed_reviewer_comment.v1";
+const ROUTED_REVIEWER_COMMENT_MUTATION_TYPES = new Set([
+  "routed_reviewer_comment",
+  ROUTED_REVIEWER_COMMENT_MUTATION_TYPE_V1,
+]);
+
+function normalizeRoutedReviewerCommentMutationType(value: string | null | undefined): string | null {
+  if (!value || !ROUTED_REVIEWER_COMMENT_MUTATION_TYPES.has(value)) return null;
+  return ROUTED_REVIEWER_COMMENT_MUTATION_TYPE_V1;
+}
+
 type ParsedExecutionState = NonNullable<ReturnType<typeof parseIssueExecutionState>>;
 type NormalizedExecutionPolicy = NonNullable<ReturnType<typeof normalizeIssueExecutionPolicy>>;
 type ActivityIssueRelationSummary = {
@@ -3585,15 +3596,35 @@ export function issueRoutes(
       return;
     }
     assertCompanyAccess(req, issue.companyId);
-    const isRoutedReviewerComment = req.body.mutationType === "routed_reviewer_comment";
+    const routedReviewerCommentMutationType = normalizeRoutedReviewerCommentMutationType(req.body.mutationType);
+    const isRoutedReviewerComment = routedReviewerCommentMutationType !== null;
+    let routedReviewerAuthorAgentId: string | null = null;
     if (isRoutedReviewerComment) {
       if (req.actor.type !== "agent" || !req.actor.agentId) {
         res.status(403).json({ error: "Routed reviewer comments require agent authentication" });
         return;
       }
+      routedReviewerAuthorAgentId = req.actor.agentId;
       const runId = requireAgentRunId(req, res);
       if (!runId) return;
     } else if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
+
+    const commentIdempotencyKey = isRoutedReviewerComment
+      ? (req.header("idempotency-key")?.trim() || null)
+      : null;
+
+    if (isRoutedReviewerComment && commentIdempotencyKey && routedReviewerAuthorAgentId) {
+      const existingComment = await svc.getIdempotentComment({
+        companyId: issue.companyId,
+        issueId: issue.id,
+        authorAgentId: routedReviewerAuthorAgentId,
+        idempotencyKey: commentIdempotencyKey,
+      });
+      if (existingComment) {
+        res.status(200).json(existingComment);
+        return;
+      }
+    }
     const closedExecutionWorkspace = await getClosedIssueExecutionWorkspace(issue);
     if (closedExecutionWorkspace) {
       respondClosedIssueExecutionWorkspace(res, closedExecutionWorkspace);
@@ -3693,11 +3724,18 @@ export function issueRoutes(
       agentId: actor.agentId ?? undefined,
       userId: actor.actorType === "user" ? actor.actorId : undefined,
       runId: actor.runId,
-      mutationType: req.body.mutationType ?? null,
+      mutationType: routedReviewerCommentMutationType,
       routedReviewerOf: req.body.routedReviewerOf ?? null,
       routingEvidenceLink: req.body.routingEvidenceLink ?? null,
       routingMetadata: req.body.routingMetadata ?? null,
+      idempotencyKey: commentIdempotencyKey,
     });
+    const idempotentReplay = (comment as { __idempotentReplay?: boolean }).__idempotentReplay === true;
+    if (idempotentReplay) {
+      const { __idempotentReplay: _ignored, ...existingComment } = comment as typeof comment & { __idempotentReplay?: boolean };
+      res.status(200).json(existingComment);
+      return;
+    }
     await issueReferencesSvc.syncComment(comment.id);
     const commentReferenceSummaryAfter = await issueReferencesSvc.listIssueReferenceSummary(currentIssue.id);
     const commentReferenceDiff = issueReferencesSvc.diffIssueReferenceSummary(
@@ -3727,9 +3765,9 @@ export function issueRoutes(
         ...(resumeRequested === true ? { resumeIntent: true, followUpRequested: true } : {}),
         ...(reopened ? { reopened: true, reopenedFrom: reopenFromStatus, source: "comment" } : {}),
         ...(interruptedRunId ? { interruptedRunId } : {}),
-        ...(req.body.mutationType === "routed_reviewer_comment"
+        ...(isRoutedReviewerComment
           ? {
-              mutationType: req.body.mutationType,
+              mutationType: routedReviewerCommentMutationType,
               routedReviewerOf: req.body.routedReviewerOf ?? null,
               routingEvidenceLink: req.body.routingEvidenceLink ?? null,
             }
