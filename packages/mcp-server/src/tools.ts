@@ -1,5 +1,6 @@
 import { z } from "zod";
 import {
+  addIssueCommentObjectSchema,
   addIssueCommentSchema,
   askUserQuestionsPayloadSchema,
   checkoutIssueSchema,
@@ -109,7 +110,7 @@ const checkoutIssueToolSchema = z.object({
 
 const addCommentToolSchema = z.object({
   issueId: issueIdSchema,
-}).merge(addIssueCommentSchema);
+}).merge(addIssueCommentObjectSchema);
 
 const createSuggestTasksToolSchema = z.object({
   issueId: issueIdSchema,
@@ -477,8 +478,10 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
       "paperclipAddComment",
       "Add a comment to an issue; include resume=true when intentionally requesting follow-up on resumable closed work",
       addCommentToolSchema,
-      async ({ issueId, ...body }) =>
-        client.requestJson("POST", `/issues/${encodeURIComponent(issueId)}/comments`, { body }),
+      async ({ issueId, ...body }) => {
+        addIssueCommentSchema.parse(body);
+        return client.requestJson("POST", `/issues/${encodeURIComponent(issueId)}/comments`, { body });
+      },
     ),
     makeTool(
       "paperclipSuggestTasks",

@@ -70,6 +70,14 @@ const ISSUE_LIST_RELATED_QUERY_CHUNK_SIZE = 500;
 export const MAX_CHILD_ISSUES_CREATED_BY_HELPER = 25;
 const MAX_CHILD_COMPLETION_SUMMARIES = 20;
 const CHILD_COMPLETION_SUMMARY_BODY_MAX_CHARS = 500;
+const ISSUE_COMMENT_IDEMPOTENCY_CONSTRAINT = "issue_comments_company_issue_author_idempotency_uq";
+
+function isIssueCommentIdempotencyConflict(error: unknown): boolean {
+  if (typeof error !== "object" || error === null) return false;
+  const err = error as { code?: string; constraint?: string; constraint_name?: string };
+  const constraint = err.constraint ?? err.constraint_name;
+  return err.code === "23505" && constraint === ISSUE_COMMENT_IDEMPOTENCY_CONSTRAINT;
+}
 function assertTransition(from: string, to: string) {
   if (from === to) return;
   if (!ALL_ISSUE_STATUSES.includes(to)) {
@@ -3686,6 +3694,29 @@ export function issueService(db: Db) {
       };
     },
 
+    getIdempotentComment: async (input: {
+      companyId: string;
+      issueId: string;
+      authorAgentId: string;
+      idempotencyKey: string;
+    }) =>
+      instanceSettings.getGeneral().then(({ censorUsernameInLogs }) =>
+        db
+          .select()
+          .from(issueComments)
+          .where(and(
+            eq(issueComments.companyId, input.companyId),
+            eq(issueComments.issueId, input.issueId),
+            eq(issueComments.authorAgentId, input.authorAgentId),
+            eq(issueComments.idempotencyKey, input.idempotencyKey),
+          ))
+          .orderBy(asc(issueComments.createdAt), asc(issueComments.id))
+          .limit(1)
+          .then((rows) => {
+            const comment = rows[0] ?? null;
+            return comment ? redactIssueComment(comment, censorUsernameInLogs) : null;
+          })),
+
     getComment: (commentId: string) =>
       instanceSettings.getGeneral().then(({ censorUsernameInLogs }) =>
         db
@@ -3722,7 +3753,16 @@ export function issueService(db: Db) {
     addComment: async (
       issueId: string,
       body: string,
-      actor: { agentId?: string; userId?: string; runId?: string | null; mutationType?: string | null; routedReviewerOf?: string | null; routingEvidenceLink?: string | null; routingMetadata?: Record<string, unknown> | null },
+      actor: {
+        agentId?: string;
+        userId?: string;
+        runId?: string | null;
+        mutationType?: string | null;
+        routedReviewerOf?: string | null;
+        routingEvidenceLink?: string | null;
+        routingMetadata?: Record<string, unknown> | null;
+        idempotencyKey?: string | null;
+      },
     ) => {
       const issue = await db
         .select({ companyId: issues.companyId })
@@ -3736,23 +3776,65 @@ export function issueService(db: Db) {
         enabled: (await instanceSettings.getGeneral()).censorUsernameInLogs,
       };
       const redactedBody = redactCurrentUserText(body, currentUserRedactionOptions);
-      const [comment] = await db
-        .insert(issueComments)
-        .values({
-          companyId: issue.companyId,
-          issueId,
-          authorAgentId: actor.agentId ?? null,
-          authorUserId: actor.userId ?? null,
-          createdByRunId: actor.runId ?? null,
-          mutationType: actor.mutationType ?? null,
-          routedReviewerOf: actor.routedReviewerOf ?? null,
-          routingEvidenceLink: actor.routingEvidenceLink ?? null,
-          routingMetadata: actor.routingMetadata ?? null,
-          body: redactedBody,
-        })
-        .returning();
+      const normalizedIdempotencyKey = actor.idempotencyKey?.trim() || null;
 
-      // Update issue's updatedAt so comment activity is reflected in recency sorting
+      if (normalizedIdempotencyKey && actor.agentId) {
+        const existing = await db
+          .select()
+          .from(issueComments)
+          .where(and(
+            eq(issueComments.companyId, issue.companyId),
+            eq(issueComments.issueId, issueId),
+            eq(issueComments.authorAgentId, actor.agentId),
+            eq(issueComments.idempotencyKey, normalizedIdempotencyKey),
+          ))
+          .orderBy(asc(issueComments.createdAt), asc(issueComments.id))
+          .limit(1)
+          .then((rows) => rows[0] ?? null);
+        if (existing) {
+          const redactedExisting = redactIssueComment(existing, currentUserRedactionOptions.enabled);
+          return { ...redactedExisting, __idempotentReplay: true as const };
+        }
+      }
+
+      let comment: typeof issueComments.$inferSelect;
+      try {
+        [comment] = await db
+          .insert(issueComments)
+          .values({
+            companyId: issue.companyId,
+            issueId,
+            authorAgentId: actor.agentId ?? null,
+            authorUserId: actor.userId ?? null,
+            createdByRunId: actor.runId ?? null,
+            mutationType: actor.mutationType ?? null,
+            routedReviewerOf: actor.routedReviewerOf ?? null,
+            routingEvidenceLink: actor.routingEvidenceLink ?? null,
+            routingMetadata: actor.routingMetadata ?? null,
+            idempotencyKey: normalizedIdempotencyKey,
+            body: redactedBody,
+          })
+          .returning();
+      } catch (error) {
+        if (!(normalizedIdempotencyKey && actor.agentId && isIssueCommentIdempotencyConflict(error))) throw error;
+        const existing = await db
+          .select()
+          .from(issueComments)
+          .where(and(
+            eq(issueComments.companyId, issue.companyId),
+            eq(issueComments.issueId, issueId),
+            eq(issueComments.authorAgentId, actor.agentId),
+            eq(issueComments.idempotencyKey, normalizedIdempotencyKey),
+          ))
+          .orderBy(asc(issueComments.createdAt), asc(issueComments.id))
+          .limit(1)
+          .then((rows) => rows[0] ?? null);
+        if (!existing) throw error;
+        const redactedExisting = redactIssueComment(existing, currentUserRedactionOptions.enabled);
+        return { ...redactedExisting, __idempotentReplay: true as const };
+      }
+
+      // Update issue updatedAt so comment activity is reflected in recency sorting
       await db
         .update(issues)
         .set({ updatedAt: new Date() })
