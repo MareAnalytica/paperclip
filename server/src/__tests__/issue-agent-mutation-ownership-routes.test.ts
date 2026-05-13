@@ -61,6 +61,9 @@ const mockIssueThreadInteractionService = vi.hoisted(() => ({
   expireRequestConfirmationsSupersededByComment: vi.fn(async () => []),
   expireStaleRequestConfirmationsForIssueDocument: vi.fn(async () => []),
 }));
+const mockIssueRecoveryActionService = vi.hoisted(() => ({
+  getActiveForIssue: vi.fn(async () => null),
+}));
 
 function registerRouteMocks() {
   vi.doMock("@paperclipai/shared/telemetry", () => ({
@@ -125,6 +128,7 @@ function registerRouteMocks() {
       listCompanyIds: vi.fn(async () => [companyId]),
     }),
     issueApprovalService: () => ({}),
+    issueRecoveryActionService: () => mockIssueRecoveryActionService,
     issueReferenceService: () => ({
       deleteDocumentSource: async () => undefined,
       diffIssueReferenceSummary: () => ({
@@ -261,6 +265,8 @@ describe("agent issue mutation checkout ownership", () => {
     mockIssueService.getWakeableParentAfterChildCompletion.mockReset();
     mockIssueService.listAttachments.mockReset();
     mockIssueService.listWakeableBlockedDependents.mockReset();
+    mockIssueRecoveryActionService.getActiveForIssue.mockReset();
+    mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue(null);
     mockIssueService.remove.mockReset();
     mockIssueService.removeAttachment.mockReset();
     mockIssueService.update.mockReset();
