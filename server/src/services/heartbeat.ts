@@ -197,6 +197,10 @@ const MAX_TURN_CONTINUATION_MAX_ATTEMPTS_CAP = 10;
 const MAX_TURN_CONTINUATION_DEFAULT_DELAY_MS = 1_000;
 const MAX_TURN_CONTINUATION_MAX_DELAY_MS = 5 * 60 * 1000;
 const MAX_TURN_CONTINUATION_LIVE_RUN_STATUSES = ["scheduled_retry", "queued", "running"] as const;
+export const CEO_HEARTBEAT_INSTRUCTION_VERSION = "2026-05-13.ceo-board-flow.v1";
+export const CEO_HEARTBEAT_TASK_KEY = "__ceo_company_flow__:2026-05-13.ceo-board-flow.v1";
+export const CEO_BOARD_FLOW_STATUSES = ["in_review", "in_progress", "todo", "backlog", "blocked", "done", "cancelled"] as const;
+const CEO_BOARD_FLOW_SAMPLE_LIMIT_PER_STATUS = 8;
 type CodexTransientFallbackMode =
   | "same_session"
   | "safer_invocation"
@@ -1593,6 +1597,93 @@ export function formatRuntimeWorkspaceWarningLog(warning: string) {
     stream: "stdout" as const,
     chunk: `[paperclip] ${warning}\n`,
   };
+}
+
+export function isCeoHeartbeatControllerAgent(agent: Pick<typeof agents.$inferSelect, "name" | "role" | "runtimeConfig">) {
+  const runtimeConfig = parseObject(agent.runtimeConfig);
+  const heartbeat = parseObject(runtimeConfig.heartbeat);
+  const configuredRole = readNonEmptyString(heartbeat.controllerRole) ??
+    readNonEmptyString(heartbeat.role) ??
+    readNonEmptyString(runtimeConfig.controllerRole);
+  if (configuredRole) {
+    const normalized = configuredRole.toLowerCase();
+    if (normalized === "ceo" || normalized === "company_ceo" || normalized === "company-flow-controller") return true;
+  }
+
+  const haystack = `${agent.name ?? ""} ${agent.role ?? ""}`.toLowerCase();
+  return (
+    /\bceo\b/.test(haystack) ||
+    haystack.includes("chief executive") ||
+    haystack.includes("mission owner") ||
+    haystack.includes("board member")
+  );
+}
+
+function formatCeoBoardIssueLine(issue: {
+  identifier: string | null;
+  id: string;
+  title: string;
+  status: string;
+  priority: string;
+  assigneeAgentName: string | null;
+  assigneeUserId: string | null;
+  activeRunStatus: string | null;
+}) {
+  const owner = issue.assigneeAgentName || issue.assigneeUserId || "UNASSIGNED";
+  const run = issue.activeRunStatus ? `, active run: ${issue.activeRunStatus}` : ", no active run";
+  return `- ${issue.identifier ?? issue.id}: [${issue.priority}] ${issue.title} — owner: ${owner}${run}`;
+}
+
+export function buildCeoHeartbeatMarkdown(input: {
+  generatedAt: string;
+  counts: Record<string, number>;
+  samples: Record<string, Array<{
+    identifier: string | null;
+    id: string;
+    title: string;
+    status: string;
+    priority: string;
+    assigneeAgentName: string | null;
+    assigneeUserId: string | null;
+    activeRunStatus: string | null;
+  }>>;
+}) {
+  const lines = [
+    "## CEO Company Flow Heartbeat",
+    "",
+    `Instruction version: ${CEO_HEARTBEAT_INSTRUCTION_VERSION}`,
+    `Snapshot generated at: ${input.generatedAt}`,
+    "",
+    "You are running a CEO/controller heartbeat for the whole company board, not a personal inbox heartbeat.",
+    "You do not need to personally review every deliverable. Your job is to make sure somebody accountable does, that work has the right owner/status, and that blocked work names the unblock owner/action.",
+    "",
+    "Work the board from right to left every heartbeat:",
+    "1. in_review — highest priority: ensure reviews/approvals happen as soon as possible, assign or wake the right reviewer, and prevent review limbo.",
+    "2. in_progress — ensure each item has an owner and active movement, wake the owner when it is actionable and has no active run, and avoid duplicate active wakes.",
+    "3. todo — ensure ready work has an owner and gets started when capacity/policy allows.",
+    "4. backlog, blocked, done, cancelled — audit state quality. Move backlog items to todo when they should now start; move items back if they are misclassified; keep done/cancelled only when that state is justified.",
+    "",
+    "Exit only after the company-flow invariants are satisfied or you have made the concrete assignment/status/wake/comment changes needed to move them toward satisfaction.",
+    "Respect budget, approval, pause/cancel, dependency, and company-boundary gates.",
+    "",
+    "### Board counts",
+  ];
+
+  for (const status of CEO_BOARD_FLOW_STATUSES) {
+    lines.push(`- ${status}: ${input.counts[status] ?? 0}`);
+  }
+
+  for (const status of CEO_BOARD_FLOW_STATUSES) {
+    const samples = input.samples[status] ?? [];
+    lines.push("", `### ${status} focus sample`);
+    if (samples.length === 0) {
+      lines.push("- none");
+      continue;
+    }
+    for (const issue of samples) lines.push(formatCeoBoardIssueLine(issue));
+  }
+
+  return lines.join("\n");
 }
 
 function describeSessionResetReason(
@@ -5097,6 +5188,126 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       intervalSec: Math.max(0, asNumber(heartbeat.intervalSec, 0)),
       wakeOnDemand: asBoolean(heartbeat.wakeOnDemand ?? heartbeat.wakeOnAssignment ?? heartbeat.wakeOnOnDemand ?? heartbeat.wakeOnAutomation, true),
       maxConcurrentRuns: normalizeMaxConcurrentRuns(heartbeat.maxConcurrentRuns),
+    };
+  }
+
+  async function buildCeoHeartbeatContext(agent: typeof agents.$inferSelect, now: Date) {
+    const statusCounts = Object.fromEntries(CEO_BOARD_FLOW_STATUSES.map((status) => [status, 0])) as Record<string, number>;
+    const countRows = await db
+      .select({
+        status: issues.status,
+        count: sql<number>`count(*)::int`,
+      })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, agent.companyId),
+          isNull(issues.hiddenAt),
+          inArray(issues.status, [...CEO_BOARD_FLOW_STATUSES]),
+        ),
+      )
+      .groupBy(issues.status);
+    for (const row of countRows) statusCounts[row.status] = Number(row.count ?? 0);
+
+    const rows = await db
+      .select({
+        id: issues.id,
+        identifier: issues.identifier,
+        title: issues.title,
+        status: issues.status,
+        priority: issues.priority,
+        assigneeUserId: issues.assigneeUserId,
+        assigneeAgentId: issues.assigneeAgentId,
+        assigneeAgentName: agents.name,
+        updatedAt: issues.updatedAt,
+      })
+      .from(issues)
+      .leftJoin(agents, eq(issues.assigneeAgentId, agents.id))
+      .where(
+        and(
+          eq(issues.companyId, agent.companyId),
+          isNull(issues.hiddenAt),
+          inArray(issues.status, [...CEO_BOARD_FLOW_STATUSES]),
+        ),
+      )
+      .orderBy(
+        sql`case ${issues.status}
+          when 'in_review' then 0
+          when 'in_progress' then 1
+          when 'todo' then 2
+          when 'backlog' then 3
+          when 'blocked' then 4
+          when 'done' then 5
+          when 'cancelled' then 6
+          else 99
+        end`,
+        desc(issues.updatedAt),
+      )
+      .limit(CEO_BOARD_FLOW_STATUSES.length * CEO_BOARD_FLOW_SAMPLE_LIMIT_PER_STATUS * 2);
+
+    const candidateIssueIds = rows.map((row) => row.id);
+    const activeRuns = candidateIssueIds.length > 0
+      ? await db
+          .select({
+            issueId: sql<string | null>`${heartbeatRuns.contextSnapshot} ->> 'issueId'`,
+            status: heartbeatRuns.status,
+            startedAt: heartbeatRuns.startedAt,
+            createdAt: heartbeatRuns.createdAt,
+          })
+          .from(heartbeatRuns)
+          .where(
+            and(
+              eq(heartbeatRuns.companyId, agent.companyId),
+              inArray(heartbeatRuns.status, [...EXECUTION_PATH_HEARTBEAT_RUN_STATUSES]),
+              inArray(sql<string>`${heartbeatRuns.contextSnapshot} ->> 'issueId'`, candidateIssueIds),
+            ),
+          )
+          .orderBy(desc(heartbeatRuns.createdAt))
+      : [];
+    const activeRunByIssue = new Map<string, string>();
+    for (const run of activeRuns) {
+      if (run.issueId && !activeRunByIssue.has(run.issueId)) activeRunByIssue.set(run.issueId, run.status);
+    }
+
+    const samples = Object.fromEntries(CEO_BOARD_FLOW_STATUSES.map((status) => [status, []])) as Record<string, Array<{
+      identifier: string | null;
+      id: string;
+      title: string;
+      status: string;
+      priority: string;
+      assigneeAgentName: string | null;
+      assigneeUserId: string | null;
+      activeRunStatus: string | null;
+    }>>;
+
+    for (const row of rows) {
+      const bucket = samples[row.status];
+      if (!bucket || bucket.length >= CEO_BOARD_FLOW_SAMPLE_LIMIT_PER_STATUS) continue;
+      bucket.push({
+        identifier: row.identifier,
+        id: row.id,
+        title: row.title,
+        status: row.status,
+        priority: row.priority,
+        assigneeAgentName: row.assigneeAgentName,
+        assigneeUserId: row.assigneeUserId,
+        activeRunStatus: activeRunByIssue.get(row.id) ?? null,
+      });
+    }
+
+    const markdown = buildCeoHeartbeatMarkdown({
+      generatedAt: now.toISOString(),
+      counts: statusCounts,
+      samples,
+    });
+
+    return {
+      instructionVersion: CEO_HEARTBEAT_INSTRUCTION_VERSION,
+      generatedAt: now.toISOString(),
+      boardOrder: [...CEO_BOARD_FLOW_STATUSES],
+      counts: statusCounts,
+      samples,
+      markdown,
     };
   }
 
@@ -9031,16 +9242,26 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         const elapsedMs = now.getTime() - baseline;
         if (elapsedMs < policy.intervalSec * 1000) continue;
 
+        const isCeoHeartbeat = isCeoHeartbeatControllerAgent(agent);
+        const ceoHeartbeatContext = isCeoHeartbeat ? await buildCeoHeartbeatContext(agent, now) : null;
         const run = await enqueueWakeup(agent.id, {
           source: "timer",
           triggerDetail: "system",
           reason: "heartbeat_timer",
           requestedByActorType: "system",
           requestedByActorId: "heartbeat_scheduler",
+          payload: ceoHeartbeatContext ? {
+            prompt: ceoHeartbeatContext.markdown,
+            taskKey: CEO_HEARTBEAT_TASK_KEY,
+          } : undefined,
           contextSnapshot: {
             source: "scheduler",
             reason: "interval_elapsed",
             now: now.toISOString(),
+            ...(ceoHeartbeatContext ? {
+              taskKey: CEO_HEARTBEAT_TASK_KEY,
+              ceoCompanyFlow: ceoHeartbeatContext,
+            } : {}),
           },
         });
         if (run) enqueued += 1;
