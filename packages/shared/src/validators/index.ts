@@ -176,6 +176,8 @@ export {
   issueThreadInteractionStatusSchema,
   issueThreadInteractionKindSchema,
   issueThreadInteractionContinuationPolicySchema,
+  issueThreadInteractionDecisionClassSchema,
+  issueThreadInteractionBoardNotificationSchema,
   suggestedTaskDraftSchema,
   suggestTasksPayloadSchema,
   suggestTasksResultCreatedTaskSchema,

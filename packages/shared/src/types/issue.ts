@@ -647,10 +647,26 @@ export interface AskUserQuestionsQuestion {
   options: AskUserQuestionsQuestionOption[];
 }
 
+export type IssueThreadInteractionDecisionClass =
+  | "agent_actionable"
+  | "ceo_actionable"
+  | "human_only"
+  | "external_wait";
+
+export interface IssueThreadInteractionBoardNotification {
+  platform?: "telegram";
+  channelName: string;
+  target?: string | null;
+  required?: boolean;
+  messageMarkdown?: string | null;
+}
+
 export interface AskUserQuestionsPayload {
   version: 1;
   title?: string | null;
   submitLabel?: string | null;
+  decisionClass?: IssueThreadInteractionDecisionClass;
+  boardNotification?: IssueThreadInteractionBoardNotification | null;
   questions: AskUserQuestionsQuestion[];
 }
 
@@ -694,6 +710,8 @@ export type RequestConfirmationTarget =
 export interface RequestConfirmationPayload {
   version: 1;
   prompt: string;
+  decisionClass?: IssueThreadInteractionDecisionClass;
+  boardNotification?: IssueThreadInteractionBoardNotification | null;
   acceptLabel?: string | null;
   rejectLabel?: string | null;
   rejectRequiresReason?: boolean;
@@ -707,7 +725,7 @@ export interface RequestConfirmationPayload {
 
 export interface RequestConfirmationResult {
   version: 1;
-  outcome: "accepted" | "rejected" | "superseded_by_comment" | "stale_target";
+  outcome: "accepted" | "rejected" | "superseded_by_comment" | "stale_target" | "issue_terminal_status";
   reason?: string | null;
   commentId?: string | null;
   staleTarget?: RequestConfirmationTarget | null;

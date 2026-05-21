@@ -80,6 +80,55 @@ import {
 import { classifyIssueGraphLiveness, type IssueLivenessFinding } from "./recovery/issue-graph-liveness.js";
 
 const ALL_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked", "done", "cancelled"];
+
+function isTerminalIssueStatus(status: string | null | undefined) {
+  return status === "done" || status === "cancelled";
+}
+
+function buildTerminalIssueInteractionResult(kind: string, issueStatus: string) {
+  const reason = "Source issue reached terminal status: " + issueStatus;
+  switch (kind) {
+    case "request_confirmation":
+      return { version: 1 as const, outcome: "issue_terminal_status" as const, reason };
+    case "ask_user_questions":
+      return { version: 1 as const, answers: [], cancelled: true as const, cancellationReason: reason, summaryMarkdown: null };
+    case "suggest_tasks":
+      return { version: 1 as const, createdTasks: [], skippedClientKeys: [], rejectionReason: reason };
+    default:
+      return { version: 1 as const, reason };
+  }
+}
+
+async function expirePendingIssueInteractionsForTerminalStatus(
+  tx: Db,
+  issue: { id: string; companyId: string; status: string },
+  actor: { agentId?: string | null; userId?: string | null },
+) {
+  if (!isTerminalIssueStatus(issue.status)) return;
+  const rows = await tx
+    .select({ id: issueThreadInteractions.id, kind: issueThreadInteractions.kind })
+    .from(issueThreadInteractions)
+    .where(and(
+      eq(issueThreadInteractions.companyId, issue.companyId),
+      eq(issueThreadInteractions.issueId, issue.id),
+      eq(issueThreadInteractions.status, "pending"),
+    ));
+  if (rows.length === 0) return;
+  const now = new Date();
+  for (const row of rows) {
+    await tx
+      .update(issueThreadInteractions)
+      .set({
+        status: "expired",
+        result: buildTerminalIssueInteractionResult(row.kind, issue.status),
+        resolvedByAgentId: actor.agentId ?? null,
+        resolvedByUserId: actor.userId ?? null,
+        resolvedAt: now,
+        updatedAt: now,
+      })
+      .where(and(eq(issueThreadInteractions.id, row.id), eq(issueThreadInteractions.status, "pending")));
+  }
+}
 const MAX_ISSUE_COMMENT_PAGE_LIMIT = 500;
 export const ISSUE_LIST_DEFAULT_LIMIT = 500;
 export const ISSUE_LIST_MAX_LIMIT = 1000;
@@ -4563,9 +4612,15 @@ export function issueService(db: Db) {
               .where(eq(executionWorkspaces.id, workspace.id));
           }
         }
+        if (issueData.status && existing.status !== issueData.status && isTerminalIssueStatus(issueData.status)) {
+          await expirePendingIssueInteractionsForTerminalStatus(tx, updated, {
+            agentId: actorAgentId ?? null,
+            userId: actorUserId ?? null,
+          });
+        }
         const [enriched] = await withIssueLabels(tx, [updated]);
         if (
-          (issueData.status === "done" || issueData.status === "cancelled") &&
+          isTerminalIssueStatus(issueData.status) &&
           existing.status !== issueData.status &&
           existing.originKind === RECOVERY_ORIGIN_KINDS.issueGraphLivenessEscalation
         ) {

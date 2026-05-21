@@ -33,6 +33,7 @@ const mockLogActivity = vi.hoisted(() => vi.fn(async () => undefined));
 const mockIssueThreadInteractionService = vi.hoisted(() => ({
   listForIssue: vi.fn(async () => []),
   expireRequestConfirmationsSupersededByComment: vi.fn(async () => []),
+  expirePendingForTerminalIssue: vi.fn(async () => []),
 }));
 const mockIssueApprovalService = vi.hoisted(() => ({
   listApprovalsForIssue: vi.fn(async () => []),
@@ -197,7 +198,7 @@ describe("issue execution policy routes", () => {
     expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 
-  it("allows an agent-authored in_review transition with a pending confirmation interaction", async () => {
+  it("rejects an agent-authored in_review transition with an ambiguous pending confirmation interaction", async () => {
     const issue = {
       id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
       companyId: "company-1",
@@ -229,10 +230,106 @@ describe("issue execution policy routes", () => {
       .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
       .send({ status: "in_review" });
 
+    expect(res.status).toBe(422);
+    expect(res.body.error).toContain("invalid_issue_disposition");
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  it("allows an agent-authored in_review transition with an explicit human-only board decision interaction", async () => {
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      status: "todo",
+      assigneeAgentId: "33333333-3333-4333-8333-333333333333",
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "PAP-1004B",
+      title: "Board strategy choice",
+      executionPolicy: null,
+      executionState: null,
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueThreadInteractionService.listForIssue.mockResolvedValue([
+      {
+        id: "interaction-1",
+        kind: "ask_user_questions",
+        status: "pending",
+        payload: {
+          version: 1,
+          decisionClass: "human_only",
+          boardNotification: { platform: "telegram", channelName: "Mare Operator HQ", required: true },
+          questions: [{ id: "strategy", prompt: "Pick strategy", selectionMode: "single", options: [{ id: "a", label: "A" }] }],
+        },
+      },
+    ]);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+      updatedAt: new Date(),
+    }));
+
+    const res = await request(await createApp({
+      type: "agent",
+      agentId: "33333333-3333-4333-8333-333333333333",
+      companyId: "company-1",
+      runId: "run-1",
+    }))
+      .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+      .send({ status: "in_review" });
+
     expect(res.status).toBe(200);
     expect(mockIssueService.update).toHaveBeenCalledWith(
       "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
       expect.objectContaining({ status: "in_review" }),
+    );
+  });
+
+  it("expires pending interactions when an issue reaches a terminal status", async () => {
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      status: "in_review",
+      assigneeAgentId: "33333333-3333-4333-8333-333333333333",
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "PAP-1004C",
+      title: "Terminal cleanup",
+      executionPolicy: null,
+      executionState: null,
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+      updatedAt: new Date(),
+    }));
+    mockIssueThreadInteractionService.expirePendingForTerminalIssue.mockResolvedValue([
+      { id: "interaction-stale", kind: "ask_user_questions", status: "expired", result: { version: 1, cancelled: true } },
+    ]);
+
+    const res = await request(await createApp({
+      type: "agent",
+      agentId: "33333333-3333-4333-8333-333333333333",
+      companyId: "company-1",
+      runId: "run-1",
+    }))
+      .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+      .send({ status: "done" });
+
+    expect(res.status).toBe(200);
+    expect(mockIssueThreadInteractionService.expirePendingForTerminalIssue).toHaveBeenCalledWith(
+      expect.objectContaining({ id: issue.id, status: "done" }),
+      expect.objectContaining({ agentId: "33333333-3333-4333-8333-333333333333" }),
+    );
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "issue.thread_interaction_expired",
+        details: expect.objectContaining({
+          interactionId: "interaction-stale",
+          source: "issue.terminal_status",
+        }),
+      }),
     );
   });
 

@@ -609,10 +609,27 @@ export const askUserQuestionsQuestionSchema = z.object({
   options: z.array(askUserQuestionsQuestionOptionSchema).min(1).max(10),
 });
 
+export const issueThreadInteractionDecisionClassSchema = z.enum([
+  "agent_actionable",
+  "ceo_actionable",
+  "human_only",
+  "external_wait",
+]);
+
+export const issueThreadInteractionBoardNotificationSchema = z.object({
+  platform: z.literal("telegram").optional().default("telegram"),
+  channelName: z.string().trim().min(1).max(160),
+  target: z.string().trim().min(1).max(240).nullable().optional(),
+  required: z.boolean().optional().default(false),
+  messageMarkdown: z.string().trim().max(4000).nullable().optional(),
+});
+
 export const askUserQuestionsPayloadSchema = z.object({
   version: z.literal(1),
   title: z.string().trim().max(240).nullable().optional(),
   submitLabel: z.string().trim().max(120).nullable().optional(),
+  decisionClass: issueThreadInteractionDecisionClassSchema.optional(),
+  boardNotification: issueThreadInteractionBoardNotificationSchema.nullable().optional(),
   questions: z.array(askUserQuestionsQuestionSchema).min(1).max(10),
 }).superRefine((value, ctx) => {
   const seenQuestionIds = new Set<string>();
@@ -689,6 +706,8 @@ export const requestConfirmationTargetSchema = z.discriminatedUnion("type", [
 export const requestConfirmationPayloadSchema = z.object({
   version: z.literal(1),
   prompt: z.string().trim().min(1).max(1000),
+  decisionClass: issueThreadInteractionDecisionClassSchema.optional(),
+  boardNotification: issueThreadInteractionBoardNotificationSchema.nullable().optional(),
   acceptLabel: z.string().trim().min(1).max(80).nullable().optional(),
   rejectLabel: z.string().trim().min(1).max(80).nullable().optional(),
   rejectRequiresReason: z.boolean().optional(),
@@ -702,7 +721,7 @@ export const requestConfirmationPayloadSchema = z.object({
 
 export const requestConfirmationResultSchema = z.object({
   version: z.literal(1),
-  outcome: z.enum(["accepted", "rejected", "superseded_by_comment", "stale_target"]),
+  outcome: z.enum(["accepted", "rejected", "superseded_by_comment", "stale_target", "issue_terminal_status"]),
   reason: z.string().trim().max(4000).nullable().optional(),
   commentId: z.string().uuid().nullable().optional(),
   staleTarget: requestConfirmationTargetSchema.nullable().optional(),
