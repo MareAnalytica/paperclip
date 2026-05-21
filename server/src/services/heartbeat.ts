@@ -1775,6 +1775,8 @@ export function buildCeoHeartbeatMarkdown(input: {
     "",
     "You are running a CEO/controller heartbeat for the whole company board, not a personal inbox heartbeat.",
     "You do not need to personally review every deliverable. Your job is to make sure somebody accountable does, that work has the right owner/status, and that blocked work names the unblock owner/action.",
+    "Do not let PR/review gates wait on the board by default. For each in_review issue, make review somebody’s job inside the company: pick the most appropriate idle/active agent (often the CEO for board-level decisions, otherwise an adjacent specialist), assign them as the reviewer or open a bounded review issue, wake them, and name exactly what they must approve, reject, merge, or return for changes. Ask the human board only for budget, credentials, irreversible external actions, policy exceptions, or explicit product/business choices.",
+    "If an issue is already in_review with only a stale request_confirmation or historical board prompt, convert it into an agent-owned review path instead of holding.",
     "",
     "Work the board from right to left every heartbeat:",
     "1. in_review — highest priority: ensure reviews/approvals happen as soon as possible, assign or wake the right reviewer, and prevent review limbo.",
@@ -6346,6 +6348,29 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const isInteractionWake = allowsIssueInteractionWake(context);
     const resumeIntent = context.resumeIntent === true || context.followUpRequested === true;
     const wakeReason = readNonEmptyString(context.wakeReason);
+    const isExecutionStageWake =
+      wakeReason === "execution_review_requested" ||
+      wakeReason === "execution_approval_requested" ||
+      wakeReason === "execution_changes_requested";
+    const executionState = parseIssueExecutionState(issue.executionState);
+    const executionStageTargetAgentId = (() => {
+      if (!isExecutionStageWake || !executionState) return null;
+      if (wakeReason === "execution_review_requested" || wakeReason === "execution_approval_requested") {
+        const participant = executionState.currentParticipant;
+        return executionState.status === "pending" && participant?.type === "agent"
+          ? (participant.agentId ?? null)
+          : null;
+      }
+      if (wakeReason === "execution_changes_requested") {
+        const returnAssignee = executionState.returnAssignee;
+        return executionState.status === "changes_requested" && returnAssignee?.type === "agent"
+          ? (returnAssignee.agentId ?? null)
+          : null;
+      }
+      return null;
+    })();
+    const executionStageWakeMatchesCurrentTarget =
+      Boolean(executionStageTargetAgentId) && executionStageTargetAgentId === run.agentId;
     const retryReason = readNonEmptyString(context.retryReason) ?? run.scheduledRetryReason ?? null;
 
     if (
@@ -6377,7 +6402,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
     }
 
-    if (issue.assigneeAgentId !== run.agentId && !isInteractionWake) {
+    if (issue.assigneeAgentId !== run.agentId && !isInteractionWake && !executionStageWakeMatchesCurrentTarget) {
       return {
         stale: true,
         errorCode: "issue_assignee_changed",
@@ -7278,22 +7303,23 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     } else {
       delete context[PAPERCLIP_WAKE_PAYLOAD_KEY];
     }
-    const taskMarkdown = buildPaperclipTaskMarkdown({
-      issue: issueRef
-        ? {
-            id: issueRef.id,
-            identifier: issueRef.identifier,
-            title: issueRef.title,
-            workMode: issueRef.workMode,
-            description: issueRef.description,
-          }
-        : null,
-      wakeComment: wakeCommentContext,
-      interaction: {
-        kind: readNonEmptyString(context.interactionKind),
-        status: readNonEmptyString(context.interactionStatus),
-      },
-    });
+    const taskMarkdown =
+      buildPaperclipTaskMarkdown({
+        issue: issueRef
+          ? {
+              id: issueRef.id,
+              identifier: issueRef.identifier,
+              title: issueRef.title,
+              workMode: issueRef.workMode,
+              description: issueRef.description,
+            }
+          : null,
+        wakeComment: wakeCommentContext,
+        interaction: {
+          kind: readNonEmptyString(context.interactionKind),
+          status: readNonEmptyString(context.interactionStatus),
+        },
+      }) || readNonEmptyString(parseObject(context.ceoCompanyFlow).markdown);
     if (issueRef) {
       context.paperclipIssue = {
         id: issueRef.id,

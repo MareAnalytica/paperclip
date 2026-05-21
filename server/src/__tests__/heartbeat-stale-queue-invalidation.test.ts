@@ -640,6 +640,84 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     expect(countExecuteCallsForRun(runId)).toBe(0);
   });
 
+  it("runs execution-stage reviewer wakes even when reviewer is not the assignee", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const reviewerAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: reviewerAgentId,
+      companyId,
+      name: "ReviewerAgent",
+      role: "qa",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+
+    const issueId = randomUUID();
+    const stageId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "In-review task routed to reviewer",
+      status: "in_review",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      executionState: {
+        status: "pending",
+        currentStageId: stageId,
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: reviewerAgentId, userId: null },
+        returnAssignee: { type: "agent", agentId, userId: null },
+        reviewRequest: null,
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+    });
+
+    const { runId } = await seedQueuedRun({
+      companyId,
+      agentId: reviewerAgentId,
+      issueId,
+      wakeReason: "execution_review_requested",
+      contextExtras: {
+        source: "issue.execution_stage",
+        executionStage: {
+          wakeRole: "reviewer",
+          stageId,
+          stageType: "review",
+          currentParticipant: { type: "agent", agentId: reviewerAgentId },
+          returnAssignee: { type: "agent", agentId },
+          allowedActions: ["approve", "request_changes"],
+        },
+      },
+    });
+
+    await heartbeat.resumeQueuedRuns();
+
+    await waitForCondition(async () => {
+      const run = await db
+        .select({ status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId))
+        .then((rows) => rows[0] ?? null);
+      return run?.status === "succeeded";
+    });
+
+    const run = await db
+      .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0] ?? null);
+
+    expect(run?.status).toBe("succeeded");
+    expect(run?.errorCode).toBeNull();
+    expect(countExecuteCallsForRun(runId)).toBe(1);
+  });
+
   it("still runs comment-driven wakes on in_review issues even when the agent is no longer the current participant", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent();
     const otherAgentId = randomUUID();

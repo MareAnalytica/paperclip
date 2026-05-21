@@ -31,6 +31,8 @@ describe("CEO heartbeat company-flow prompt", () => {
     expect(CEO_HEARTBEAT_TASK_KEY).toContain("__ceo_company_flow__");
     expect(markdown).toContain("CEO/controller heartbeat for the whole company board");
     expect(markdown).toContain("You do not need to personally review every deliverable");
+    expect(markdown).toContain("make review somebody’s job inside the company");
+    expect(markdown).toContain("Ask the human board only for budget, credentials, irreversible external actions, policy exceptions, or explicit product/business choices");
     expect(markdown).toContain("ensure reviews/approvals happen as soon as possible");
     expect(markdown).toContain("Move backlog items to todo when they should now start");
     expect(markdown.indexOf("### in_review focus sample")).toBeLessThan(markdown.indexOf("### in_progress focus sample"));
