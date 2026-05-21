@@ -193,6 +193,8 @@ export type {
   IssueCommentMetadataRunLinkRow,
   IssueCommentPresentation,
   IssueThreadInteractionActorFields,
+  IssueThreadInteractionDecisionClass,
+  IssueThreadInteractionBoardNotification,
   SuggestedTaskDraft,
   SuggestTasksPayload,
   SuggestTasksResultCreatedTask,

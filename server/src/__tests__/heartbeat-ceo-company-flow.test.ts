@@ -28,14 +28,18 @@ describe("CEO heartbeat company-flow prompt", () => {
       },
     });
 
-    expect(CEO_HEARTBEAT_TASK_KEY).toBe("__ceo_company_flow__:2026-05-21.ceo-review-routing.v2");
-    expect(markdown).toContain("Instruction version: 2026-05-21.ceo-review-routing.v2");
+    expect(CEO_HEARTBEAT_TASK_KEY).toBe("__ceo_company_flow__:2026-05-21.board-decision-routing.v3");
+    expect(markdown).toContain("Instruction version: 2026-05-21.board-decision-routing.v3");
     expect(markdown).toContain("CEO/controller heartbeat for the whole company board");
     expect(markdown).toContain("You do not need to personally review every deliverable");
     expect(markdown).toContain("make review somebody’s job inside the company");
     expect(markdown).toContain("the Merge Request/Pull Request author must request review from the designated reviewing agent");
     expect(markdown).toContain("If the designated reviewer is unavailable, blocked, conflicted, or rate-limited, create or wake a contingency reviewer");
     expect(markdown).toContain("Ask the human board only for budget, credentials, irreversible external actions, policy exceptions, or explicit product/business choices");
+    expect(markdown).toContain("Classify every blocker before you wait");
+    expect(markdown).toContain("payload.decisionClass='human_only'");
+    expect(markdown).toContain("Mare Operator HQ");
+    expect(markdown).toContain("superseded by merged work");
     expect(markdown).toContain("ensure reviews/approvals happen as soon as possible");
     expect(markdown).toContain("Move backlog items to todo when they should now start");
     expect(markdown.indexOf("### in_review focus sample")).toBeLessThan(markdown.indexOf("### in_progress focus sample"));
