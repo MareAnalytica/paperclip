@@ -353,6 +353,24 @@ function hasScheduledMonitor(input: {
   return Boolean(policy?.monitor?.nextCheckAt);
 }
 
+const EXPLICIT_BOARD_DECISION_CLASSES = new Set(["human_only", "external_wait"]);
+
+function isExplicitBoardDecisionInteraction(interaction: unknown) {
+  if (!interaction || typeof interaction !== "object") return false;
+  const row = interaction as { status?: unknown; kind?: unknown; payload?: unknown };
+  if (row.status !== "pending") return false;
+  if (row.kind !== "ask_user_questions" && row.kind !== "request_confirmation") return false;
+  const payload = row.payload && typeof row.payload === "object" ? row.payload as Record<string, unknown> : null;
+  if (!payload) return false;
+  const decisionClass = typeof payload.decisionClass === "string" ? payload.decisionClass : null;
+  if (!decisionClass || !EXPLICIT_BOARD_DECISION_CLASSES.has(decisionClass)) return false;
+  const boardNotification = payload.boardNotification;
+  if (decisionClass === "external_wait" && (boardNotification === undefined || boardNotification === null)) return true;
+  if (typeof boardNotification !== "object" || boardNotification === null) return false;
+  const channelName = (boardNotification as Record<string, unknown>).channelName;
+  return typeof channelName === "string" && channelName.trim().length > 0;
+}
+
 function successfulRunHandoffStateFromActivity(row: {
   action: string;
   agentId: string | null;
@@ -1165,7 +1183,7 @@ export function issueRoutes(
     })) return;
 
     const interactions = await issueThreadInteractionService(db).listForIssue(input.existing.id);
-    if (interactions.some((interaction) => interaction.status === "pending")) return;
+    if (interactions.some(isExplicitBoardDecisionInteraction)) return;
 
     const approvals = await issueApprovalsSvc.listApprovalsForIssue(input.existing.id);
     if (approvals.some((approval) => ACTIVE_REVIEW_APPROVAL_STATUSES.has(String(approval.status)))) return;
@@ -1174,7 +1192,7 @@ export function issueRoutes(
       code: "invalid_issue_disposition",
       missing: "review_path",
       validReviewPaths: [
-        "pending_issue_thread_interaction",
+        "explicit_human_only_or_external_wait_issue_thread_interaction",
         "linked_pending_approval",
         "human_assignee_user_id",
         "typed_execution_state_current_participant",
@@ -3772,6 +3790,16 @@ export function issueRoutes(
       };
     }
     await routinesSvc.syncRunStatusForIssue(issue.id);
+
+    if (existing.status !== issue.status && isClosedIssueStatus(issue.status)) {
+      const expiredInteractions = await issueThreadInteractionService(db).expirePendingForTerminalIssue(issue, actor);
+      await logExpiredRequestConfirmations({
+        issue: { id: issue.id, companyId: issue.companyId, identifier: issue.identifier },
+        interactions: expiredInteractions,
+        actor,
+        source: "issue.terminal_status",
+      });
+    }
 
     if (actor.runId) {
       await heartbeat.reportRunActivity(actor.runId).catch((err) =>

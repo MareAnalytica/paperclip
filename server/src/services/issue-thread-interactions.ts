@@ -144,6 +144,20 @@ function isTerminalIssueStatus(status: string) {
   return status === "done" || status === "cancelled";
 }
 
+function buildTerminalIssueInteractionResult(row: IssueThreadInteractionRow, issueStatus: string) {
+  const reason = "Source issue reached terminal status: " + issueStatus;
+  switch (row.kind) {
+    case "request_confirmation":
+      return { version: 1 as const, outcome: "issue_terminal_status" as const, reason };
+    case "ask_user_questions":
+      return { version: 1 as const, answers: [], cancelled: true as const, cancellationReason: reason, summaryMarkdown: null };
+    case "suggest_tasks":
+      return { version: 1 as const, createdTasks: [], skippedClientKeys: [], rejectionReason: reason };
+    default:
+      return { version: 1 as const, reason };
+  }
+}
+
 function shouldReturnAcceptedConfirmationToCreatorAgent(args: {
   issue: IssueResolutionContext;
   current: IssueThreadInteractionRow;
@@ -635,6 +649,50 @@ export function issueThreadInteractionService(db: Db) {
         .then((rows) => rows[0] ?? null);
 
       return row ? hydrateInteraction(row) : null;
+    },
+
+    expirePendingForTerminalIssue: async (
+      issue: { id: string; companyId: string; status: string },
+      actor: InteractionActor,
+    ) => {
+      if (!isTerminalIssueStatus(issue.status)) return [];
+
+      const rows = await db
+        .select()
+        .from(issueThreadInteractions)
+        .where(and(
+          eq(issueThreadInteractions.companyId, issue.companyId),
+          eq(issueThreadInteractions.issueId, issue.id),
+          eq(issueThreadInteractions.status, "pending"),
+        ));
+
+      if (rows.length === 0) return [];
+
+      const now = new Date();
+      const expired: IssueThreadInteraction[] = [];
+      for (const row of rows) {
+        const [updated] = await db
+          .update(issueThreadInteractions)
+          .set({
+            status: "expired",
+            result: buildTerminalIssueInteractionResult(row, issue.status),
+            resolvedByAgentId: actor.agentId ?? null,
+            resolvedByUserId: actor.userId ?? null,
+            resolvedAt: now,
+            updatedAt: now,
+          })
+          .where(and(
+            eq(issueThreadInteractions.id, row.id),
+            eq(issueThreadInteractions.status, "pending"),
+          ))
+          .returning();
+        if (updated) expired.push(hydrateInteraction(updated));
+      }
+
+      if (expired.length > 0) {
+        await touchIssue(db, issue.id);
+      }
+      return expired;
     },
 
     create: async (

@@ -231,8 +231,8 @@ const MAX_TURN_CONTINUATION_MAX_ATTEMPTS_CAP = 10;
 const MAX_TURN_CONTINUATION_DEFAULT_DELAY_MS = 1_000;
 const MAX_TURN_CONTINUATION_MAX_DELAY_MS = 5 * 60 * 1000;
 const MAX_TURN_CONTINUATION_LIVE_RUN_STATUSES = ["scheduled_retry", "queued", "running"] as const;
-export const CEO_HEARTBEAT_INSTRUCTION_VERSION = "2026-05-13.ceo-board-flow.v1";
-export const CEO_HEARTBEAT_TASK_KEY = "__ceo_company_flow__:2026-05-13.ceo-board-flow.v1";
+export const CEO_HEARTBEAT_INSTRUCTION_VERSION = "2026-05-21.board-decision-routing.v3";
+export const CEO_HEARTBEAT_TASK_KEY = "__ceo_company_flow__:" + CEO_HEARTBEAT_INSTRUCTION_VERSION;
 export const CEO_BOARD_FLOW_STATUSES = ["in_review", "in_progress", "todo", "backlog", "blocked", "done", "cancelled"] as const;
 const CEO_BOARD_FLOW_SAMPLE_LIMIT_PER_STATUS = 8;
 type CodexTransientFallbackMode =
@@ -1606,6 +1606,28 @@ function parseIssueAssigneeAdapterOverrides(
  */
 const HEARTBEAT_TASK_KEY = "__heartbeat__";
 
+function getExecutionStageWakeTargetAgentId(wakeReason: string | null, rawExecutionState: unknown) {
+  if (
+    wakeReason !== "execution_review_requested" &&
+    wakeReason !== "execution_approval_requested" &&
+    wakeReason !== "execution_changes_requested"
+  ) {
+    return null;
+  }
+  const executionState = parseIssueExecutionState(rawExecutionState);
+  if (!executionState) return null;
+  if (wakeReason === "execution_review_requested" || wakeReason === "execution_approval_requested") {
+    const participant = executionState.currentParticipant;
+    return executionState.status === "pending" && participant?.type === "agent"
+      ? (participant.agentId ?? null)
+      : null;
+  }
+  const returnAssignee = executionState.returnAssignee;
+  return executionState.status === "changes_requested" && returnAssignee?.type === "agent"
+    ? (returnAssignee.agentId ?? null)
+    : null;
+}
+
 function deriveTaskKey(
   contextSnapshot: Record<string, unknown> | null | undefined,
   payload: Record<string, unknown> | null | undefined,
@@ -1775,6 +1797,10 @@ export function buildCeoHeartbeatMarkdown(input: {
     "",
     "You are running a CEO/controller heartbeat for the whole company board, not a personal inbox heartbeat.",
     "You do not need to personally review every deliverable. Your job is to make sure somebody accountable does, that work has the right owner/status, and that blocked work names the unblock owner/action.",
+    "Do not let PR/review gates wait on the board by default. For each in_review issue, make review somebody’s job inside the company: pick the most appropriate idle/active agent (often the CEO for board-level decisions, otherwise an adjacent specialist), assign them as the reviewer or open a bounded review issue, wake them, and name exactly what they must approve, reject, merge, or return for changes. For code changes, the Merge Request/Pull Request author must request review from the designated reviewing agent and record the review request on the issue/PR before waiting. Ask the human board only for budget, credentials, irreversible external actions, policy exceptions, or explicit product/business choices.",
+    "Classify every blocker before you wait: agent_actionable, ceo_actionable, human_only, or external_wait. A passive wait is valid only when the blocker is marked human_only/external_wait with a specific reason; otherwise take one concrete action yourself or route it to a named company agent.",
+    "If a real board decision is required, create an ask_user_questions or request_confirmation interaction with payload.decisionClass='human_only'. For each company, route that decision to the company's dedicated Telegram board group. For Eli Board, that group is Mare Operator HQ; include boardNotification { platform: 'telegram', channelName: 'Mare Operator HQ', required: true, messageMarkdown: '<concise decision request>' } and record in the issue comment that the Hermes-cluster Eli relay must notify Telegram.",
+    "If an issue is already in_review with only a stale request_confirmation or historical board prompt, convert it into an agent-owned review path instead of holding. If the designated reviewer is unavailable, blocked, conflicted, or rate-limited, create or wake a contingency reviewer and keep the original reviewer path documented so operations can continue. If the issue is superseded by merged work and no human-only decision remains, close it with an audit comment instead of requesting ratification forever.",
     "",
     "Work the board from right to left every heartbeat:",
     "1. in_review — highest priority: ensure reviews/approvals happen as soon as possible, assign or wake the right reviewer, and prevent review limbo.",
@@ -5024,7 +5050,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       };
     }
 
-    if (issue.assigneeAgentId !== run.agentId) {
+    const executionStageTargetAgentId = getExecutionStageWakeTargetAgentId(
+      readNonEmptyString(contextSnapshot.wakeReason),
+      issue.executionState,
+    );
+    const executionStageWakeMatchesCurrentTarget =
+      Boolean(executionStageTargetAgentId) && executionStageTargetAgentId === run.agentId;
+
+    if (issue.assigneeAgentId !== run.agentId && !executionStageWakeMatchesCurrentTarget) {
       return {
         allowed: false,
         reason: "Scheduled retry suppressed because issue ownership changed",
@@ -6346,6 +6379,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const isInteractionWake = allowsIssueInteractionWake(context);
     const resumeIntent = context.resumeIntent === true || context.followUpRequested === true;
     const wakeReason = readNonEmptyString(context.wakeReason);
+    const executionStageTargetAgentId = getExecutionStageWakeTargetAgentId(wakeReason, issue.executionState);
+    const executionStageWakeMatchesCurrentTarget =
+      Boolean(executionStageTargetAgentId) && executionStageTargetAgentId === run.agentId;
     const retryReason = readNonEmptyString(context.retryReason) ?? run.scheduledRetryReason ?? null;
 
     if (
@@ -6377,7 +6413,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
     }
 
-    if (issue.assigneeAgentId !== run.agentId && !isInteractionWake) {
+    if (issue.assigneeAgentId !== run.agentId && !isInteractionWake && !executionStageWakeMatchesCurrentTarget) {
       return {
         stale: true,
         errorCode: "issue_assignee_changed",
@@ -7278,22 +7314,23 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     } else {
       delete context[PAPERCLIP_WAKE_PAYLOAD_KEY];
     }
-    const taskMarkdown = buildPaperclipTaskMarkdown({
-      issue: issueRef
-        ? {
-            id: issueRef.id,
-            identifier: issueRef.identifier,
-            title: issueRef.title,
-            workMode: issueRef.workMode,
-            description: issueRef.description,
-          }
-        : null,
-      wakeComment: wakeCommentContext,
-      interaction: {
-        kind: readNonEmptyString(context.interactionKind),
-        status: readNonEmptyString(context.interactionStatus),
-      },
-    });
+    const taskMarkdown =
+      buildPaperclipTaskMarkdown({
+        issue: issueRef
+          ? {
+              id: issueRef.id,
+              identifier: issueRef.identifier,
+              title: issueRef.title,
+              workMode: issueRef.workMode,
+              description: issueRef.description,
+            }
+          : null,
+        wakeComment: wakeCommentContext,
+        interaction: {
+          kind: readNonEmptyString(context.interactionKind),
+          status: readNonEmptyString(context.interactionStatus),
+        },
+      }) || readNonEmptyString(parseObject(context.ceoCompanyFlow).markdown);
     if (issueRef) {
       context.paperclipIssue = {
         id: issueRef.id,

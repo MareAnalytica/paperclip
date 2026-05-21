@@ -34,6 +34,41 @@ describe("issue thread interaction schemas", () => {
     });
   });
 
+
+  it("parses explicit human-only board decision routing metadata", () => {
+    const parsed = createIssueThreadInteractionSchema.parse({
+      kind: "ask_user_questions",
+      continuationPolicy: "wake_assignee",
+      payload: {
+        version: 1,
+        title: "Board decision required",
+        decisionClass: "human_only",
+        boardNotification: {
+          platform: "telegram",
+          channelName: "Mare Operator HQ",
+          target: "telegram:Mare Operator HQ",
+          required: true,
+          messageMarkdown: "ELI-132 needs a repository-history strategy decision.",
+        },
+        questions: [{
+          id: "strategy",
+          prompt: "Which reconciliation strategy should Eli use?",
+          selectionMode: "single",
+          options: [{ id: "cherry-pick", label: "Cherry-pick Timeline B artifacts" }],
+        }],
+      },
+    });
+
+    expect(parsed.kind).toBe("ask_user_questions");
+    if (parsed.kind !== "ask_user_questions") return;
+    expect(parsed.payload.decisionClass).toBe("human_only");
+    expect(parsed.payload.boardNotification).toMatchObject({
+      platform: "telegram",
+      channelName: "Mare Operator HQ",
+      required: true,
+    });
+  });
+
   it("accepts issue document targets for request_confirmation interactions", () => {
     const parsed = createIssueThreadInteractionSchema.parse({
       kind: "request_confirmation",
