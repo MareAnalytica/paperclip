@@ -96,3 +96,21 @@ export function trackErrorHandlerCrash(
 ): void {
   client.track("error.handler_crash", { error_code: dims.errorCode });
 }
+
+/**
+ * Counter for ELI-168 / DEE-448: server-side WARN when an agent is created or
+ * patched and the post-merge `adapterConfig.env.MEM0_USER_ID` is absent or
+ * empty. Promotion to blocking is governed by the metric contract on ELI-168.
+ *
+ * Equivalent Prometheus-style label: `agent_writes_missing_mem0_user_id_total{companyId,verb,caller}`.
+ */
+export function trackAgentMissingMem0UserId(
+  client: TelemetryClient,
+  dims: { companyId: string; verb: "create" | "update"; caller: string },
+): void {
+  client.track("agent.missing_mem0_user_id", {
+    company_id: dims.companyId,
+    verb: dims.verb,
+    caller: dims.caller,
+  });
+}

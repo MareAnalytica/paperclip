@@ -49,6 +49,7 @@ import {
   workspaceOperationService,
 } from "../services/index.js";
 import { conflict, forbidden, notFound, unprocessable } from "../errors.js";
+import { recordAgentMem0UserIdGap } from "../services/agent-mem0-warn.js";
 import { assertBoard, assertCompanyAccess, assertInstanceAdmin, getActorInfo } from "./authz.js";
 import {
   assertNoAgentHostWorkspaceCommandMutation,
@@ -2102,6 +2103,13 @@ export function agentRoutes(
       trackAgentCreated(telemetryClient, { agentRole: agent.role, agentId: agent.id });
     }
 
+    await recordAgentMem0UserIdGap(db, {
+      companyId,
+      agent,
+      verb: "create",
+      actor,
+    });
+
     await applyDefaultAgentTaskAssignGrant(
       companyId,
       agent.id,
@@ -2696,6 +2704,13 @@ export function agentRoutes(
       entityType: "agent",
       entityId: agent.id,
       details: summarizeAgentUpdateDetails(patchData),
+    });
+
+    await recordAgentMem0UserIdGap(db, {
+      companyId: agent.companyId,
+      agent,
+      verb: "update",
+      actor,
     });
 
     res.json(agent);
