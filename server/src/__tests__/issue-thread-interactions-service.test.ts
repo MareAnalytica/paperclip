@@ -526,7 +526,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       userId: "local-board",
     });
 
-    const cancelled = await interactionsSvc.cancelQuestions({
+    const cancelled = await interactionsSvc.cancelInteraction({
       id: issueId,
       companyId,
     }, created.id, {
@@ -550,6 +550,51 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     }, created.id, {
       answers: [{ questionId: "scope", optionIds: ["phase-1"] }],
     }, {
+      userId: "local-board",
+    })).rejects.toThrow("Interaction has already been resolved");
+  });
+
+
+
+  it("cancels request confirmations without accepting them", async () => {
+    const { companyId, issueId } = await seedConfirmationIssue();
+
+    const created = await interactionsSvc.create({
+      id: issueId,
+      companyId,
+    }, {
+      kind: "request_confirmation",
+      payload: {
+        version: 1,
+        prompt: "Open the peer ticket?",
+      },
+    }, {
+      userId: "local-board",
+    });
+
+    const cancelled = await interactionsSvc.cancelInteraction({
+      id: issueId,
+      companyId,
+    }, created.id, {
+      reason: "superseded by a clearer human-only prompt",
+    }, {
+      userId: "local-board",
+    });
+
+    expect(cancelled.status).toBe("cancelled");
+    expect(cancelled.kind).toBe("request_confirmation");
+    expect(cancelled.result).toEqual({
+      version: 1,
+      outcome: "cancelled",
+      reason: "superseded by a clearer human-only prompt",
+    });
+
+    await expect(interactionsSvc.acceptInteraction({
+      id: issueId,
+      companyId,
+      projectId: null,
+      goalId: null,
+    }, created.id, {}, {
       userId: "local-board",
     })).rejects.toThrow("Interaction has already been resolved");
   });

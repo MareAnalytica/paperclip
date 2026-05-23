@@ -1229,6 +1229,32 @@ export function issueRoutes(
     }
   }
 
+  async function assertNoPendingInteractionsBeforeTerminalStatus(input: {
+    issue: { id: string; status: string };
+    nextStatus?: unknown;
+  }) {
+    if (typeof input.nextStatus !== "string") return;
+    if (!isClosedIssueStatus(input.nextStatus) || isClosedIssueStatus(input.issue.status)) return;
+
+    const interactions = await issueThreadInteractionService(db).listForIssue(input.issue.id);
+    const pendingInteractions = interactions
+      .filter((interaction) => interaction.status === "pending")
+      .map((interaction) => ({
+        id: interaction.id,
+        kind: interaction.kind,
+        status: interaction.status,
+        title: interaction.title ?? null,
+      }));
+
+    if (pendingInteractions.length === 0) return;
+
+    throw conflict("Issue has pending interactions", {
+      code: "pending_issue_interactions",
+      pendingInteractions,
+      requiredAction: "Resolve, cancel, or supersede pending issue interactions before closing the issue.",
+    });
+  }
+
   function parseDateQuery(value: unknown, field: string) {
     if (typeof value !== "string" || value.trim().length === 0) return undefined;
     const parsed = new Date(value);
@@ -2297,6 +2323,11 @@ export function issueRoutes(
       existing,
       updateFields,
       actorType: req.actor.type,
+    });
+
+    await assertNoPendingInteractionsBeforeTerminalStatus({
+      issue: existing,
+      nextStatus: updateFields.status,
     });
 
     const actionStatus = outcome === "cancelled" ? "cancelled" : "resolved";
@@ -3643,6 +3674,11 @@ export function issueRoutes(
       actorType: req.actor.type,
     });
 
+    await assertNoPendingInteractionsBeforeTerminalStatus({
+      issue: existing,
+      nextStatus: updateFields.status,
+    });
+
     const nextAssigneeAgentId =
       updateFields.assigneeAgentId === undefined ? existing.assigneeAgentId : (updateFields.assigneeAgentId as string | null);
     const nextAssigneeUserId =
@@ -4895,10 +4931,12 @@ export function issueRoutes(
         return;
       }
       assertCompanyAccess(req, issue.companyId);
-      assertBoard(req);
+      if (req.actor.type !== "agent") {
+        assertBoard(req);
+      }
 
       const actor = getActorInfo(req);
-      const interaction = await issueThreadInteractionService(db).cancelQuestions(issue, interactionId, req.body, {
+      const interaction = await issueThreadInteractionService(db).cancelInteraction(issue, interactionId, req.body, {
         agentId: actor.agentId,
         userId: actor.actorType === "user" ? actor.actorId : null,
       });
@@ -4919,7 +4957,11 @@ export function issueRoutes(
           cancellationReason:
             interaction.kind === "ask_user_questions"
               ? (interaction.result?.cancellationReason ?? null)
-              : null,
+              : interaction.kind === "request_confirmation"
+                ? (interaction.result?.reason ?? null)
+                : interaction.kind === "suggest_tasks"
+                  ? (interaction.result?.rejectionReason ?? null)
+                  : null,
         },
       });
 
