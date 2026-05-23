@@ -1315,42 +1315,55 @@ export function issueThreadInteractionService(db: Db) {
       return hydrateInteraction(updated);
     },
 
-    cancelQuestions: async (
+    cancelInteraction: async (
       issue: { id: string; companyId: string },
       interactionId: string,
       input: CancelIssueThreadInteraction,
       actor: InteractionActor,
     ) => {
       const data = cancelIssueThreadInteractionSchema.parse(input);
-      const current = await db
-        .select()
-        .from(issueThreadInteractions)
-        .where(eq(issueThreadInteractions.id, interactionId))
-        .then((rows) => rows[0] ?? null);
+      const current = await getPendingInteractionForResolution({ issue, interactionId });
 
-      if (!current) throw notFound("Interaction not found");
-      if (current.companyId !== issue.companyId || current.issueId !== issue.id) {
-        throw notFound("Interaction not found");
-      }
-      if (current.kind !== "ask_user_questions") {
-        throw unprocessable("Only ask_user_questions interactions can be cancelled");
-      }
-      if (current.status !== "pending") {
-        throw conflict("Interaction has already been resolved");
+      if (actor.agentId && !actor.userId && current.createdByAgentId !== actor.agentId) {
+        throw unprocessable("Only the interaction creator or a board user can cancel this interaction");
       }
 
       const reason = data.reason?.trim() || null;
-      const [updated] = await db
-        .update(issueThreadInteractions)
-        .set({
-          status: "cancelled",
-          result: {
+      let result: IssueThreadInteraction["result"];
+      switch (current.kind) {
+        case "ask_user_questions":
+          result = {
             version: 1,
             answers: [],
             cancelled: true,
             cancellationReason: reason,
             summaryMarkdown: null,
-          },
+          };
+          break;
+        case "request_confirmation":
+          result = {
+            version: 1,
+            outcome: "cancelled",
+            reason,
+          };
+          break;
+        case "suggest_tasks":
+          result = {
+            version: 1,
+            createdTasks: [],
+            skippedClientKeys: [],
+            rejectionReason: reason,
+          };
+          break;
+        default:
+          throw unprocessable(`Interactions of kind ${current.kind} cannot be cancelled`);
+      }
+
+      const [updated] = await db
+        .update(issueThreadInteractions)
+        .set({
+          status: "cancelled",
+          result,
           resolvedByAgentId: actor.agentId ?? null,
           resolvedByUserId: actor.userId ?? null,
           resolvedAt: new Date(),

@@ -65,6 +65,7 @@ const mockStorageService = vi.hoisted(() => ({
 const mockIssueThreadInteractionService = vi.hoisted(() => ({
   expireRequestConfirmationsSupersededByComment: vi.fn(async () => []),
   expireStaleRequestConfirmationsForIssueDocument: vi.fn(async () => []),
+  listForIssue: vi.fn(async () => []),
 }));
 const mockIssueRecoveryActionService = vi.hoisted(() => ({
   getActiveForIssue: vi.fn(async () => null),
@@ -347,6 +348,8 @@ describe("agent issue mutation checkout ownership", () => {
     mockStorageService.getObject.mockReset();
     mockStorageService.headObject.mockReset();
     mockStorageService.deleteObject.mockReset();
+    mockIssueThreadInteractionService.listForIssue.mockReset();
+    mockIssueThreadInteractionService.listForIssue.mockResolvedValue([]);
     mockAccessService.canUser.mockResolvedValue(true);
     mockAccessService.hasPermission.mockResolvedValue(false);
     mockAgentService.getById.mockImplementation(async (id: string) => {
@@ -499,6 +502,34 @@ describe("agent issue mutation checkout ownership", () => {
     expect(mockWorkProductService.update).not.toHaveBeenCalled();
     expect(mockStorageService.putFile).not.toHaveBeenCalled();
     expect(mockStorageService.deleteObject).not.toHaveBeenCalled();
+  });
+
+
+
+  it("rejects closing an issue while issue-thread interactions are still pending", async () => {
+    mockIssueThreadInteractionService.listForIssue.mockResolvedValueOnce([
+      {
+        id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        kind: "request_confirmation",
+        status: "pending",
+        title: "Confirm open PR",
+      },
+    ]);
+
+    const res = await request(await createApp(ownerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({ status: "done" });
+
+    expect(res.status).toBe(409);
+    expect(res.body.error).toBe("Issue has pending interactions");
+    expect(res.body.details.pendingInteractions).toEqual([
+      expect.objectContaining({
+        id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        kind: "request_confirmation",
+        status: "pending",
+      }),
+    ]);
+    expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 
   it("allows the checked-out owner with the matching run id to patch and update documents", async () => {

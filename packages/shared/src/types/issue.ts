@@ -725,7 +725,7 @@ export interface RequestConfirmationPayload {
 
 export interface RequestConfirmationResult {
   version: 1;
-  outcome: "accepted" | "rejected" | "superseded_by_comment" | "stale_target" | "issue_terminal_status";
+  outcome: "accepted" | "rejected" | "cancelled" | "superseded_by_comment" | "stale_target" | "issue_terminal_status";
   reason?: string | null;
   commentId?: string | null;
   staleTarget?: RequestConfirmationTarget | null;
