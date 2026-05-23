@@ -2231,6 +2231,13 @@ export function agentRoutes(
       trackAgentCreated(telemetryClient, { agentRole: agent.role, agentId: agent.id });
     }
 
+    await recordAgentMem0UserIdGap(db, {
+      companyId,
+      agent,
+      verb: "create",
+      actor,
+    });
+
     await applyDefaultAgentTaskAssignGrant(
       companyId,
       agent.id,

@@ -13,7 +13,8 @@ emits:
 
 1. A structured **pino warn log** under event tag `agent_missing_mem0_user_id`
    with fields `companyId`, `agentId`, `verb` (`create`/`update`), `caller`
-   (`agent`/`user`/`board`/`system`/`plugin`), `callerActorId`.
+   (`agent` or `user` in production; `system` and `plugin` are reserved for
+   future actor-type shims and not emitted today), `callerActorId`.
 2. A single **activity_log row** with `action = "agent_missing_mem0_user_id"`,
    `entity_type = "agent"`, `entity_id = <agentId>`, and `details = {verb,
    caller, callerActorId, agentName, agentRole}`.
