@@ -513,6 +513,47 @@ describe.sequential("issue thread interaction routes", () => {
     );
   });
 
+
+
+  it("allows agent creators to request cancellation without issue ownership", async () => {
+    mockInteractionService.cancelInteraction.mockResolvedValueOnce({
+      id: "interaction-agent-created",
+      companyId: "company-1",
+      issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      kind: "request_confirmation",
+      status: "cancelled",
+      continuationPolicy: "none",
+      idempotencyKey: null,
+      sourceCommentId: null,
+      sourceRunId: "run-creator",
+      payload: { version: 1, prompt: "Confirm?" },
+      result: { version: 1, outcome: "cancelled", reason: "superseded" },
+      createdAt: "2026-04-20T12:00:00.000Z",
+      updatedAt: "2026-04-20T12:05:00.000Z",
+      resolvedAt: "2026-04-20T12:05:00.000Z",
+    });
+    const app = await createApp({
+      type: "agent",
+      agentId: "agent-creator",
+      companyId: "company-1",
+      companyIds: ["company-1"],
+      runId: "run-creator",
+      source: "agent_api_key",
+    });
+
+    const res = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions/interaction-agent-created/cancel")
+      .send({ reason: "superseded" });
+
+    expect(res.status).toBe(200);
+    expect(mockInteractionService.cancelInteraction).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" }),
+      "interaction-agent-created",
+      { reason: "superseded" },
+      expect.objectContaining({ agentId: "agent-creator", userId: null }),
+    );
+  });
+
   it("accepts request confirmations and wakes the current assignee when configured for accept-only wakeups", async () => {
     mockInteractionService.acceptInteraction.mockResolvedValueOnce({
       interaction: {
