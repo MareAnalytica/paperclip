@@ -43,11 +43,18 @@ describe("issue thread interaction schemas", () => {
         version: 1,
         title: "Board decision required",
         decisionClass: "human_only",
+        decisionSubject: {
+          type: "repository_history_strategy",
+          repository: "MareAnalytica/eli-board",
+          issueIdentifier: "ELI-132",
+          summary: "Choose a reconciliation strategy.",
+        },
         boardNotification: {
           platform: "telegram",
           channelName: "Mare Operator HQ",
           target: "telegram:Mare Operator HQ",
           required: true,
+          safetyTier: "legal",
           messageMarkdown: "ELI-132 needs a repository-history strategy decision.",
         },
         questions: [{
@@ -62,10 +69,15 @@ describe("issue thread interaction schemas", () => {
     expect(parsed.kind).toBe("ask_user_questions");
     if (parsed.kind !== "ask_user_questions") return;
     expect(parsed.payload.decisionClass).toBe("human_only");
+    expect(parsed.payload.decisionSubject).toMatchObject({
+      type: "repository_history_strategy",
+      repository: "MareAnalytica/eli-board",
+    });
     expect(parsed.payload.boardNotification).toMatchObject({
       platform: "telegram",
       channelName: "Mare Operator HQ",
       required: true,
+      safetyTier: "legal",
     });
   });
 

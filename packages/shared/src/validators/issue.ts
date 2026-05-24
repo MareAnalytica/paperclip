@@ -616,12 +616,34 @@ export const issueThreadInteractionDecisionClassSchema = z.enum([
   "external_wait",
 ]);
 
+export const issueThreadInteractionBoardNotificationSafetyTierSchema = z.enum([
+  "production_deploy",
+  "credentials",
+  "rbac",
+  "network",
+  "legal",
+]);
+
 export const issueThreadInteractionBoardNotificationSchema = z.object({
   platform: z.literal("telegram").optional().default("telegram"),
   channelName: z.string().trim().min(1).max(160),
   target: z.string().trim().min(1).max(240).nullable().optional(),
   required: z.boolean().optional().default(false),
   messageMarkdown: z.string().trim().max(4000).nullable().optional(),
+  safetyTier: issueThreadInteractionBoardNotificationSafetyTierSchema.nullable().optional(),
+});
+
+export const issueThreadInteractionDecisionSubjectSchema = z.object({
+  type: z.string().trim().min(1).max(120),
+  repository: z.string().trim().max(240).nullable().optional(),
+  pullRequest: z.string().trim().max(240).nullable().optional(),
+  pr: z.string().trim().max(240).nullable().optional(),
+  prNumber: z.union([z.string().trim().max(120), z.number().int().positive()]).nullable().optional(),
+  prUrl: z.string().trim().max(2000).nullable().optional(),
+  pullRequestUrl: z.string().trim().max(2000).nullable().optional(),
+  url: z.string().trim().max(2000).nullable().optional(),
+  issueIdentifier: z.string().trim().max(120).nullable().optional(),
+  summary: z.string().trim().max(1000).nullable().optional(),
 });
 
 export const askUserQuestionsPayloadSchema = z.object({
@@ -629,6 +651,7 @@ export const askUserQuestionsPayloadSchema = z.object({
   title: z.string().trim().max(240).nullable().optional(),
   submitLabel: z.string().trim().max(120).nullable().optional(),
   decisionClass: issueThreadInteractionDecisionClassSchema.optional(),
+  decisionSubject: issueThreadInteractionDecisionSubjectSchema.nullable().optional(),
   boardNotification: issueThreadInteractionBoardNotificationSchema.nullable().optional(),
   questions: z.array(askUserQuestionsQuestionSchema).min(1).max(10),
 }).superRefine((value, ctx) => {
@@ -707,6 +730,7 @@ export const requestConfirmationPayloadSchema = z.object({
   version: z.literal(1),
   prompt: z.string().trim().min(1).max(1000),
   decisionClass: issueThreadInteractionDecisionClassSchema.optional(),
+  decisionSubject: issueThreadInteractionDecisionSubjectSchema.nullable().optional(),
   boardNotification: issueThreadInteractionBoardNotificationSchema.nullable().optional(),
   acceptLabel: z.string().trim().min(1).max(80).nullable().optional(),
   rejectLabel: z.string().trim().min(1).max(80).nullable().optional(),

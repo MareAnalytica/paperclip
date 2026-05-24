@@ -96,6 +96,96 @@ function isEquivalentCreateRequest(
   );
 }
 
+const HUMAN_BOARD_PR_REVIEW_SAFETY_TIERS = new Set([
+  "production_deploy",
+  "credentials",
+  "rbac",
+  "network",
+  "legal",
+]);
+
+const PR_REVIEW_DECISION_SUBJECT_TYPES = new Set([
+  "pr_review",
+  "pull_request_review",
+  "pull_request_merge",
+  "pr_merge",
+  "merge_approval",
+  "code_review",
+]);
+
+function stringIncludesPrReviewOrMerge(value: string) {
+  return /(?:\bpr\b|pull request|github\.com\/[^\s]+\/pull\/\d+|[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+#\d+).{0,100}(?:review|merge|approval|approve|ship|land|greenlight|lgtm|sign[- ]?off|release|deploy)|(?:review|merge|approve|ship|land|greenlight|lgtm|sign[- ]?off|release|deploy).{0,100}(?:\bpr\b|pull request|github\.com\/[^\s]+\/pull\/\d+|[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+#\d+)/i.test(value);
+}
+
+function collectBoardDecisionText(payload: Record<string, unknown>, boardNotification: Record<string, unknown> | null) {
+  const parts: string[] = [];
+  for (const key of ["title", "prompt", "detailsMarkdown", "summary"] as const) {
+    const value = payload[key];
+    if (typeof value === "string") parts.push(value);
+  }
+  const target = payload.target && typeof payload.target === "object" ? payload.target as Record<string, unknown> : null;
+  if (target) {
+    for (const key of ["label", "href", "key", "revisionId"] as const) {
+      const value = target[key];
+      if (typeof value === "string") parts.push(value);
+    }
+  }
+  if (boardNotification && typeof boardNotification.messageMarkdown === "string") parts.push(boardNotification.messageMarkdown);
+  const questions = payload.questions;
+  if (Array.isArray(questions)) {
+    for (const question of questions) {
+      if (!question || typeof question !== "object") continue;
+      const q = question as Record<string, unknown>;
+      if (typeof q.prompt === "string") parts.push(q.prompt);
+      const options = q.options;
+      if (!Array.isArray(options)) continue;
+      for (const option of options) {
+        if (!option || typeof option !== "object") continue;
+        const label = (option as Record<string, unknown>).label;
+        if (typeof label === "string") parts.push(label);
+      }
+    }
+  }
+  return parts.join("\n");
+}
+
+function hasPrSubjectAlias(decisionSubject: Record<string, unknown> | null) {
+  if (!decisionSubject) return false;
+  for (const key of ["pullRequest", "pr", "prNumber", "prUrl", "pullRequestUrl", "url"] as const) {
+    const value = decisionSubject[key];
+    if (typeof value === "number" && Number.isFinite(value)) return true;
+    if (typeof value === "string" && value.trim().length > 0) return true;
+  }
+  return false;
+}
+
+function isHumanBoardPrReviewEscalation(input: unknown) {
+  if (!input || typeof input !== "object") return false;
+  const body = input as { kind?: unknown; payload?: unknown };
+  if (body.kind !== "ask_user_questions" && body.kind !== "request_confirmation") return false;
+  const payload = body.payload && typeof body.payload === "object" ? body.payload as Record<string, unknown> : null;
+  if (!payload || payload.decisionClass !== "human_only") return false;
+  const boardNotification = payload.boardNotification && typeof payload.boardNotification === "object"
+    ? payload.boardNotification as Record<string, unknown>
+    : null;
+  const safetyTier = typeof boardNotification?.safetyTier === "string" ? boardNotification.safetyTier : null;
+  if (safetyTier && HUMAN_BOARD_PR_REVIEW_SAFETY_TIERS.has(safetyTier)) return false;
+  const decisionSubject = payload.decisionSubject && typeof payload.decisionSubject === "object"
+    ? payload.decisionSubject as Record<string, unknown>
+    : null;
+  const decisionSubjectType = typeof decisionSubject?.type === "string" ? decisionSubject.type.trim().toLowerCase() : null;
+  if (decisionSubjectType && PR_REVIEW_DECISION_SUBJECT_TYPES.has(decisionSubjectType)) return true;
+  if (hasPrSubjectAlias(decisionSubject)) return true;
+  return stringIncludesPrReviewOrMerge(collectBoardDecisionText(payload, boardNotification));
+}
+
+function assertHumanBoardPrReviewEscalationAllowed(input: CreateIssueThreadInteraction) {
+  if (!isHumanBoardPrReviewEscalation(input)) return;
+  throw unprocessable(
+    "Human board escalation is not allowed for ordinary pull request review or merge decisions. Route PR review internally to the reviewer, Chief Executive Officer, or Mission Owner, unless the request declares boardNotification.safetyTier as production_deploy, credentials, rbac, network, or legal.",
+  );
+}
+
 function hydrateInteraction(
   row: IssueThreadInteractionRow,
 ): IssueThreadInteraction {
@@ -701,6 +791,7 @@ export function issueThreadInteractionService(db: Db) {
       actor: InteractionActor,
     ) => {
       const data = createIssueThreadInteractionSchema.parse(input);
+      assertHumanBoardPrReviewEscalationAllowed(data);
 
       if (data.idempotencyKey) {
         const existing = await getIdempotentInteraction({
