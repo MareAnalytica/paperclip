@@ -653,12 +653,33 @@ export type IssueThreadInteractionDecisionClass =
   | "human_only"
   | "external_wait";
 
+export type IssueThreadInteractionBoardNotificationSafetyTier =
+  | "production_deploy"
+  | "credentials"
+  | "rbac"
+  | "network"
+  | "legal";
+
 export interface IssueThreadInteractionBoardNotification {
   platform?: "telegram";
   channelName: string;
   target?: string | null;
   required?: boolean;
   messageMarkdown?: string | null;
+  safetyTier?: IssueThreadInteractionBoardNotificationSafetyTier | null;
+}
+
+export interface IssueThreadInteractionDecisionSubject {
+  type: string;
+  repository?: string | null;
+  pullRequest?: string | null;
+  pr?: string | null;
+  prNumber?: string | number | null;
+  prUrl?: string | null;
+  pullRequestUrl?: string | null;
+  url?: string | null;
+  issueIdentifier?: string | null;
+  summary?: string | null;
 }
 
 export interface AskUserQuestionsPayload {
@@ -666,6 +687,7 @@ export interface AskUserQuestionsPayload {
   title?: string | null;
   submitLabel?: string | null;
   decisionClass?: IssueThreadInteractionDecisionClass;
+  decisionSubject?: IssueThreadInteractionDecisionSubject | null;
   boardNotification?: IssueThreadInteractionBoardNotification | null;
   questions: AskUserQuestionsQuestion[];
 }
@@ -711,6 +733,7 @@ export interface RequestConfirmationPayload {
   version: 1;
   prompt: string;
   decisionClass?: IssueThreadInteractionDecisionClass;
+  decisionSubject?: IssueThreadInteractionDecisionSubject | null;
   boardNotification?: IssueThreadInteractionBoardNotification | null;
   acceptLabel?: string | null;
   rejectLabel?: string | null;

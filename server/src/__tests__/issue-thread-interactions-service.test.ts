@@ -689,6 +689,38 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     expect(rows[0]?.idempotencyKey).toBe("run-1:questionnaire");
   });
 
+  it("rejects direct service creation of human board escalation for ordinary PR review", async () => {
+    const { companyId, issueId } = await seedConfirmationIssue("PR review governance");
+
+    await expect(interactionsSvc.create({
+      id: issueId,
+      companyId,
+    }, {
+      kind: "request_confirmation",
+      continuationPolicy: "wake_assignee",
+      payload: {
+        version: 1,
+        prompt: "Need human decision",
+        decisionClass: "human_only",
+        decisionSubject: {
+          type: "decision",
+          prUrl: "https://github.com/MareAnalytica/paperclip/pull/10",
+        },
+        boardNotification: {
+          platform: "telegram",
+          channelName: "Mare Operator HQ",
+          required: true,
+          messageMarkdown: "Please greenlight this change.",
+        },
+      },
+    }, {
+      agentId: randomUUID(),
+    })).rejects.toMatchObject({ status: 422 });
+
+    const rows = await db.select().from(issueThreadInteractions);
+    expect(rows).toHaveLength(0);
+  });
+
   it("accepts request_confirmation interactions without creating child issues", async () => {
     const companyId = randomUUID();
     const goalId = randomUUID();

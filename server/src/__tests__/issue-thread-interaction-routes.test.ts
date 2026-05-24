@@ -799,6 +799,90 @@ describe.sequential("issue thread interaction routes", () => {
     expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
   });
 
+  it("rejects agent-authored human board escalation for ordinary PR review", async () => {
+    const app = await createApp({
+      type: "agent",
+      agentId: CREATED_AGENT_ID,
+      companyId: "company-1",
+      runId: "run-1",
+    });
+
+    const res = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions")
+      .send({
+        kind: "request_confirmation",
+        payload: {
+          version: 1,
+          prompt: "Should the Eli Board approve and merge PR #9?",
+          decisionClass: "human_only",
+          decisionSubject: {
+            type: "pull_request_review",
+            repository: "MareAnalytica/paperclip",
+            pullRequest: "9",
+          },
+          boardNotification: {
+            platform: "telegram",
+            channelName: "Mare Operator HQ",
+            required: true,
+            messageMarkdown: "Please review and approve PR #9.",
+          },
+        },
+      });
+
+    expect(res.status).toBe(422);
+    expect(res.body.error).toContain("ordinary pull request review");
+    expect(mockInteractionService.create).not.toHaveBeenCalled();
+  });
+
+  it("allows human board PR escalation when an explicit safety tier is declared", async () => {
+    const app = await createApp({
+      type: "agent",
+      agentId: CREATED_AGENT_ID,
+      companyId: "company-1",
+      runId: "run-1",
+    });
+
+    const res = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions")
+      .send({
+        kind: "request_confirmation",
+        payload: {
+          version: 1,
+          prompt: "Approve production deploy after PR #9 merge?",
+          decisionClass: "human_only",
+          decisionSubject: {
+            type: "pull_request_merge",
+            repository: "MareAnalytica/paperclip",
+            pullRequest: "9",
+          },
+          boardNotification: {
+            platform: "telegram",
+            channelName: "Mare Operator HQ",
+            required: true,
+            safetyTier: "production_deploy",
+            messageMarkdown: "Production deploy approval required.",
+          },
+        },
+      });
+
+    expect(res.status).toBe(201);
+    expect(mockInteractionService.create).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" }),
+      expect.objectContaining({
+        kind: "request_confirmation",
+        payload: expect.objectContaining({
+          decisionClass: "human_only",
+          boardNotification: expect.objectContaining({ safetyTier: "production_deploy" }),
+        }),
+        sourceRunId: "run-1",
+      }),
+      {
+        agentId: CREATED_AGENT_ID,
+        userId: null,
+      },
+    );
+  });
+
   it("allows agent-authored interaction creation and stamps the active run id", async () => {
     const app = await createApp({
       type: "agent",
