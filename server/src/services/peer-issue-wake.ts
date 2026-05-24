@@ -31,7 +31,8 @@ export async function wakePeerIssueArrived(
     .from(agents)
     .where(and(
       eq(agents.companyId, input.targetCompanyId),
-      inArray(agents.role, ["ceo", "cto"]),
+      // Spec §8: fire to CEO/Mission Owner (role "ceo") only; "cto" excluded per spec text.
+      inArray(agents.role, ["ceo"]),
     ));
   for (const row of ceoRows) {
     try {

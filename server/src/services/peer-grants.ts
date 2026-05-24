@@ -75,13 +75,17 @@ export function peerGrantService(db: Db) {
       return rows;
     },
 
-    revoke: async (grantId: string, revokedAt: Date = new Date()) => {
+    revoke: async (grantId: string, targetCompanyId: string, revokedAt: Date = new Date()) => {
       const [row] = await db
         .update(agentPeerGrants)
         .set({ revokedAt })
-        .where(and(eq(agentPeerGrants.id, grantId), isNull(agentPeerGrants.revokedAt)))
+        .where(and(
+          eq(agentPeerGrants.id, grantId),
+          eq(agentPeerGrants.targetCompanyId, targetCompanyId),
+          isNull(agentPeerGrants.revokedAt),
+        ))
         .returning();
-      if (!row) throw notFound("Active peer grant not found");
+      if (!row) throw notFound("Active peer grant not found for this company");
       return row;
     },
 

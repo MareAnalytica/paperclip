@@ -2,6 +2,7 @@ import { and, eq, gte, sql } from "drizzle-orm";
 import {
   agents,
   issues,
+  issueComments,
   peerIssueAudits,
   type Db,
 } from "@paperclipai/db";
@@ -9,6 +10,15 @@ import { issueService } from "./issues.js";
 import { peerGrantService } from "./peer-grants.js";
 import { SYSTEM_PEER_ISSUE_USER_ID } from "./peer-issue-system-user.js";
 import { badRequest, conflict, forbidden, notFound, unprocessable } from "../errors.js";
+
+const PEER_ISSUE_AUDITS_IDEMPOTENCY_CONSTRAINT = "peer_issue_audits_idempotency_uq";
+
+function isIdempotencyConflict(error: unknown): boolean {
+  if (typeof error !== "object" || error === null) return false;
+  const err = error as { code?: string; constraint?: string; constraint_name?: string };
+  const constraint = err.constraint ?? err.constraint_name;
+  return err.code === "23505" && constraint === PEER_ISSUE_AUDITS_IDEMPOTENCY_CONSTRAINT;
+}
 
 /**
  * Per spec §8 CEO ruling 2026-05-24:
@@ -153,6 +163,10 @@ export function peerIssueService(db: Db) {
 
       const replay = await findIdempotentAudit(targetCompanyId, input.sourceCompanyId, input.idempotencyKey);
       if (replay) {
+        const snap = replay.responseSnapshot as Record<string, unknown> | null;
+        if (snap && "commentId" in snap && !("issueId" in snap)) {
+          throw conflict("idempotencyKey was previously used for a peer comment, not a peer issue create");
+        }
         return { replayed: true as const, audit: replay, response: replay.responseSnapshot };
       }
 
@@ -192,10 +206,23 @@ export function peerIssueService(db: Db) {
         sourceCallbackUrl: input.sourceCallbackUrl,
       };
 
-      const [audit] = await db
-        .insert(peerIssueAudits)
-        .values({ ...auditPayload, responseSnapshot: response })
-        .returning();
+      let audit: typeof peerIssueAudits.$inferSelect;
+      try {
+        const [row] = await db
+          .insert(peerIssueAudits)
+          .values({ ...auditPayload, responseSnapshot: response })
+          .returning();
+        audit = row;
+      } catch (err) {
+        // Concurrent request with the same idempotencyKey won the unique-index race.
+        // Delete the orphan issue we just created and replay the winner's audit row.
+        if (isIdempotencyConflict(err)) {
+          await db.delete(issues).where(eq(issues.id, issue.id));
+          const winner = await findIdempotentAudit(targetCompanyId, input.sourceCompanyId, input.idempotencyKey);
+          if (winner) return { replayed: true as const, audit: winner, response: winner.responseSnapshot };
+        }
+        throw err;
+      }
 
       return { replayed: false as const, audit, response, issue };
     },
@@ -222,6 +249,10 @@ export function peerIssueService(db: Db) {
 
       const replay = await findIdempotentAudit(targetCompanyId, input.sourceCompanyId, input.idempotencyKey);
       if (replay) {
+        const snap = replay.responseSnapshot as Record<string, unknown> | null;
+        if (snap && "issueId" in snap && !("commentId" in snap)) {
+          throw conflict("idempotencyKey was previously used for a peer issue create, not a comment");
+        }
         return { replayed: true as const, audit: replay, response: replay.responseSnapshot };
       }
 
@@ -236,6 +267,8 @@ export function peerIssueService(db: Db) {
         { authorType: "user" },
       );
 
+      const commentId = (comment as { id: string }).id;
+
       const auditPayload = {
         targetCompanyId,
         targetIssueId: targetIssue.id,
@@ -245,7 +278,9 @@ export function peerIssueService(db: Db) {
         sourceUserId: null,
         sourceIssueIdentifier: input.sourceIssueIdentifier,
         sourceCallbackUrl: input.sourceCallbackUrl,
-        acceptanceCriteria: "(comment on existing peer issue)",
+        // TODO: make acceptance_criteria nullable in a follow-on migration (ELI-237 follow-up);
+        // the sentinel string is benign but pollutes the audit log for comment-kind rows.
+        acceptanceCriteria: null as unknown as string,
         requestedAssigneeAgentNameKey: null,
         grantId: grant.id,
         guardrailAck: input.guardrailAck as Record<string, unknown>,
@@ -254,14 +289,25 @@ export function peerIssueService(db: Db) {
 
       const response = {
         issueIdentifier: targetIssue.identifier,
-        commentId: (comment as { id: string }).id,
+        commentId,
         targetCompanyId,
       };
 
-      const [audit] = await db
-        .insert(peerIssueAudits)
-        .values({ ...auditPayload, responseSnapshot: response })
-        .returning();
+      let audit: typeof peerIssueAudits.$inferSelect;
+      try {
+        const [row] = await db
+          .insert(peerIssueAudits)
+          .values({ ...auditPayload, responseSnapshot: response })
+          .returning();
+        audit = row;
+      } catch (err) {
+        if (isIdempotencyConflict(err)) {
+          await db.delete(issueComments).where(eq(issueComments.id, commentId));
+          const winner = await findIdempotentAudit(targetCompanyId, input.sourceCompanyId, input.idempotencyKey);
+          if (winner) return { replayed: true as const, audit: winner, response: winner.responseSnapshot };
+        }
+        throw err;
+      }
 
       return { replayed: false as const, audit, response, comment, issue: targetIssue };
     },

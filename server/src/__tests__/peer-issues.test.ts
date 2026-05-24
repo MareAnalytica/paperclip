@@ -360,6 +360,54 @@ describeEmbeddedPostgres("peer-issue service (spec §6)", () => {
     ).rejects.toThrow(/rate cap exceeded/);
   });
 
+  it("REFUSE: cross-action idempotencyKey reuse rejected (create key used for comment)", async () => {
+    await makeGrant(db, sourceAgent.id, target.id, ["peer_issue:create", "peer_issue:comment"]);
+    const sharedKey = hashKey("cross-action-key");
+    const created = await svc.create(target.id, sourceAgent.id, {
+      sourceCompanyId: source.id,
+      sourceAgentId: sourceAgent.id,
+      sourceIssueIdentifier: "SRC-XA",
+      sourceCallbackUrl: "https://source.example/issues/SRC-XA",
+      title: "Issue for cross-action test",
+      acceptanceCriteria: "ok",
+      guardrailAck: GUARDRAIL_ACK,
+      idempotencyKey: sharedKey,
+    });
+    expect(created.replayed).toBe(false);
+    if (created.replayed) throw new Error("expected fresh create");
+    // Re-using the same key for a comment should be rejected.
+    await expect(
+      svc.comment(target.id, created.issue.identifier, sourceAgent.id, {
+        sourceCompanyId: source.id,
+        sourceAgentId: sourceAgent.id,
+        sourceIssueIdentifier: "SRC-XA",
+        sourceCallbackUrl: "https://source.example/issues/SRC-XA",
+        body: "cross-action misuse",
+        guardrailAck: GUARDRAIL_ACK,
+        idempotencyKey: sharedKey,
+      }),
+    ).rejects.toThrow(/previously used for a peer issue create/);
+  });
+
+  it("REFUSE: revoke with wrong targetCompanyId cannot affect another company's grant", async () => {
+    const otherSource = await makeAgent(db, target.id, "general", "Target Agent");
+    // Create a grant on an UNRELATED third company.
+    const third = await makeCompany(db, "Third");
+    await makeAgent(db, third.id, "ceo", "Third CEO");
+    const victimGrant = await makeGrant(db, otherSource.id, third.id, ["peer_issue:create"]);
+    // Now try to revoke victimGrant using target.id as the scoped company.
+    await expect(
+      peerGrantService(db).revoke(victimGrant.id, target.id),
+    ).rejects.toThrow(/not found/);
+    // Verify the grant is still active.
+    const stillActive = await db
+      .select()
+      .from(agentPeerGrants)
+      .where(eq(agentPeerGrants.id, victimGrant.id))
+      .then((rows) => rows[0]!);
+    expect(stillActive.revokedAt).toBeNull();
+  });
+
   it("PASS: listAudits returns inbound rows for target and outbound rows for source", async () => {
     await makeGrant(db, sourceAgent.id, target.id, ["peer_issue:create"]);
     await svc.create(target.id, sourceAgent.id, {

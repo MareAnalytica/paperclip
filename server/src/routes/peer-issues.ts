@@ -25,7 +25,7 @@ const peerIssueCreateBodySchema = z.object({
   acceptanceCriteria: z.string().min(1),
   requestedAssigneeAgentNameKey: z.string().optional().nullable(),
   guardrailAck: guardrailAckSchema,
-  idempotencyKey: z.string().min(16).max(128),
+  idempotencyKey: z.string().regex(/^[a-f0-9]{64}$/, "idempotencyKey must be a sha256 hex string (64 lowercase hex chars)"),
 });
 
 const peerIssueCommentBodySchema = z.object({
@@ -34,7 +34,7 @@ const peerIssueCommentBodySchema = z.object({
   sourceCallbackUrl: z.string().url(),
   body: z.string().min(1).max(64_000),
   guardrailAck: guardrailAckSchema,
-  idempotencyKey: z.string().min(16).max(128),
+  idempotencyKey: z.string().regex(/^[a-f0-9]{64}$/, "idempotencyKey must be a sha256 hex string (64 lowercase hex chars)"),
 });
 
 const peerGrantCreateBodySchema = z.object({
@@ -270,10 +270,7 @@ export function peerIssueRoutes(db: Db) {
       if (req.actor.type !== "board") {
         throw forbidden("Peer grants can only be revoked by board actors");
       }
-      const grant = await grants.revoke(grantId);
-      if (grant.targetCompanyId !== targetCompanyId) {
-        throw forbidden("Grant does not belong to this company");
-      }
+      const grant = await grants.revoke(grantId, targetCompanyId);
       await logActivity(db, {
         companyId: targetCompanyId,
         actorType: "user",
