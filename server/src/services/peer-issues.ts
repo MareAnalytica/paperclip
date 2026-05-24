@@ -280,7 +280,7 @@ export function peerIssueService(db: Db) {
         sourceCallbackUrl: input.sourceCallbackUrl,
         // TODO: make acceptance_criteria nullable in a follow-on migration (ELI-237 follow-up);
         // the sentinel string is benign but pollutes the audit log for comment-kind rows.
-        acceptanceCriteria: null as unknown as string,
+        acceptanceCriteria: "(comment on existing peer issue)",
         requestedAssigneeAgentNameKey: null,
         grantId: grant.id,
         guardrailAck: input.guardrailAck as Record<string, unknown>,
