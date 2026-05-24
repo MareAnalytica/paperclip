@@ -371,6 +371,72 @@ function isExplicitBoardDecisionInteraction(interaction: unknown) {
   return typeof channelName === "string" && channelName.trim().length > 0;
 }
 
+const HUMAN_BOARD_PR_REVIEW_SAFETY_TIERS = new Set([
+  "production_deploy",
+  "credentials",
+  "rbac",
+  "network",
+  "legal",
+]);
+
+const PR_REVIEW_DECISION_SUBJECT_TYPES = new Set([
+  "pr_review",
+  "pull_request_review",
+  "pull_request_merge",
+  "pr_merge",
+  "merge_approval",
+  "code_review",
+]);
+
+function stringIncludesPrReviewOrMerge(value: string) {
+  return /(?:\bpr\b|pull request).{0,80}(?:review|merge|approval|approve)|(?:review|merge|approve).{0,80}(?:\bpr\b|pull request)/i.test(value);
+}
+
+function collectBoardDecisionText(payload: Record<string, unknown>, boardNotification: Record<string, unknown> | null) {
+  const parts: string[] = [];
+  for (const key of ["title", "prompt", "detailsMarkdown"] as const) {
+    const value = payload[key];
+    if (typeof value === "string") parts.push(value);
+  }
+  if (boardNotification && typeof boardNotification.messageMarkdown === "string") parts.push(boardNotification.messageMarkdown);
+  const questions = payload.questions;
+  if (Array.isArray(questions)) {
+    for (const question of questions) {
+      if (!question || typeof question !== "object") continue;
+      const q = question as Record<string, unknown>;
+      if (typeof q.prompt === "string") parts.push(q.prompt);
+      const options = q.options;
+      if (!Array.isArray(options)) continue;
+      for (const option of options) {
+        if (!option || typeof option !== "object") continue;
+        const label = (option as Record<string, unknown>).label;
+        if (typeof label === "string") parts.push(label);
+      }
+    }
+  }
+  return parts.join("\n");
+}
+
+function isHumanBoardPrReviewEscalation(input: unknown) {
+  if (!input || typeof input !== "object") return false;
+  const body = input as { kind?: unknown; payload?: unknown };
+  if (body.kind !== "ask_user_questions" && body.kind !== "request_confirmation") return false;
+  const payload = body.payload && typeof body.payload === "object" ? body.payload as Record<string, unknown> : null;
+  if (!payload || payload.decisionClass !== "human_only") return false;
+  const boardNotification = payload.boardNotification && typeof payload.boardNotification === "object"
+    ? payload.boardNotification as Record<string, unknown>
+    : null;
+  const safetyTier = typeof boardNotification?.safetyTier === "string" ? boardNotification.safetyTier : null;
+  if (safetyTier && HUMAN_BOARD_PR_REVIEW_SAFETY_TIERS.has(safetyTier)) return false;
+  const decisionSubject = payload.decisionSubject && typeof payload.decisionSubject === "object"
+    ? payload.decisionSubject as Record<string, unknown>
+    : null;
+  const decisionSubjectType = typeof decisionSubject?.type === "string" ? decisionSubject.type.trim().toLowerCase() : null;
+  if (decisionSubjectType && PR_REVIEW_DECISION_SUBJECT_TYPES.has(decisionSubjectType)) return true;
+  if (typeof decisionSubject?.pullRequest === "string" && decisionSubject.pullRequest.trim().length > 0) return true;
+  return stringIncludesPrReviewOrMerge(collectBoardDecisionText(payload, boardNotification));
+}
+
 function successfulRunHandoffStateFromActivity(row: {
   action: string;
   agentId: string | null;
@@ -4679,6 +4745,13 @@ export function issueRoutes(
     const actor = getActorInfo(req);
     const agentSourceRunId = req.actor.type === "agent" ? requireAgentRunId(req, res) : null;
     if (req.actor.type === "agent" && !agentSourceRunId) return;
+
+    if (isHumanBoardPrReviewEscalation(req.body)) {
+      res.status(422).json({
+        error: "Human board escalation is not allowed for ordinary pull request review or merge decisions. Route PR review internally to the reviewer, Chief Executive Officer, or Mission Owner, unless the request declares boardNotification.safetyTier as production_deploy, credentials, rbac, network, or legal.",
+      });
+      return;
+    }
 
     const interaction = await issueThreadInteractionService(db).create(issue, {
       ...req.body,
