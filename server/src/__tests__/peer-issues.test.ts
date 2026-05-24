@@ -389,6 +389,41 @@ describeEmbeddedPostgres("peer-issue service (spec §6)", () => {
     ).rejects.toThrow(/previously used for a peer issue create/);
   });
 
+  it("PASS: concurrent same-key creates produce exactly one target issue + one audit row (race regression)", async () => {
+    await makeGrant(db, sourceAgent.id, target.id, ["peer_issue:create"]);
+    const sharedKey = hashKey("concurrent-race");
+    const callArgs = {
+      sourceCompanyId: source.id,
+      sourceAgentId: sourceAgent.id,
+      sourceIssueIdentifier: "SRC-RACE",
+      sourceCallbackUrl: "https://source.example/issues/SRC-RACE",
+      title: "Concurrent race winner",
+      acceptanceCriteria: "exactly one issue + one audit",
+      guardrailAck: GUARDRAIL_ACK,
+      idempotencyKey: sharedKey,
+    } as const;
+    const results = await Promise.allSettled([
+      svc.create(target.id, sourceAgent.id, { ...callArgs }),
+      svc.create(target.id, sourceAgent.id, { ...callArgs }),
+      svc.create(target.id, sourceAgent.id, { ...callArgs }),
+    ]);
+    // Every settled result must be fulfilled (no 500); at least one must be a fresh
+    // create, the rest must be replays — and total target-company issues == 1.
+    const fulfilled = results.filter((r): r is PromiseFulfilledResult<Awaited<ReturnType<typeof svc.create>>> => r.status === "fulfilled");
+    expect(fulfilled).toHaveLength(results.length);
+    const fresh = fulfilled.filter((r) => r.value.replayed === false);
+    const replays = fulfilled.filter((r) => r.value.replayed === true);
+    expect(fresh.length).toBeGreaterThanOrEqual(1);
+    expect(fresh.length + replays.length).toBe(results.length);
+    // The durable artifact CEO called out: exactly one target-company issue exists
+    // for this idempotencyKey after the race resolves.
+    const targetIssuesRemaining = await db.select().from(issues).where(eq(issues.companyId, target.id));
+    expect(targetIssuesRemaining).toHaveLength(1);
+    const auditRows = await db.select().from(peerIssueAudits).where(eq(peerIssueAudits.idempotencyKey, sharedKey));
+    expect(auditRows).toHaveLength(1);
+    expect(auditRows[0]!.targetIssueId).toBe(targetIssuesRemaining[0]!.id);
+  });
+
   it("REFUSE: revoke with wrong targetCompanyId cannot affect another company's grant", async () => {
     const otherSource = await makeAgent(db, target.id, "general", "Target Agent");
     // Create a grant on an UNRELATED third company.
