@@ -40,5 +40,6 @@ export type TelemetryEventName =
   | "skill.imported"
   | "agent.first_heartbeat"
   | "agent.task_completed"
+  | "agent.missing_mem0_user_id"
   | "error.handler_crash"
   | `plugin.${string}`;
