@@ -377,6 +377,57 @@ describe("agent skill routes", () => {
     );
   });
 
+  it("bootstraps a fresh CEO with heartbeatSec=300 and embeds the CEO flow policy fragment", async () => {
+    const res = await request(createApp())
+      .post("/api/companies/company-1/agents")
+      .send({
+        name: "CEO",
+        role: "ceo",
+        adapterType: "claude_local",
+        adapterConfig: {},
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    const createdAdapterConfig =
+      (mockAgentService.create.mock.calls.at(-1)?.[1]?.adapterConfig ?? {}) as Record<
+        string,
+        unknown
+      >;
+    expect(createdAdapterConfig.heartbeatSec).toBe(300);
+    expect(createdAdapterConfig.heartbeatEnabled).toBe(true);
+    const ceoFlowMeta = createdAdapterConfig.ceoFlowPolicy as Record<string, unknown>;
+    expect(ceoFlowMeta).toBeDefined();
+    expect(ceoFlowMeta.resolvedHeartbeatSec).toBe(300);
+    expect(ceoFlowMeta.promptInsertKey).toBe("ceo-flow-ownership-v1");
+    expect(String(ceoFlowMeta.promptFragment)).toContain("CEO operating policy");
+
+    const materializeCall = mockAgentInstructionsService.materializeManagedBundle.mock.calls.at(-1);
+    expect(materializeCall).toBeDefined();
+    const filesArg = materializeCall![1] as Record<string, string>;
+    expect(filesArg["AGENTS.md"]).toContain("You are the CEO.");
+    expect(filesArg["AGENTS.md"]).toContain("CEO operating policy: heartbeat every 300 seconds");
+  });
+
+  it("does not apply CEO flow policy when role is not ceo", async () => {
+    const res = await request(createApp())
+      .post("/api/companies/company-1/agents")
+      .send({
+        name: "Engineer",
+        role: "engineer",
+        adapterType: "claude_local",
+        adapterConfig: {},
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    const createdAdapterConfig =
+      (mockAgentService.create.mock.calls.at(-1)?.[1]?.adapterConfig ?? {}) as Record<
+        string,
+        unknown
+      >;
+    expect(createdAdapterConfig.ceoFlowPolicy).toBeUndefined();
+    expect(createdAdapterConfig.heartbeatSec).toBeUndefined();
+  });
+
   it("materializes the bundled default instruction set for non-CEO agents with no prompt template", async () => {
     const res = await request(createApp())
       .post("/api/companies/company-1/agents")
