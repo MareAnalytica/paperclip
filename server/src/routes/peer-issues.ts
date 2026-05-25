@@ -111,7 +111,7 @@ export function peerIssueRoutes(db: Db) {
         details: {
           direction: "outbound",
           targetCompanyId,
-          targetIssueIdentifier: result.issue.identifier,
+          targetIssueIdentifier: result.issue.identifier ?? result.issue.id,
           sourceIssueIdentifier: req.body.sourceIssueIdentifier,
           peerAuditId: result.audit.id,
         },
@@ -120,7 +120,7 @@ export function peerIssueRoutes(db: Db) {
       const wake = await wakePeerIssueArrived(db, {
         targetCompanyId,
         targetIssueId: result.issue.id,
-        targetIssueIdentifier: result.issue.identifier,
+        targetIssueIdentifier: result.issue.identifier ?? result.issue.id,
         sourceCompanyId: req.body.sourceCompanyId,
         sourceIssueIdentifier: req.body.sourceIssueIdentifier,
         sourceCallbackUrl: req.body.sourceCallbackUrl,

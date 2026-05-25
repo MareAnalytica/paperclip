@@ -181,10 +181,12 @@ export function peerIssueService(db: Db) {
         createdByAgentId: null,
       });
 
+      const issueIdentifier = issue.identifier ?? issue.id;
+
       const auditPayload = {
         targetCompanyId,
         targetIssueId: issue.id,
-        targetIssueIdentifier: issue.identifier,
+        targetIssueIdentifier: issueIdentifier,
         sourceCompanyId: input.sourceCompanyId,
         sourceAgentId: agentId,
         sourceUserId: null,
@@ -193,13 +195,13 @@ export function peerIssueService(db: Db) {
         acceptanceCriteria: input.acceptanceCriteria,
         requestedAssigneeAgentNameKey: input.requestedAssigneeAgentNameKey ?? null,
         grantId: grant.id,
-        guardrailAck: input.guardrailAck as Record<string, unknown>,
+        guardrailAck: input.guardrailAck as Record<string, boolean>,
         idempotencyKey: input.idempotencyKey,
       };
 
       const response = {
         issueId: issue.id,
-        issueIdentifier: issue.identifier,
+        issueIdentifier,
         targetCompanyId,
         acceptanceCriteria: input.acceptanceCriteria,
         sourceIssueIdentifier: input.sourceIssueIdentifier,
@@ -268,11 +270,12 @@ export function peerIssueService(db: Db) {
       );
 
       const commentId = (comment as { id: string }).id;
+      const targetIssueResolvedIdentifier = targetIssue.identifier ?? targetIssue.id;
 
       const auditPayload = {
         targetCompanyId,
         targetIssueId: targetIssue.id,
-        targetIssueIdentifier: targetIssue.identifier,
+        targetIssueIdentifier: targetIssueResolvedIdentifier,
         sourceCompanyId: input.sourceCompanyId,
         sourceAgentId: agentId,
         sourceUserId: null,
@@ -283,12 +286,12 @@ export function peerIssueService(db: Db) {
         acceptanceCriteria: "(comment on existing peer issue)",
         requestedAssigneeAgentNameKey: null,
         grantId: grant.id,
-        guardrailAck: input.guardrailAck as Record<string, unknown>,
+        guardrailAck: input.guardrailAck as Record<string, boolean>,
         idempotencyKey: input.idempotencyKey,
       };
 
       const response = {
-        issueIdentifier: targetIssue.identifier,
+        issueIdentifier: targetIssueResolvedIdentifier,
         commentId,
         targetCompanyId,
       };
