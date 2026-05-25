@@ -61,6 +61,7 @@ import {
   loadDefaultAgentInstructionsBundle,
   resolveDefaultAgentInstructionsBundleRole,
 } from "../services/default-agent-instructions.js";
+import { applyCeoFlowPolicyToAdapterConfig } from "../services/ceo-flow-policy.js";
 
 export function agentRoutes(db: Db) {
   const DEFAULT_INSTRUCTIONS_PATH_KEYS: Record<string, string> = {
@@ -468,9 +469,22 @@ export function agentRoutes(db: Db) {
     const promptTemplate = typeof adapterConfig.promptTemplate === "string"
       ? adapterConfig.promptTemplate
       : "";
-    const files = promptTemplate.trim().length === 0
+    const ceoFlowFragment =
+      agent.role === "ceo"
+        ? (asRecord(adapterConfig.ceoFlowPolicy)?.promptFragment as string | undefined) ?? null
+        : null;
+    let files = promptTemplate.trim().length === 0
       ? await loadDefaultAgentInstructionsBundle(resolveDefaultAgentInstructionsBundleRole(agent.role))
       : { "AGENTS.md": promptTemplate };
+    if (ceoFlowFragment && typeof ceoFlowFragment === "string" && ceoFlowFragment.length > 0) {
+      const existing = typeof files["AGENTS.md"] === "string" ? files["AGENTS.md"] : "";
+      files = {
+        ...files,
+        "AGENTS.md": existing.trim().length === 0
+          ? ceoFlowFragment
+          : `${existing.trimEnd()}\n\n${ceoFlowFragment}`,
+      };
+    }
     const materialized = await instructions.materializeManagedBundle(
       agent,
       files,
@@ -1191,9 +1205,16 @@ export function agentRoutes(db: Db) {
       hireInput.adapterType,
       normalizedAdapterConfig,
     );
+    const adapterConfigAfterCeoFlow =
+      hireInput.role === "ceo"
+        ? applyCeoFlowPolicyToAdapterConfig({
+            companyId,
+            adapterConfig: normalizedAdapterConfig,
+          }).adapterConfig
+        : normalizedAdapterConfig;
     const normalizedHireInput = {
       ...hireInput,
-      adapterConfig: normalizedAdapterConfig,
+      adapterConfig: adapterConfigAfterCeoFlow,
     };
 
     const company = await db
@@ -1352,9 +1373,17 @@ export function agentRoutes(db: Db) {
       normalizedAdapterConfig,
     );
 
+    const adapterConfigAfterCeoFlow =
+      createInput.role === "ceo"
+        ? applyCeoFlowPolicyToAdapterConfig({
+            companyId,
+            adapterConfig: normalizedAdapterConfig,
+          }).adapterConfig
+        : normalizedAdapterConfig;
+
     const createdAgent = await svc.create(companyId, {
       ...createInput,
-      adapterConfig: normalizedAdapterConfig,
+      adapterConfig: adapterConfigAfterCeoFlow,
       status: "idle",
       spentMonthlyCents: 0,
       lastHeartbeatAt: null,
