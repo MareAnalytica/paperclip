@@ -159,6 +159,14 @@ function didAutomaticRecoveryFail(
     );
 }
 
+
+function isChiefExecutiveOfficerSweepLogIssue(issue: Pick<typeof issues.$inferSelect, "title" | "description" | "identifier">) {
+  const title = readNonEmptyString(issue.title)?.toUpperCase() ?? "";
+  const description = readNonEmptyString(issue.description)?.toLowerCase() ?? "";
+  return title.endsWith("-CEO-SWEEP-LOG") ||
+    (title.includes("CEO-SWEEP-LOG") && description.includes("heartbeat audit sink"));
+}
+
 function successfulRunHandoffRecoveryEvidence(latestRun: LatestIssueRun): SuccessfulRunHandoffRecoveryEvidence | null {
   if (!latestRun) return null;
 
@@ -2372,6 +2380,12 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
 
       const agent = await getAgent(agentId);
       if (!agent || agent.companyId !== issue.companyId || !isAgentInvokable(agent)) {
+        result.skipped += 1;
+        continue;
+      }
+
+
+      if (isChiefExecutiveOfficerSweepLogIssue(issue)) {
         result.skipped += 1;
         continue;
       }
