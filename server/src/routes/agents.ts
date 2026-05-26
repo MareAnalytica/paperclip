@@ -99,6 +99,7 @@ import {
 import { getTelemetryClient } from "../telemetry.js";
 import { assertEnvironmentSelectionForCompany } from "./environment-selection.js";
 import { recoveryService } from "../services/recovery/service.js";
+import { applyCeoFlowPolicyToAdapterConfig } from "../services/ceo-flow-policy.js";
 
 const RUN_LOG_DEFAULT_LIMIT_BYTES = 256_000;
 const RUN_LOG_MAX_LIMIT_BYTES = 1024 * 1024;
@@ -1097,8 +1098,26 @@ export function agentRoutes(
       return (updated as T | null) ?? { ...agent, adapterConfig: nextAdapterConfig };
     }
 
-    const files = input?.files
-      ?? await loadDefaultAgentInstructionsBundle(resolveDefaultAgentInstructionsBundleRole(agent.role));
+    const promptTemplate = typeof adapterConfig.promptTemplate === "string"
+      ? adapterConfig.promptTemplate
+      : "";
+    const ceoFlowFragment =
+      agent.role === "ceo"
+        ? (asRecord(adapterConfig.ceoFlowPolicy)?.promptFragment as string | undefined) ?? null
+        : null;
+    let files = input?.files
+      ?? (promptTemplate.trim().length === 0
+        ? await loadDefaultAgentInstructionsBundle(resolveDefaultAgentInstructionsBundleRole(agent.role))
+        : { "AGENTS.md": promptTemplate });
+    if (ceoFlowFragment && typeof ceoFlowFragment === "string" && ceoFlowFragment.length > 0) {
+      const existing = typeof files["AGENTS.md"] === "string" ? files["AGENTS.md"] : "";
+      files = {
+        ...files,
+        "AGENTS.md": existing.trim().length === 0
+          ? ceoFlowFragment
+          : `${existing.trimEnd()}\n\n${ceoFlowFragment}`,
+      };
+    }
     const materialized = await instructions.materializeManagedBundle(
       agent,
       files,
@@ -1982,9 +2001,16 @@ export function agentRoutes(
       normalizeNewAgentRuntimeConfig(hireInput.runtimeConfig),
       normalizedAdapterConfig,
     );
+    const adapterConfigAfterCeoFlow =
+      hireInput.role === "ceo"
+        ? applyCeoFlowPolicyToAdapterConfig({
+            companyId,
+            adapterConfig: normalizedAdapterConfig,
+          }).adapterConfig
+        : normalizedAdapterConfig;
     const normalizedHireInput = {
       ...hireInput,
-      adapterConfig: normalizedAdapterConfig,
+      adapterConfig: adapterConfigAfterCeoFlow,
       runtimeConfig: normalizedRuntimeConfig,
     };
 
@@ -2174,9 +2200,17 @@ export function agentRoutes(
       allowedSandboxProviders: allowedSandboxProvidersForAgent(createInput.adapterType),
     });
 
+    const adapterConfigAfterCeoFlow =
+      createInput.role === "ceo"
+        ? applyCeoFlowPolicyToAdapterConfig({
+            companyId,
+            adapterConfig: normalizedAdapterConfig,
+          }).adapterConfig
+        : normalizedAdapterConfig;
+
     const createdAgent = await svc.create(companyId, {
       ...createInput,
-      adapterConfig: normalizedAdapterConfig,
+      adapterConfig: adapterConfigAfterCeoFlow,
       runtimeConfig: normalizedRuntimeConfig,
       status: "idle",
       spentMonthlyCents: 0,
