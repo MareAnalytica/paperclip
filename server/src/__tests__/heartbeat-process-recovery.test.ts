@@ -2507,6 +2507,183 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(comments[0]?.body).toContain("Recovery owner: [CodexCoder]");
   });
 
+  it("suppresses stranded_assigned_issue when the assignee commented recently and an open child is in review", async () => {
+    const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      retryReason: "issue_continuation_needed",
+    });
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+
+    // Recent assignee-agent comment (event-driven heartbeat pattern from DEE-349 DM).
+    await db.insert(issueComments).values({
+      companyId,
+      issueId,
+      authorAgentId: agentId,
+      authorType: "agent",
+      body: "Heartbeat: still waiting on child review (DEE-349 shape).",
+    });
+
+    // Open child issue in_review (PR-E/F gated on HPA/V/E in DEE-349 shape).
+    const childIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: childIssueId,
+      companyId,
+      parentId: issueId,
+      title: "Routed child review gate",
+      status: "in_review",
+      priority: "medium",
+      issueNumber: 99,
+      identifier: `${issuePrefix}-99`,
+    });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.escalated).toBe(0);
+    expect(result.continuationRequeued).toBe(0);
+    expect(result.skipped).toBeGreaterThanOrEqual(1);
+    expect(result.issueIds).not.toContain(issueId);
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("in_progress");
+
+    const recoveryIssues = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "stranded_issue_recovery")));
+    expect(recoveryIssues).toHaveLength(0);
+
+    const recoveryActions = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    expect(recoveryActions).toHaveLength(0);
+
+    // Sanity: the assignee comment we seeded is still the only non-system comment.
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments).toHaveLength(1);
+    expect(comments[0]?.authorAgentId).toBe(agentId);
+    void runId;
+  });
+
+  it("suppresses stranded_assigned_issue when the assignee commented recently and an active blockedBy issue is open", async () => {
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      retryReason: "issue_continuation_needed",
+    });
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+
+    await db.insert(issueComments).values({
+      companyId,
+      issueId,
+      authorAgentId: agentId,
+      authorType: "agent",
+      body: "Heartbeat: waiting on platform blocker.",
+    });
+
+    const blockerIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: blockerIssueId,
+      companyId,
+      title: "Active platform blocker",
+      status: "in_progress",
+      priority: "medium",
+      issueNumber: 77,
+      identifier: `${issuePrefix}-77`,
+    });
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: blockerIssueId,
+      relatedIssueId: issueId,
+      type: "blocks",
+    });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.escalated).toBe(0);
+    expect(result.continuationRequeued).toBe(0);
+    expect(result.issueIds).not.toContain(issueId);
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("in_progress");
+  });
+
+  it("still fires stranded_assigned_issue when only a recent assignee comment exists without an open child or blocker", async () => {
+    const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      retryReason: "issue_continuation_needed",
+    });
+
+    await db.insert(issueComments).values({
+      companyId,
+      issueId,
+      authorAgentId: agentId,
+      authorType: "agent",
+      body: "Heartbeat-only liveness; nothing actually pending.",
+    });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.escalated).toBe(1);
+    expect(result.issueIds).toEqual([issueId]);
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("blocked");
+
+    await expectSourceScopedStrandedRecoveryAction({
+      companyId,
+      agentId,
+      issueId,
+      runId,
+      previousStatus: "in_progress",
+      retryReason: "issue_continuation_needed",
+    });
+  });
+
+  it("still fires stranded_assigned_issue when an open child exists but the assignee has not commented recently", async () => {
+    const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      retryReason: "issue_continuation_needed",
+    });
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+
+    const childIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: childIssueId,
+      companyId,
+      parentId: issueId,
+      title: "Open child without assignee liveness",
+      status: "in_review",
+      priority: "medium",
+      issueNumber: 88,
+      identifier: `${issuePrefix}-88`,
+    });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.escalated).toBe(1);
+    expect(result.issueIds).toEqual([issueId]);
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("blocked");
+
+    await expectSourceScopedStrandedRecoveryAction({
+      companyId,
+      agentId,
+      issueId,
+      runId,
+      previousStatus: "in_progress",
+      retryReason: "issue_continuation_needed",
+    });
+  });
+
   it("redacts error-code-only stranded recovery failures in issue copy", async () => {
     const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
       status: "in_progress",
