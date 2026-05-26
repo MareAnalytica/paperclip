@@ -316,6 +316,7 @@ describeEmbeddedPostgres("peer-issue service (spec §6)", () => {
         companyId: other.id,
         title: "Other co's issue",
         status: "todo",
+        identifier: `${other.issuePrefix}-999`,
       })
       .returning();
     await expect(

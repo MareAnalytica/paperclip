@@ -14,10 +14,22 @@ import { badRequest, conflict, forbidden, notFound, unprocessable } from "../err
 const PEER_ISSUE_AUDITS_IDEMPOTENCY_CONSTRAINT = "peer_issue_audits_idempotency_uq";
 
 function isIdempotencyConflict(error: unknown): boolean {
-  if (typeof error !== "object" || error === null) return false;
-  const err = error as { code?: string; constraint?: string; constraint_name?: string };
-  const constraint = err.constraint ?? err.constraint_name;
-  return err.code === "23505" && constraint === PEER_ISSUE_AUDITS_IDEMPOTENCY_CONSTRAINT;
+  let current: unknown = error;
+  for (let depth = 0; depth < 3; depth += 1) {
+    if (typeof current !== "object" || current === null) return false;
+    const err = current as {
+      code?: string;
+      constraint?: string;
+      constraint_name?: string;
+      cause?: unknown;
+    };
+    const constraint = err.constraint ?? err.constraint_name;
+    if (err.code === "23505" && constraint === PEER_ISSUE_AUDITS_IDEMPOTENCY_CONSTRAINT) {
+      return true;
+    }
+    current = err.cause;
+  }
+  return false;
 }
 
 /**
