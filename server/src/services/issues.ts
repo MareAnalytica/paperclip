@@ -5815,53 +5815,50 @@ async function listBlockedQueueImpl(db: Db, companyId: string): Promise<BlockedQ
     latestByIssue.set(row.issueId, row);
   }
 
-  // F2 (P12 spec): namedUnblockOwner derives from the latest CEO-or-assignee-authored comment.
-  // Separate subquery so we never miss the most recent comment by an eligible author.
-  const eligibleAssigneeIds = Array.from(
-    new Set(
-      Array.from(assigneeByIssueId.values()).filter((id): id is string => typeof id === "string"),
-    ),
-  );
-  const eligibleAuthorIds = Array.from(new Set([...ceoIds, ...eligibleAssigneeIds]));
+  // F2 (P12 spec) + F7-N1: namedUnblockOwner derives from the latest comment authored by
+  // a per-issue eligible author — CEO of the company OR THIS issue's current assignee.
+  // The eligibility predicate is enforced in SQL (join + OR) so the rn=1 row is always
+  // valid for the row's issue, and we never silently drop a foreign-assignee comment
+  // that happens to be globally-eligible-but-not-eligible-for-this-issue.
+  const ceoIdList = Array.from(ceoIds);
   const ownerByIssue = new Map<string, string>();
-  if (eligibleAuthorIds.length > 0) {
-    const eligiblePerIssue = db
-      .select({
-        issueId: issueComments.issueId,
-        body: issueComments.body,
-        authorAgentId: issueComments.authorAgentId,
-        createdAt: issueComments.createdAt,
-        rn: sql<number>`row_number() over (partition by ${issueComments.issueId} order by ${issueComments.createdAt} desc)`.as(
-          "rn",
-        ),
-      })
-      .from(issueComments)
-      .where(
-        and(
-          eq(issueComments.companyId, companyId),
-          inArray(issueComments.issueId, issueIds),
-          inArray(issueComments.authorAgentId, eligibleAuthorIds),
-        ),
-      )
-      .as("eligible_per_issue");
+  const eligibilityPredicate = or(
+    ceoIdList.length > 0 ? inArray(issueComments.authorAgentId, ceoIdList) : sql`false`,
+    eq(issueComments.authorAgentId, issues.assigneeAgentId),
+  );
+  const eligiblePerIssue = db
+    .select({
+      issueId: issueComments.issueId,
+      body: issueComments.body,
+      authorAgentId: issueComments.authorAgentId,
+      createdAt: issueComments.createdAt,
+      rn: sql<number>`row_number() over (partition by ${issueComments.issueId} order by ${issueComments.createdAt} desc)`.as(
+        "rn",
+      ),
+    })
+    .from(issueComments)
+    .innerJoin(issues, eq(issues.id, issueComments.issueId))
+    .where(
+      and(
+        eq(issueComments.companyId, companyId),
+        inArray(issueComments.issueId, issueIds),
+        eligibilityPredicate,
+      ),
+    )
+    .as("eligible_per_issue");
 
-    const eligibleRows = await db
-      .select({
-        issueId: eligiblePerIssue.issueId,
-        body: eligiblePerIssue.body,
-        authorAgentId: eligiblePerIssue.authorAgentId,
-      })
-      .from(eligiblePerIssue)
-      .where(eq(eligiblePerIssue.rn, 1));
+  const eligibleRows = await db
+    .select({
+      issueId: eligiblePerIssue.issueId,
+      body: eligiblePerIssue.body,
+      authorAgentId: eligiblePerIssue.authorAgentId,
+    })
+    .from(eligiblePerIssue)
+    .where(eq(eligiblePerIssue.rn, 1));
 
-    for (const row of eligibleRows) {
-      // Per-issue: only count CEO-or-this-issue's-assignee comments.
-      const assignee = assigneeByIssueId.get(row.issueId);
-      const allowed = ceoIds.has(row.authorAgentId ?? "") || row.authorAgentId === assignee;
-      if (!allowed) continue;
-      const resolved = parseNamedUnblockOwner(row.body, agentIdByNormalizedName);
-      if (resolved) ownerByIssue.set(row.issueId, resolved);
-    }
+  for (const row of eligibleRows) {
+    const resolved = parseNamedUnblockOwner(row.body, agentIdByNormalizedName);
+    if (resolved) ownerByIssue.set(row.issueId, resolved);
   }
 
   const pendingApprovalRows = await db

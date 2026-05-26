@@ -358,6 +358,57 @@ describeEmbeddedPostgres("issueService.listBlockedQueue", () => {
     expect(result.map((r) => r.id)).toEqual([olderId, youngerId]);
   });
 
+  it("namedUnblockOwner uses per-issue eligible-author (F7-N1): latest comment by another blocked-issue's assignee does not mask THIS issue's assignee comment", async () => {
+    const { companyId, agentId: ceoAgentId } = await setup();
+    const assigneeA = randomUUID();
+    const assigneeB = randomUUID();
+    await db.insert(agents).values({
+      id: assigneeA,
+      companyId,
+      name: "Assignee A",
+      role: "general",
+      status: "idle",
+    });
+    await db.insert(agents).values({
+      id: assigneeB,
+      companyId,
+      name: "Assignee B",
+      role: "general",
+      status: "idle",
+    });
+    const { id: issueB } = await insertIssue(companyId, "blocked", { assigneeAgentId: assigneeB });
+    await insertIssue(companyId, "blocked", { assigneeAgentId: assigneeA });
+
+    const targetUuid = randomUUID();
+    const now = Date.now();
+    // Earlier: assignee B (eligible for issue B) names a target.
+    await insertComment(
+      companyId,
+      issueB,
+      `agent://${targetUuid} please take it`,
+      assigneeB,
+      new Date(now - 10 * 60_000),
+    );
+    // Later: assignee A (NOT eligible for issue B, but eligible for issue A) comments on issue B.
+    // Pre-F7-N1 the eligible-author subquery used a global author set,
+    // so rn=1 returned this comment and the JS filter dropped it without falling back
+    // to the prior assignee-B comment, leaving namedUnblockOwner=null.
+    await insertComment(
+      companyId,
+      issueB,
+      "just a status note from A",
+      assigneeA,
+      new Date(now - 1 * 60_000),
+    );
+
+    const result = await svc.listBlockedQueue(companyId);
+    const itemB = result.find((r) => r.id === issueB);
+    expect(itemB?.namedUnblockOwner).toBe(`agent://${targetUuid}`);
+    // Sanity: latest-comment projection still reflects the actual newest comment regardless of author.
+    expect(itemB?.lastAuthor?.agentId).toBe(assigneeA);
+    void ceoAgentId;
+  });
+
   it("handles 200 blocked issues with p95 latency under 200ms", async () => {
     const { companyId, agentId } = await setup();
     const ids: string[] = [];
