@@ -1837,13 +1837,15 @@ export interface BlockedQueueItem {
   title: string;
   priority: string;
   ageMinutesSinceLastComment: number | null;
-  lastAuthor: { agentId: string | null; userId: string | null; type: string | null } | null;
+  lastAuthor: { agentId: string | null; userId: string | null; type: "agent" | "user" | null } | null;
   lastCommentClass: "unblock-ask" | "progress" | "bounce" | "other";
   unresolvedInteractionIds: string[];
   namedUnblockOwner: string | null;
 }
 
+// P12 heuristics (ELI-295 ticket): regex tiers for last-comment classification.
 const AGENT_MENTION_URI_RE = /agent:\/\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
+const BARE_AGENT_MENTION_RE = /(?:^|[^a-z0-9_/])@([A-Za-z][A-Za-z0-9_\-]{1,63})/;
 const BOUNCE_RE = /\b(bounce|escalat|refus|reject)/i;
 const UNBLOCK_ASK_RE = /\?\s*$|\b(please|need|can you|awaiting)/i;
 const PROGRESS_RE = /\b(merged|pushed|done|complete|landed)/i;
@@ -1857,31 +1859,74 @@ function classifyCommentBody(body: string | null | undefined): BlockedQueueItem[
   return "other";
 }
 
-function parseNamedUnblockOwner(body: string | null | undefined): string | null {
+function normalizeAgentName(name: string): string {
+  return name.trim().toLowerCase().replace(/[\s_-]+/g, "");
+}
+
+function parseNamedUnblockOwner(
+  body: string | null | undefined,
+  agentIdByNormalizedName: Map<string, string>,
+): string | null {
   if (!body) return null;
-  const uri = body.match(AGENT_MENTION_URI_RE);
-  if (uri) return uri[0];
+  // Tier 1 (P12): structured `[@Name](agent://uuid)` markdown link or raw URI.
+  const structuredIds = extractAgentMentionIds(body);
+  if (structuredIds.length > 0) {
+    return `agent://${structuredIds[0]}`;
+  }
+  const rawUri = body.match(AGENT_MENTION_URI_RE);
+  if (rawUri) return rawUri[0];
+  // Tier 2 (P12): bare `@Name` resolved against company agent roster.
+  const bare = body.match(BARE_AGENT_MENTION_RE);
+  if (bare) {
+    const resolved = agentIdByNormalizedName.get(normalizeAgentName(bare[1]));
+    if (resolved) return `agent://${resolved}`;
+  }
+  // Tier 3 (P12): literal `owner:` line.
   const owner = body.match(OWNER_LINE_RE);
   if (owner) return owner[1] ?? null;
   return null;
 }
 
 async function listBlockedQueueImpl(db: Db, companyId: string): Promise<BlockedQueueItem[]> {
+  // F3: mirror list()'s defaults — hide hidden issues and routine-execution children.
   const blockedIssues = await db
     .select({
       id: issues.id,
       identifier: issues.identifier,
       title: issues.title,
       priority: issues.priority,
+      assigneeAgentId: issues.assigneeAgentId,
     })
     .from(issues)
-    .where(and(eq(issues.companyId, companyId), eq(issues.status, "blocked")));
+    .where(
+      and(
+        eq(issues.companyId, companyId),
+        eq(issues.status, "blocked"),
+        isNull(issues.hiddenAt),
+        ne(issues.originKind, "routine_execution"),
+      ),
+    );
 
   if (blockedIssues.length === 0) return [];
 
   const issueIds = blockedIssues.map((row) => row.id);
+  const assigneeByIssueId = new Map<string, string | null>(
+    blockedIssues.map((row) => [row.id, row.assigneeAgentId]),
+  );
 
-  const latestCommentRows = await db
+  // Company agent roster (for CEO-or-assignee author filter + bare @mention resolution).
+  const agentRows = await db
+    .select({ id: agents.id, name: agents.name, role: agents.role })
+    .from(agents)
+    .where(eq(agents.companyId, companyId));
+  const ceoIds = new Set(agentRows.filter((a) => a.role === "ceo").map((a) => a.id));
+  const agentIdByNormalizedName = new Map<string, string>();
+  for (const a of agentRows) {
+    agentIdByNormalizedName.set(normalizeAgentName(a.name), a.id);
+  }
+
+  // F1: subquery filters rn=1 in SQL — only the latest comment per issue crosses the wire.
+  const latestPerIssue = db
     .select({
       issueId: issueComments.issueId,
       id: issueComments.id,
@@ -1889,15 +1934,78 @@ async function listBlockedQueueImpl(db: Db, companyId: string): Promise<BlockedQ
       authorAgentId: issueComments.authorAgentId,
       authorUserId: issueComments.authorUserId,
       createdAt: issueComments.createdAt,
-      rn: sql<number>`row_number() over (partition by ${issueComments.issueId} order by ${issueComments.createdAt} desc)`.as("rn"),
+      rn: sql<number>`row_number() over (partition by ${issueComments.issueId} order by ${issueComments.createdAt} desc)`.as(
+        "rn",
+      ),
     })
     .from(issueComments)
     .where(and(eq(issueComments.companyId, companyId), inArray(issueComments.issueId, issueIds)))
-    .then((rows) => rows.filter((r) => Number(r.rn) === 1));
+    .as("latest_per_issue");
+
+  const latestCommentRows = await db
+    .select({
+      issueId: latestPerIssue.issueId,
+      id: latestPerIssue.id,
+      body: latestPerIssue.body,
+      authorAgentId: latestPerIssue.authorAgentId,
+      authorUserId: latestPerIssue.authorUserId,
+      createdAt: latestPerIssue.createdAt,
+    })
+    .from(latestPerIssue)
+    .where(eq(latestPerIssue.rn, 1));
 
   const latestByIssue = new Map<string, (typeof latestCommentRows)[number]>();
   for (const row of latestCommentRows) {
     latestByIssue.set(row.issueId, row);
+  }
+
+  // F2 (P12 spec): namedUnblockOwner derives from the latest CEO-or-assignee-authored comment.
+  // Separate subquery so we never miss the most recent comment by an eligible author.
+  const eligibleAssigneeIds = Array.from(
+    new Set(
+      Array.from(assigneeByIssueId.values()).filter((id): id is string => typeof id === "string"),
+    ),
+  );
+  const eligibleAuthorIds = Array.from(new Set([...ceoIds, ...eligibleAssigneeIds]));
+  const ownerByIssue = new Map<string, string>();
+  if (eligibleAuthorIds.length > 0) {
+    const eligiblePerIssue = db
+      .select({
+        issueId: issueComments.issueId,
+        body: issueComments.body,
+        authorAgentId: issueComments.authorAgentId,
+        createdAt: issueComments.createdAt,
+        rn: sql<number>`row_number() over (partition by ${issueComments.issueId} order by ${issueComments.createdAt} desc)`.as(
+          "rn",
+        ),
+      })
+      .from(issueComments)
+      .where(
+        and(
+          eq(issueComments.companyId, companyId),
+          inArray(issueComments.issueId, issueIds),
+          inArray(issueComments.authorAgentId, eligibleAuthorIds),
+        ),
+      )
+      .as("eligible_per_issue");
+
+    const eligibleRows = await db
+      .select({
+        issueId: eligiblePerIssue.issueId,
+        body: eligiblePerIssue.body,
+        authorAgentId: eligiblePerIssue.authorAgentId,
+      })
+      .from(eligiblePerIssue)
+      .where(eq(eligiblePerIssue.rn, 1));
+
+    for (const row of eligibleRows) {
+      // Per-issue: only count CEO-or-this-issue's-assignee comments.
+      const assignee = assigneeByIssueId.get(row.issueId);
+      const allowed = ceoIds.has(row.authorAgentId ?? "") || row.authorAgentId === assignee;
+      if (!allowed) continue;
+      const resolved = parseNamedUnblockOwner(row.body, agentIdByNormalizedName);
+      if (resolved) ownerByIssue.set(row.issueId, resolved);
+    }
   }
 
   const pendingApprovalRows = await db
@@ -1928,7 +2036,7 @@ async function listBlockedQueueImpl(db: Db, companyId: string): Promise<BlockedQ
     const ageMinutes = latest
       ? Math.max(0, Math.floor((now - new Date(latest.createdAt).getTime()) / 60000))
       : null;
-    const authorType = latest
+    const authorType: "agent" | "user" | null = latest
       ? latest.authorAgentId
         ? "agent"
         : latest.authorUserId
@@ -1951,7 +2059,7 @@ async function listBlockedQueueImpl(db: Db, companyId: string): Promise<BlockedQ
       lastAuthor,
       lastCommentClass: classifyCommentBody(latest?.body),
       unresolvedInteractionIds: interactionsByIssue.get(row.id) ?? [],
-      namedUnblockOwner: parseNamedUnblockOwner(latest?.body),
+      namedUnblockOwner: ownerByIssue.get(row.id) ?? null,
     };
   });
 

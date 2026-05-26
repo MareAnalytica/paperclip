@@ -70,16 +70,25 @@ describeEmbeddedPostgres("issueService.listBlockedQueue", () => {
     return { companyId, agentId };
   }
 
-  async function insertIssue(companyId: string, status: string, id = randomUUID()) {
+  async function insertIssue(
+    companyId: string,
+    status: string,
+    options: { id?: string; assigneeAgentId?: string | null; hiddenAt?: Date; originKind?: string } = {},
+  ) {
+    const id = options.id ?? randomUUID();
     const identifier = `BLK-${(++identifierCounter).toString(36).toUpperCase()}`;
-    await db.insert(issues).values({
+    const values: typeof issues.$inferInsert = {
       id,
       companyId,
       identifier,
       title: `Issue ${identifier}`,
       status,
       priority: "medium",
-    });
+      assigneeAgentId: options.assigneeAgentId ?? null,
+    };
+    if (options.hiddenAt) values.hiddenAt = options.hiddenAt;
+    if (options.originKind) values.originKind = options.originKind;
+    await db.insert(issues).values(values);
     return { id, identifier };
   }
 
@@ -89,6 +98,7 @@ describeEmbeddedPostgres("issueService.listBlockedQueue", () => {
     body: string,
     agentId?: string,
     createdAt?: Date,
+    userId?: string,
   ) {
     const values: typeof issueComments.$inferInsert = {
       id: randomUUID(),
@@ -96,6 +106,7 @@ describeEmbeddedPostgres("issueService.listBlockedQueue", () => {
       issueId,
       body,
       authorAgentId: agentId ?? null,
+      authorUserId: userId ?? null,
     };
     if (createdAt) values.createdAt = createdAt;
     await db.insert(issueComments).values(values);
@@ -128,7 +139,7 @@ describeEmbeddedPostgres("issueService.listBlockedQueue", () => {
 
   it("returns blocked issues with correct projection", async () => {
     const { companyId, agentId } = await setup();
-    const { id: issueId, identifier } = await insertIssue(companyId, "blocked");
+    const { id: issueId, identifier } = await insertIssue(companyId, "blocked", { assigneeAgentId: agentId });
     await insertComment(companyId, issueId, "Please unblock this so we can proceed", agentId);
 
     const result = await svc.listBlockedQueue(companyId);
@@ -193,14 +204,122 @@ describeEmbeddedPostgres("issueService.listBlockedQueue", () => {
     expect(result[0].ageMinutesSinceLastComment).toBeNull();
   });
 
-  it("extracts namedUnblockOwner from agent:// mention in comment", async () => {
-    const { companyId } = await setup();
+  it("extracts namedUnblockOwner from agent:// mention by CEO author", async () => {
+    const { companyId, agentId: ceoAgentId } = await setup();
     const { id: issueId } = await insertIssue(companyId, "blocked");
     const targetUuid = randomUUID();
-    await insertComment(companyId, issueId, `Routed to agent://${targetUuid} for action`);
+    await insertComment(companyId, issueId, `Routed to agent://${targetUuid} for action`, ceoAgentId);
 
     const result = await svc.listBlockedQueue(companyId);
     expect(result[0].namedUnblockOwner).toBe(`agent://${targetUuid}`);
+  });
+
+  it("ignores agent:// mention when commenter is neither CEO nor assignee (F2)", async () => {
+    const { companyId } = await setup();
+    const { id: issueId } = await insertIssue(companyId, "blocked");
+    const randomAgent = randomUUID();
+    await db.insert(agents).values({
+      id: randomAgent,
+      companyId,
+      name: "Random Agent",
+      role: "general",
+      status: "idle",
+    });
+    const targetUuid = randomUUID();
+    await insertComment(companyId, issueId, `Routed to agent://${targetUuid}`, randomAgent);
+
+    const result = await svc.listBlockedQueue(companyId);
+    expect(result[0].namedUnblockOwner).toBeNull();
+  });
+
+  it("extracts namedUnblockOwner from agent:// mention by issue assignee (F2)", async () => {
+    const { companyId } = await setup();
+    const assigneeId = randomUUID();
+    await db.insert(agents).values({
+      id: assigneeId,
+      companyId,
+      name: "Assignee Agent",
+      role: "general",
+      status: "idle",
+    });
+    const { id: issueId } = await insertIssue(companyId, "blocked", { assigneeAgentId: assigneeId });
+    const targetUuid = randomUUID();
+    await insertComment(companyId, issueId, `agent://${targetUuid} please take it`, assigneeId);
+
+    const result = await svc.listBlockedQueue(companyId);
+    expect(result[0].namedUnblockOwner).toBe(`agent://${targetUuid}`);
+  });
+
+  it("resolves bare @Name mention against agent roster (F2 tier 2)", async () => {
+    const { companyId, agentId: ceoAgentId } = await setup();
+    const targetId = randomUUID();
+    await db.insert(agents).values({
+      id: targetId,
+      companyId,
+      name: "Platform Engineer",
+      role: "general",
+      status: "idle",
+    });
+    const { id: issueId } = await insertIssue(companyId, "blocked");
+    await insertComment(companyId, issueId, "Please @platform-engineer take this", ceoAgentId);
+
+    const result = await svc.listBlockedQueue(companyId);
+    expect(result[0].namedUnblockOwner).toBe(`agent://${targetId}`);
+  });
+
+  it("falls back to owner: line when no agent mention present (F6)", async () => {
+    const { companyId, agentId: ceoAgentId } = await setup();
+    const { id: issueId } = await insertIssue(companyId, "blocked");
+    await insertComment(
+      companyId,
+      issueId,
+      "Update on status.\n\nowner: ops-on-call\n\nPlease pick up.",
+      ceoAgentId,
+    );
+
+    const result = await svc.listBlockedQueue(companyId);
+    expect(result[0].namedUnblockOwner).toBe("ops-on-call");
+  });
+
+  it("recognises user-authored comments (F6)", async () => {
+    const { companyId } = await setup();
+    const { id: issueId } = await insertIssue(companyId, "blocked");
+    await insertComment(companyId, issueId, "Holding for review", undefined, undefined, "user-7");
+
+    const result = await svc.listBlockedQueue(companyId);
+    expect(result[0].lastAuthor?.type).toBe("user");
+    expect(result[0].lastAuthor?.userId).toBe("user-7");
+    expect(result[0].lastAuthor?.agentId).toBeNull();
+  });
+
+  it("returns multiple pending approvals on the same issue (F6)", async () => {
+    const { companyId } = await setup();
+    const { id: issueId } = await insertIssue(companyId, "blocked");
+    const a1 = await insertApprovalLink(companyId, issueId, "pending");
+    const a2 = await insertApprovalLink(companyId, issueId, "pending");
+
+    const result = await svc.listBlockedQueue(companyId);
+    expect(result[0].unresolvedInteractionIds).toHaveLength(2);
+    expect(new Set(result[0].unresolvedInteractionIds)).toEqual(new Set([a1, a2]));
+  });
+
+  it("returns empty unresolvedInteractionIds when no approvals exist (F6)", async () => {
+    const { companyId } = await setup();
+    await insertIssue(companyId, "blocked");
+
+    const result = await svc.listBlockedQueue(companyId);
+    expect(result[0].unresolvedInteractionIds).toEqual([]);
+  });
+
+  it("excludes hidden and routine-execution issues (F3)", async () => {
+    const { companyId } = await setup();
+    const { id: keepId } = await insertIssue(companyId, "blocked");
+    await insertIssue(companyId, "blocked", { hiddenAt: new Date() });
+    await insertIssue(companyId, "blocked", { originKind: "routine_execution" });
+
+    const result = await svc.listBlockedQueue(companyId);
+    expect(result).toHaveLength(1);
+    expect(result[0].id).toBe(keepId);
   });
 
   it("uses the most recent comment body for classification", async () => {
@@ -260,4 +379,34 @@ describeEmbeddedPostgres("issueService.listBlockedQueue", () => {
     const p95 = samples[Math.floor(samples.length * 0.95)];
     expect(p95).toBeLessThan(200);
   }, 60_000);
+
+  it("handles 50 issues x 30 comments each with p95 under 200ms (F4)", async () => {
+    const { companyId, agentId } = await setup();
+    const ids: string[] = [];
+    const start = Date.now();
+    for (let i = 0; i < 50; i++) {
+      const { id } = await insertIssue(companyId, "blocked", { assigneeAgentId: agentId });
+      ids.push(id);
+      for (let j = 0; j < 30; j++) {
+        await insertComment(
+          companyId,
+          id,
+          `comment ${j} for issue ${i}`,
+          agentId,
+          new Date(start + i * 1000 + j),
+        );
+      }
+    }
+
+    const samples: number[] = [];
+    for (let i = 0; i < 50; i++) {
+      const t0 = performance.now();
+      const rows = await svc.listBlockedQueue(companyId);
+      samples.push(performance.now() - t0);
+      expect(rows).toHaveLength(50);
+    }
+    samples.sort((a, b) => a - b);
+    const p95 = samples[Math.floor(samples.length * 0.95)];
+    expect(p95).toBeLessThan(200);
+  }, 120_000);
 });
