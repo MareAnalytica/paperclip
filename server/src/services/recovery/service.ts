@@ -67,6 +67,8 @@ export const ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS = 60 * 60 * 1000;
 export const ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS = 4 * 60 * 60 * 1000;
 export const ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS = 30 * 60 * 1000;
 const ACTIVE_RUN_OUTPUT_EVIDENCE_TAIL_BYTES = 8 * 1024;
+export const STRANDED_ASSIGNEE_COMMENT_LIVENESS_WINDOW_MS = 5 * 60 * 1000;
+const STRANDED_OPEN_CHILD_STATUSES = ["in_review", "in_progress"] as const;
 const STRANDED_ISSUE_RECOVERY_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.strandedIssueRecovery;
 const STALE_ACTIVE_RUN_EVALUATION_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.staleActiveRunEvaluation;
 const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
@@ -2147,6 +2149,65 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return updated;
   }
 
+  async function hasRecentAssigneeAgentComment(
+    issueId: string,
+    assigneeAgentId: string,
+    windowMs: number,
+  ): Promise<boolean> {
+    const cutoff = new Date(Date.now() - windowMs);
+    const rows = await db
+      .select({ id: issueComments.id })
+      .from(issueComments)
+      .where(
+        and(
+          eq(issueComments.issueId, issueId),
+          eq(issueComments.authorAgentId, assigneeAgentId),
+          gt(issueComments.createdAt, cutoff),
+        ),
+      )
+      .limit(1);
+    return rows.length > 0;
+  }
+
+  async function hasOpenChildIssueAwaitingProgress(
+    companyId: string,
+    issueId: string,
+  ): Promise<boolean> {
+    const rows = await db
+      .select({ id: issues.id })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, companyId),
+          eq(issues.parentId, issueId),
+          isNull(issues.hiddenAt),
+          inArray(issues.status, [...STRANDED_OPEN_CHILD_STATUSES]),
+        ),
+      )
+      .limit(1);
+    return rows.length > 0;
+  }
+
+  async function isStrandedRecoverySuppressedByEventDrivenWait(
+    companyId: string,
+    issueId: string,
+    assigneeAgentId: string,
+  ): Promise<boolean> {
+    const recentComment = await hasRecentAssigneeAgentComment(
+      issueId,
+      assigneeAgentId,
+      STRANDED_ASSIGNEE_COMMENT_LIVENESS_WINDOW_MS,
+    );
+    if (!recentComment) {
+      return false;
+    }
+    const unresolvedBlockers = await existingUnresolvedBlockerIssueIds(companyId, issueId);
+    if (unresolvedBlockers.length > 0) {
+      return true;
+    }
+    return hasOpenChildIssueAwaitingProgress(companyId, issueId);
+  }
+
   async function existingBlockerIssueIds(companyId: string, issueId: string) {
     return db
       .select({ blockerIssueId: issueRelations.issueId })
@@ -2396,6 +2457,14 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       }
 
       if (await isAutomaticRecoverySuppressedByPauseHold(db, issue.companyId, issue.id, treeControlSvc)) {
+        result.skipped += 1;
+        continue;
+      }
+
+      if (
+        !isStrandedIssueRecoveryIssue(issue) &&
+        await isStrandedRecoverySuppressedByEventDrivenWait(issue.companyId, issue.id, agentId)
+      ) {
         result.skipped += 1;
         continue;
       }
