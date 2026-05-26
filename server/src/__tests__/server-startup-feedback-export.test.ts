@@ -181,6 +181,10 @@ vi.mock("../services/feedback-share-client.js", () => ({
   createFeedbackTraceShareClientFromConfig: vi.fn(() => ({ id: "feedback-share-client" })),
 }));
 
+vi.mock("../services/peer-issue-system-user.js", () => ({
+  ensureSystemPeerIssueUser: vi.fn(async () => undefined),
+}));
+
 vi.mock("../startup-banner.js", () => ({
   printStartupBanner: vi.fn(),
 }));
@@ -188,6 +192,15 @@ vi.mock("../startup-banner.js", () => ({
 vi.mock("../board-claim.js", () => ({
   getBoardClaimWarningUrl: vi.fn(() => null),
   initializeBoardClaimChallenge: vi.fn(async () => undefined),
+}));
+
+vi.mock("../telemetry.js", () => ({
+  initTelemetry: vi.fn(),
+  getTelemetryClient: vi.fn(() => null),
+}));
+
+vi.mock("../adapters/registry.js", () => ({
+  waitForExternalAdapters: vi.fn(async () => ({ loaded: 0, failed: 0 })),
 }));
 
 vi.mock("../auth/better-auth.js", () => ({
