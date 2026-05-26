@@ -5680,5 +5680,142 @@ export function issueService(db: Db) {
         goal: a.goalId ? goalMap.get(a.goalId) ?? null : null,
       }));
     },
+
+    listBlockedQueue: async (companyId: string) => {
+      return listBlockedQueueImpl(db, companyId);
+    },
   };
+}
+
+export interface BlockedQueueItem {
+  id: string;
+  identifier: string | null;
+  title: string;
+  priority: string;
+  ageMinutesSinceLastComment: number | null;
+  lastAuthor: { agentId: string | null; userId: string | null; type: string | null } | null;
+  lastCommentClass: "unblock-ask" | "progress" | "bounce" | "other";
+  unresolvedInteractionIds: string[];
+  namedUnblockOwner: string | null;
+}
+
+const AGENT_MENTION_URI_RE = /agent:\/\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
+const BOUNCE_RE = /\b(bounce|escalat|refus|reject)/i;
+const UNBLOCK_ASK_RE = /\?\s*$|\b(please|need|can you|awaiting)/i;
+const PROGRESS_RE = /\b(merged|pushed|done|complete|landed)/i;
+const OWNER_LINE_RE = /^\s*owner\s*:\s*(\S.*?)\s*$/im;
+
+function classifyCommentBody(body: string | null | undefined): BlockedQueueItem["lastCommentClass"] {
+  if (!body) return "other";
+  if (BOUNCE_RE.test(body)) return "bounce";
+  if (UNBLOCK_ASK_RE.test(body)) return "unblock-ask";
+  if (PROGRESS_RE.test(body)) return "progress";
+  return "other";
+}
+
+function parseNamedUnblockOwner(body: string | null | undefined): string | null {
+  if (!body) return null;
+  const uri = body.match(AGENT_MENTION_URI_RE);
+  if (uri) return uri[0];
+  const owner = body.match(OWNER_LINE_RE);
+  if (owner) return owner[1] ?? null;
+  return null;
+}
+
+async function listBlockedQueueImpl(db: Db, companyId: string): Promise<BlockedQueueItem[]> {
+  const blockedIssues = await db
+    .select({
+      id: issues.id,
+      identifier: issues.identifier,
+      title: issues.title,
+      priority: issues.priority,
+    })
+    .from(issues)
+    .where(and(eq(issues.companyId, companyId), eq(issues.status, "blocked")));
+
+  if (blockedIssues.length === 0) return [];
+
+  const issueIds = blockedIssues.map((row) => row.id);
+
+  const latestCommentRows = await db
+    .select({
+      issueId: issueComments.issueId,
+      id: issueComments.id,
+      body: issueComments.body,
+      authorAgentId: issueComments.authorAgentId,
+      authorUserId: issueComments.authorUserId,
+      createdAt: issueComments.createdAt,
+      rn: sql<number>`row_number() over (partition by ${issueComments.issueId} order by ${issueComments.createdAt} desc)`.as("rn"),
+    })
+    .from(issueComments)
+    .where(and(eq(issueComments.companyId, companyId), inArray(issueComments.issueId, issueIds)))
+    .then((rows) => rows.filter((r) => Number(r.rn) === 1));
+
+  const latestByIssue = new Map<string, (typeof latestCommentRows)[number]>();
+  for (const row of latestCommentRows) {
+    latestByIssue.set(row.issueId, row);
+  }
+
+  const pendingApprovalRows = await db
+    .select({
+      issueId: issueApprovals.issueId,
+      approvalId: approvals.id,
+    })
+    .from(issueApprovals)
+    .innerJoin(approvals, eq(approvals.id, issueApprovals.approvalId))
+    .where(
+      and(
+        eq(issueApprovals.companyId, companyId),
+        inArray(issueApprovals.issueId, issueIds),
+        eq(approvals.status, "pending"),
+      ),
+    );
+
+  const interactionsByIssue = new Map<string, string[]>();
+  for (const row of pendingApprovalRows) {
+    const list = interactionsByIssue.get(row.issueId) ?? [];
+    list.push(row.approvalId);
+    interactionsByIssue.set(row.issueId, list);
+  }
+
+  const now = Date.now();
+  const projection: BlockedQueueItem[] = blockedIssues.map((row) => {
+    const latest = latestByIssue.get(row.id);
+    const ageMinutes = latest
+      ? Math.max(0, Math.floor((now - new Date(latest.createdAt).getTime()) / 60000))
+      : null;
+    const authorType = latest
+      ? latest.authorAgentId
+        ? "agent"
+        : latest.authorUserId
+          ? "user"
+          : null
+      : null;
+    const lastAuthor = latest
+      ? {
+          agentId: latest.authorAgentId,
+          userId: latest.authorUserId,
+          type: authorType,
+        }
+      : null;
+    return {
+      id: row.id,
+      identifier: row.identifier,
+      title: row.title,
+      priority: row.priority,
+      ageMinutesSinceLastComment: ageMinutes,
+      lastAuthor,
+      lastCommentClass: classifyCommentBody(latest?.body),
+      unresolvedInteractionIds: interactionsByIssue.get(row.id) ?? [],
+      namedUnblockOwner: parseNamedUnblockOwner(latest?.body),
+    };
+  });
+
+  projection.sort((a, b) => {
+    const aAge = a.ageMinutesSinceLastComment ?? -1;
+    const bAge = b.ageMinutesSinceLastComment ?? -1;
+    return bAge - aAge;
+  });
+
+  return projection;
 }
