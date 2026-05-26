@@ -120,6 +120,7 @@ function registerServiceMocks() {
       listForIssue: vi.fn(async () => []),
       expireRequestConfirmationsSupersededByComment: vi.fn(async () => []),
       expireStaleRequestConfirmationsForIssueDocument: vi.fn(async () => []),
+      expirePendingForTerminalIssue: vi.fn(async () => []),
     }),
     issueRecoveryActionService: () => ({
       getActiveForIssue: vi.fn(async () => null),

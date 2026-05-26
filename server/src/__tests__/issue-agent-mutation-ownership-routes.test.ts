@@ -777,6 +777,9 @@ describe("agent issue mutation checkout ownership", () => {
         routedReviewerOf: "PAP-12",
         routingEvidenceLink: "/PAP/issues/PAP-77#comment-routing",
       }),
+      expect.objectContaining({
+        authorType: "agent",
+      }),
     );
   });
 

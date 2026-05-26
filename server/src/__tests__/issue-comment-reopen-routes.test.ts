@@ -68,6 +68,8 @@ const mockRoutineService = vi.hoisted(() => ({
 const mockIssueThreadInteractionService = vi.hoisted(() => ({
   expireRequestConfirmationsSupersededByComment: vi.fn(async () => []),
   expireStaleRequestConfirmationsForIssueDocument: vi.fn(async () => []),
+  expirePendingForTerminalIssue: vi.fn(async () => []),
+  listForIssue: vi.fn(async () => []),
 }));
 const mockIssueRecoveryActionService = vi.hoisted(() => ({
   getActiveForIssue: vi.fn(async () => null),
@@ -738,7 +740,16 @@ describe.sequential("issue comment reopen routes", () => {
     expect(mockIssueService.addComment).toHaveBeenCalledWith(
       "11111111-1111-4111-8111-111111111111",
       "Paperclip needs a disposition before this issue can continue.",
-      { agentId: undefined, userId: "local-board", runId: null },
+      {
+        agentId: undefined,
+        userId: "local-board",
+        runId: null,
+        mutationType: null,
+        routedReviewerOf: null,
+        routingEvidenceLink: null,
+        routingMetadata: null,
+        idempotencyKey: null,
+      },
       {
         authorType: "user",
         presentation: { kind: "system_notice", tone: "warning", detailsDefaultOpen: false },

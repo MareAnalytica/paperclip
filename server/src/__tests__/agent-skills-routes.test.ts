@@ -654,7 +654,7 @@ describe.sequential("agent skill routes", () => {
   });
 
   it("bootstraps a fresh CEO with heartbeatSec=300 and embeds the CEO flow policy fragment", async () => {
-    const res = await request(createApp())
+    const res = await request(await createApp())
       .post("/api/companies/company-1/agents")
       .send({
         name: "CEO",
@@ -685,7 +685,7 @@ describe.sequential("agent skill routes", () => {
   });
 
   it("does not apply CEO flow policy when role is not ceo", async () => {
-    const res = await request(createApp())
+    const res = await request(await createApp())
       .post("/api/companies/company-1/agents")
       .send({
         name: "Engineer",
