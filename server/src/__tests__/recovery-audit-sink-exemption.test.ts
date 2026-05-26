@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
@@ -50,32 +50,52 @@ describeEmbeddedPostgres("audit-sink recovery exemption", () => {
 
   afterEach(async () => {
     // The recovery-action resolve route fires `heartbeat.wakeup` as
-    // fire-and-forget, which may write rows after the supertest call
-    // returns. Wait briefly and retry the table teardown so the FK cleanup
-    // doesn't race the wakeup background insert.
-    await new Promise((resolve) => setTimeout(resolve, 200));
-    for (let attempt = 0; attempt < 5; attempt += 1) {
-      await db.delete(issueLabels);
-      await db.delete(labels);
-      await db.delete(issueRecoveryActions);
-      await db.delete(issueComments);
-      await db.delete(activityLog);
-      await db.delete(heartbeatRunEvents);
-      await db.delete(heartbeatRuns);
-      await db.delete(agentWakeupRequests);
-      await db.delete(issueRelations);
-      await db.delete(issues);
-      await db.delete(agentRuntimeState);
+    // fire-and-forget. Those writes can land mid-teardown — both as FK
+    // violations on `heartbeat_runs`/`heartbeat_run_events` and as
+    // deadlocks on the `issues` checkout-clear UPDATE. CI (parallel
+    // suites, slower scheduler) widens the race window vs local runs.
+    //
+    // Give the background work a beat to settle, then TRUNCATE the test
+    // tables with CASCADE in a retry loop so any single statement that
+    // races a late insert restarts from the top. We TRUNCATE in one
+    // statement so a deadlock on any one table aborts the whole attempt
+    // cleanly instead of leaving the schema half-cleared.
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+    let lastError: unknown = null;
+    for (let attempt = 0; attempt < 6; attempt += 1) {
       try {
-        await db.delete(agents);
+        // `companies` cascades to everything used by the test through the
+        // existing FK chain; we name explicit tables that the recovery
+        // path may also touch so a future schema split still cleans up.
+        await db.execute(sql`
+          truncate table
+            issue_labels,
+            labels,
+            issue_recovery_actions,
+            issue_comments,
+            issue_documents,
+            issue_relations,
+            issues,
+            activity_log,
+            heartbeat_run_events,
+            heartbeat_runs,
+            agent_wakeup_requests,
+            agent_runtime_state,
+            agents,
+            company_skills,
+            document_revisions,
+            documents,
+            companies
+          restart identity cascade
+        `);
+        lastError = null;
         break;
       } catch (error) {
-        if (attempt === 4) throw error;
-        await new Promise((resolve) => setTimeout(resolve, 100));
+        lastError = error;
+        await new Promise((resolve) => setTimeout(resolve, 250));
       }
     }
-    await db.delete(companySkills);
-    await db.delete(companies);
+    if (lastError) throw lastError;
   });
 
   afterAll(async () => {
