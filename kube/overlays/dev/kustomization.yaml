@@ -10,7 +10,7 @@ resources:
 
 images:
   - name: registry.mareanalytica.com/paperclip
-    newTag: latest
+    newTag: custom-latest-4857bc92
 
 patches:
   # Override namespace name for dev
