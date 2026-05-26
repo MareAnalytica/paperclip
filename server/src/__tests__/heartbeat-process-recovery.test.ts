@@ -1541,8 +1541,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
   });
 
-  // DEE-558: structurally broken from inception (4c0c20d4) — run never settles to succeeded even with extended timeout. Skipping until product/test contract resolved.
-  it.skip("does not auto-checkout a blocked issue on issue_assigned wake", async () => {
+  it("does not auto-checkout a blocked issue on issue_assigned wake", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();
     const blockedIssueId = randomUUID();
@@ -1645,6 +1644,11 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       return null;
     }, 5_000);
 
+    // claimQueuedRun stamps status="running" before executeRun reaches
+    // adapter.execute; wait for the mock to actually capture releaseRun so the
+    // promise can be resolved below.
+    const releaseHandle = await waitForValue(async () => releaseRun, 5_000);
+
     const runningIssueStatus = await db
       .select({ status: issues.status, checkoutRunId: issues.checkoutRunId })
       .from(issues)
@@ -1652,6 +1656,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .then((rows) => rows[0] ?? null);
 
     expect(runStarted).not.toBeNull();
+    expect(releaseHandle).not.toBeNull();
     expect(runningIssueStatus?.status).toBe("blocked");
     expect(runningIssueStatus?.checkoutRunId).toBeNull();
 
