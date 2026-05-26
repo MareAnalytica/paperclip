@@ -11,6 +11,9 @@ import {
   DEFAULT_STRANDED_BLOCKED_CEO_PARENT_THRESHOLD_MINUTES,
   MAX_STRANDED_BLOCKED_CEO_PARENT_THRESHOLD_MINUTES,
   MIN_STRANDED_BLOCKED_CEO_PARENT_THRESHOLD_MINUTES,
+  DEFAULT_CEO_BLOCKED_SWEEP_INTERVAL_MINUTES,
+  MAX_CEO_BLOCKED_SWEEP_INTERVAL_MINUTES,
+  MIN_CEO_BLOCKED_SWEEP_INTERVAL_MINUTES,
 } from "../types/instance.js";
 import { feedbackDataSharingPreferenceSchema } from "./feedback.js";
 
@@ -59,6 +62,13 @@ export const instanceExperimentalSettingsSchema = z.object({
       z.null(),
     ])
     .default(DEFAULT_STRANDED_BLOCKED_CEO_PARENT_THRESHOLD_MINUTES),
+  ceoBlockedSweepEnabled: z.boolean().default(false),
+  ceoBlockedSweepIntervalMinutes: z
+    .number()
+    .int()
+    .min(MIN_CEO_BLOCKED_SWEEP_INTERVAL_MINUTES)
+    .max(MAX_CEO_BLOCKED_SWEEP_INTERVAL_MINUTES)
+    .default(DEFAULT_CEO_BLOCKED_SWEEP_INTERVAL_MINUTES),
 }).strict();
 
 export const patchInstanceExperimentalSettingsSchema = instanceExperimentalSettingsSchema.partial();

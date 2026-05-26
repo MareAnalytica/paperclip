@@ -19,6 +19,8 @@ describe("instance settings service", () => {
       enableIssueGraphLivenessAutoRecovery: true,
       issueGraphLivenessAutoRecoveryLookbackHours: 48,
       strandedBlockedCeoParentThresholdMinutes: 30,
+      ceoBlockedSweepEnabled: false,
+      ceoBlockedSweepIntervalMinutes: 60,
     });
   });
 });

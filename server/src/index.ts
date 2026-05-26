@@ -34,10 +34,12 @@ import {
   backfillPrincipalAccessCompatibility,
   heartbeatService,
   instanceSettingsService,
+  issueService,
   reconcileCloudUpstreamRunsOnStartup,
   reconcilePersistedRuntimeServicesOnStartup,
   routineService,
 } from "./services/index.js";
+import { ceoBlockedSweepService } from "./services/ceo-blocked-sweep.js";
 import { createFeedbackTraceShareClientFromConfig } from "./services/feedback-share-client.js";
 import { ensureSystemPeerIssueUser } from "./services/peer-issue-system-user.js";
 import { initCeoFlowPolicy } from "./services/ceo-flow-policy.js";
@@ -726,6 +728,32 @@ export async function startServer(): Promise<StartedServer> {
   if (config.heartbeatSchedulerEnabled) {
     const heartbeat = heartbeatService(db as any, { pluginWorkerManager });
     const routines = routineService(db as any, { pluginWorkerManager });
+    const ceoBlockedSweep = ceoBlockedSweepService(db as any);
+    const settingsForSweep = instanceSettingsService(db as any);
+    const issuesForSweep = issueService(db as any);
+    const sweepExperimentalSettings = async () => {
+      const exp = await settingsForSweep.getExperimental();
+      return {
+        ceoBlockedSweepEnabled: exp.ceoBlockedSweepEnabled,
+        ceoBlockedSweepIntervalMinutes: exp.ceoBlockedSweepIntervalMinutes,
+      };
+    };
+
+    // Startup: reconcile sweep routines across all companies so a process
+    // restart or settings-change picks up the current expected state.
+    void ceoBlockedSweep
+      .reconcileAllCompanies({
+        experimentalSettings: sweepExperimentalSettings,
+        listCompanyIds: () => settingsForSweep.listCompanyIds(),
+      })
+      .then((r) => {
+        if (r.created > 0 || r.updated > 0 || r.removed > 0) {
+          logger.info({ ...r }, "startup CEO blocked-sweep reconciliation changed routines");
+        }
+      })
+      .catch((err) => {
+        logger.error({ err }, "startup CEO blocked-sweep reconciliation failed");
+      });
   
     // Reap orphaned running runs at startup while in-memory execution state is empty,
     // then resume any persisted queued runs that were waiting on the previous process.
@@ -797,6 +825,24 @@ export async function startServer(): Promise<StartedServer> {
         })
         .catch((err) => {
           logger.error({ err }, "routine scheduler tick failed");
+        });
+
+      // F6 (ELI-297): CEO blocked-queue sweep. Wakes the CEO with the inline
+      // F7 projection when a sweep routine is due. The tick is cheap when no
+      // routines are due (single indexed scan).
+      void ceoBlockedSweep
+        .tickDue({
+          listBlockedQueue: (companyId) => issuesForSweep.listBlockedQueue(companyId),
+          wakeup: heartbeat.wakeup,
+          experimentalSettings: sweepExperimentalSettings,
+        })
+        .then((result) => {
+          if (result.triggered > 0) {
+            logger.info({ ...result }, "ceo blocked-sweep tick fired wakes");
+          }
+        })
+        .catch((err) => {
+          logger.error({ err }, "ceo blocked-sweep tick failed");
         });
   
       // Periodically reap orphaned runs (5-min staleness threshold) and make sure
