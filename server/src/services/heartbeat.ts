@@ -141,6 +141,7 @@ import {
   readContinuationAttempt,
 } from "./recovery/index.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "./recovery/pause-hold-guard.js";
+import { isAuditSinkIssue } from "./recovery/audit-sink-guard.js";
 import {
   recoveryAssigneeAdapterOverrides,
   withRecoveryModelProfileHint,
@@ -4147,6 +4148,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const context = parseObject(run.contextSnapshot);
     const issueId = readNonEmptyString(context.issueId);
     if (!issueId) return;
+    if (await isAuditSinkIssue(db, run.companyId, issueId)) return;
 
     const [issue, agent] = await Promise.all([
       db
@@ -4329,6 +4331,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const context = parseObject(run.contextSnapshot);
     const issueId = readNonEmptyString(context.issueId) ?? readNonEmptyString(context.taskId);
     if (!issueId) return;
+    if (await isAuditSinkIssue(db, run.companyId, issueId)) return;
 
     const issue = await db
       .select({
