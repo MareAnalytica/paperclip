@@ -74,6 +74,8 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     resultJson?: Record<string, unknown> | null;
     adapterType?: "codex_local" | "claude_local";
     agentName?: string;
+    runtimeConfig?: Record<string, unknown>;
+    contextSnapshot?: Record<string, unknown>;
   }) {
     const adapterType = input.adapterType ?? "codex_local";
     const agentName = input.agentName ?? (adapterType === "claude_local" ? "ClaudeCoder" : "CodexCoder");
@@ -92,7 +94,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       status: "active",
       adapterType,
       adapterConfig: {},
-      runtimeConfig: {
+      runtimeConfig: input.runtimeConfig ?? {
         heartbeat: {
           wakeOnDemand: true,
           maxConcurrentRuns: 1,
@@ -121,7 +123,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
             }
           : {}),
       },
-      contextSnapshot: {
+      contextSnapshot: input.contextSnapshot ?? {
         issueId: randomUUID(),
         wakeReason: "issue_assigned",
       },
@@ -1336,5 +1338,317 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     expect((wakeupRequest?.payload as Record<string, unknown> | null)?.transientRetryNotBefore).toBe(
       retryNotBefore.toISOString(),
     );
+  });
+
+  it("selects the next configured provider fallback entry for Claude transient failures", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const now = new Date("2026-04-22T10:00:00.000Z");
+
+    await seedRetryFixture({
+      runId,
+      companyId,
+      agentId,
+      now,
+      errorCode: "adapter_failed",
+      errorFamily: "transient_upstream",
+      adapterType: "claude_local",
+      runtimeConfig: {
+        heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 },
+        providerFallback: {
+          chain: [
+            { id: "claude-code-personal", adapter: "claude_local", enabled: true, account: "personal" },
+            { id: "claude-code-aflabox", adapter: "claude_local", enabled: true, account: "aflabox" },
+            { id: "codex-local", adapter: "codex_local", enabled: true },
+          ],
+        },
+      },
+      contextSnapshot: {
+        issueId: randomUUID(),
+        wakeReason: "issue_assigned",
+        providerFallbackSelection: {
+          id: "claude-code-personal",
+          adapter: "claude_local",
+          account: "personal",
+        },
+      },
+    });
+
+    const scheduled = await heartbeat.scheduleBoundedRetry(runId, { now, random: () => 0.5 });
+    expect(scheduled.outcome).toBe("scheduled");
+    if (scheduled.outcome !== "scheduled") return;
+
+    const retryRun = await db
+      .select({
+        contextSnapshot: heartbeatRuns.contextSnapshot,
+        wakeupRequestId: heartbeatRuns.wakeupRequestId,
+      })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, scheduled.run.id))
+      .then((rows) => rows[0] ?? null);
+    const selection = (
+      ((retryRun?.contextSnapshot as Record<string, unknown> | null)?.providerFallbackSelection ?? null) as
+        | Record<string, unknown>
+        | null
+    ) ?? {};
+    expect(selection.id).toBe("claude-code-aflabox");
+    expect(selection.adapter).toBe("claude_local");
+
+    const wakeupRequest = await db
+      .select({ payload: agentWakeupRequests.payload })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, retryRun?.wakeupRequestId ?? ""))
+      .then((rows) => rows[0] ?? null);
+    const wakeSelection = (
+      ((wakeupRequest?.payload as Record<string, unknown> | null)?.providerFallbackSelection ?? null) as
+        | Record<string, unknown>
+        | null
+    ) ?? {};
+    expect(wakeSelection.id).toBe("claude-code-aflabox");
+  });
+
+  it("rotates from Claude aflabox to Codex and then to Grok across retries", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const now = new Date("2026-04-22T10:00:00.000Z");
+
+    await seedRetryFixture({
+      runId,
+      companyId,
+      agentId,
+      now,
+      errorCode: "adapter_failed",
+      errorFamily: "transient_upstream",
+      adapterType: "claude_local",
+      runtimeConfig: {
+        heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 },
+        providerFallback: {
+          chain: [
+            { id: "claude-code-personal", adapter: "claude_local", enabled: true, account: "personal" },
+            { id: "claude-code-aflabox", adapter: "claude_local", enabled: true, account: "aflabox" },
+            { id: "codex-local", adapter: "codex_local", enabled: true },
+            { id: "grok-local", adapter: "grok_local", enabled: true, probe: { required: true } },
+          ],
+        },
+      },
+      contextSnapshot: {
+        issueId: randomUUID(),
+        wakeReason: "issue_assigned",
+        providerFallbackSelection: {
+          id: "claude-code-aflabox",
+          adapter: "claude_local",
+          account: "aflabox",
+        },
+      },
+    });
+
+    const scheduled = await heartbeat.scheduleBoundedRetry(runId, { now, random: () => 0.5 });
+    expect(scheduled.outcome).toBe("scheduled");
+    if (scheduled.outcome !== "scheduled") return;
+
+    const retryRun = await db
+      .select({ contextSnapshot: heartbeatRuns.contextSnapshot })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, scheduled.run.id))
+      .then((rows) => rows[0] ?? null);
+    const selection = (
+      ((retryRun?.contextSnapshot as Record<string, unknown> | null)?.providerFallbackSelection ?? null) as
+        | Record<string, unknown>
+        | null
+    ) ?? {};
+    expect(selection.id).toBe("codex-local");
+    expect(selection.adapter).toBe("codex_local");
+
+    const secondCompanyId = randomUUID();
+    const secondAgentId = randomUUID();
+    const secondRunId = randomUUID();
+    await seedRetryFixture({
+      runId: secondRunId,
+      companyId: secondCompanyId,
+      agentId: secondAgentId,
+      now: new Date(now.getTime() + 60_000),
+      errorCode: "adapter_failed",
+      errorFamily: "transient_upstream",
+      adapterType: "claude_local",
+      runtimeConfig: {
+        heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 },
+        providerFallback: {
+          chain: [
+            { id: "claude-code-personal", adapter: "claude_local", enabled: true, account: "personal" },
+            { id: "claude-code-aflabox", adapter: "claude_local", enabled: true, account: "aflabox" },
+            { id: "codex-local", adapter: "codex_local", enabled: true },
+            { id: "grok-local", adapter: "grok_local", enabled: true, probe: { required: true } },
+          ],
+        },
+      },
+      contextSnapshot: {
+        issueId: randomUUID(),
+        wakeReason: "issue_assigned",
+        providerFallbackSelection: {
+          id: "codex-local",
+          adapter: "codex_local",
+        },
+      },
+    });
+
+    const scheduledSecond = await heartbeat.scheduleBoundedRetry(secondRunId, {
+      now: new Date(now.getTime() + 60_000),
+      random: () => 0.5,
+    });
+    expect(scheduledSecond.outcome).toBe("scheduled");
+    if (scheduledSecond.outcome !== "scheduled") return;
+
+    const secondRetryRun = await db
+      .select({ contextSnapshot: heartbeatRuns.contextSnapshot })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, scheduledSecond.run.id))
+      .then((rows) => rows[0] ?? null);
+    const secondSelection = (
+      ((secondRetryRun?.contextSnapshot as Record<string, unknown> | null)?.providerFallbackSelection ?? null) as
+        | Record<string, unknown>
+        | null
+    ) ?? {};
+    expect(secondSelection.id).toBe("grok-local");
+    expect(secondSelection.adapter).toBe("grok_local");
+  });
+
+  it("treats Claude usage-limit failures as provider-fallback eligible", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const now = new Date("2026-04-22T10:00:00.000Z");
+
+    await seedRetryFixture({
+      runId,
+      companyId,
+      agentId,
+      now,
+      errorCode: "claude_usage_limit",
+      adapterType: "claude_local",
+      runtimeConfig: {
+        heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 },
+        providerFallback: {
+          chain: [
+            { id: "claude-code-personal", adapter: "claude_local", enabled: true, account: "personal" },
+            { id: "claude-code-aflabox", adapter: "claude_local", enabled: true, account: "aflabox" },
+          ],
+        },
+      },
+      contextSnapshot: {
+        issueId: randomUUID(),
+        wakeReason: "issue_assigned",
+        providerFallbackSelection: {
+          id: "claude-code-personal",
+          adapter: "claude_local",
+          account: "personal",
+        },
+      },
+    });
+
+    const scheduled = await heartbeat.scheduleBoundedRetry(runId, { now, random: () => 0.5 });
+    expect(scheduled.outcome).toBe("scheduled");
+    if (scheduled.outcome !== "scheduled") return;
+
+    const retryRun = await db
+      .select({ contextSnapshot: heartbeatRuns.contextSnapshot })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, scheduled.run.id))
+      .then((rows) => rows[0] ?? null);
+    const selection = (
+      ((retryRun?.contextSnapshot as Record<string, unknown> | null)?.providerFallbackSelection ?? null) as
+        | Record<string, unknown>
+        | null
+    ) ?? {};
+    expect(selection.id).toBe("claude-code-aflabox");
+    expect(selection.adapter).toBe("claude_local");
+  });
+
+  it("does not apply provider fallback when no fallback chain is configured", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const now = new Date("2026-04-22T10:00:00.000Z");
+
+    await seedRetryFixture({
+      runId,
+      companyId,
+      agentId,
+      now,
+      errorCode: "adapter_failed",
+      errorFamily: "transient_upstream",
+      adapterType: "codex_local",
+      runtimeConfig: {
+        heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 },
+      },
+      contextSnapshot: {
+        issueId: randomUUID(),
+        wakeReason: "issue_assigned",
+      },
+    });
+
+    const scheduled = await heartbeat.scheduleBoundedRetry(runId, { now, random: () => 0.5 });
+    expect(scheduled.outcome).toBe("scheduled");
+    if (scheduled.outcome !== "scheduled") return;
+
+    const retryRun = await db
+      .select({ contextSnapshot: heartbeatRuns.contextSnapshot })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, scheduled.run.id))
+      .then((rows) => rows[0] ?? null);
+    const snapshot = (retryRun?.contextSnapshot as Record<string, unknown> | null) ?? {};
+    expect(snapshot.providerFallbackSelection).toBeUndefined();
+  });
+
+  it("preserves string probe values in scheduled provider fallback selection", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const now = new Date("2026-04-22T10:00:00.000Z");
+
+    await seedRetryFixture({
+      runId,
+      companyId,
+      agentId,
+      now,
+      errorCode: "adapter_failed",
+      errorFamily: "transient_upstream",
+      adapterType: "codex_local",
+      runtimeConfig: {
+        heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 },
+        providerFallback: {
+          chain: [
+            { id: "codex-local", adapter: "codex_local", enabled: true },
+            { id: "grok-local", adapter: "grok_local", enabled: true, probe: "which grok >/dev/null 2>&1" },
+          ],
+        },
+      },
+      contextSnapshot: {
+        issueId: randomUUID(),
+        wakeReason: "issue_assigned",
+        providerFallbackSelection: {
+          id: "codex-local",
+          adapter: "codex_local",
+        },
+      },
+    });
+
+    const scheduled = await heartbeat.scheduleBoundedRetry(runId, { now, random: () => 0.5 });
+    expect(scheduled.outcome).toBe("scheduled");
+    if (scheduled.outcome !== "scheduled") return;
+
+    const retryRun = await db
+      .select({ contextSnapshot: heartbeatRuns.contextSnapshot })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, scheduled.run.id))
+      .then((rows) => rows[0] ?? null);
+    const selection = (
+      ((retryRun?.contextSnapshot as Record<string, unknown> | null)?.providerFallbackSelection ?? null) as
+        | Record<string, unknown>
+        | null
+    ) ?? {};
+    expect(selection.id).toBe("grok-local");
+    expect(selection.probe).toBe("which grok >/dev/null 2>&1");
   });
 });

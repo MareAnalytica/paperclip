@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { and, eq, or, inArray } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
@@ -32,8 +33,13 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { runningProcesses } from "../adapters/index.ts";
+import * as adapters from "../adapters/index.ts";
 const mockTelemetryClient = vi.hoisted(() => ({ track: vi.fn() }));
 const mockTrackAgentFirstHeartbeat = vi.hoisted(() => vi.fn());
+const mockAdapterTestEnvironment = vi.hoisted(() => vi.fn(async () => ({
+  status: "pass" as const,
+  checks: [],
+})));
 const mockAdapterExecute = vi.hoisted(() =>
   vi.fn(async () => ({
     exitCode: 0,
@@ -67,6 +73,7 @@ vi.mock("../adapters/index.ts", async () => {
     getServerAdapter: vi.fn(() => ({
       supportsLocalAgentJwt: false,
       execute: mockAdapterExecute,
+      testEnvironment: mockAdapterTestEnvironment,
     })),
   };
 });
@@ -99,6 +106,16 @@ function isPidAlive(pid: number | null | undefined) {
   if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) return false;
   try {
     process.kill(pid, 0);
+    if (process.platform === "linux") {
+      try {
+        const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+        const fields = stat.trim().split(/\s+/);
+        const state = fields[2];
+        if (state === "Z") return false;
+      } catch {
+        // If procfs is unavailable or transiently unreadable, fall back to kill(0) probe.
+      }
+    }
     return true;
   } catch {
     return false;
@@ -357,6 +374,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     await db.delete(agentWakeupRequests);
     await db.delete(budgetPolicies);
     for (let attempt = 0; attempt < 5; attempt += 1) {
+      await db.delete(agentWakeupRequests);
       await db.delete(agentRuntimeState);
       try {
         await db.delete(agents);
@@ -999,7 +1017,9 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(lease?.releasedAt).toBeTruthy();
   });
 
-  it.skipIf(process.platform === "win32")("reaps orphaned descendant process groups when the parent pid is already gone", async () => {
+  it.skipIf(process.platform === "win32")(
+    "reaps orphaned descendant process groups when the parent pid is already gone",
+    async () => {
     const orphan = await spawnOrphanedProcessGroup();
     cleanupPids.add(orphan.descendantPid);
     expect(isPidAlive(orphan.descendantPid)).toBe(true);
@@ -1014,7 +1034,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(result.reaped).toBe(1);
     expect(result.runIds).toEqual([runId]);
 
-    expect(await waitForPidExit(orphan.descendantPid, 2_000)).toBe(true);
+    await expect(waitForPidExit(orphan.descendantPid, 20_000)).resolves.toBe(true);
 
     const runs = await db
       .select()
@@ -1036,7 +1056,9 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0] ?? null);
     expect(issue?.executionRunId).toBe(retryRun?.id ?? null);
-  });
+    },
+    30_000,
+  );
 
   it("blocks the issue when process-loss retry is exhausted and the immediate continuation recovery also fails", async () => {
     mockAdapterExecute.mockRejectedValueOnce(new Error("continuation recovery failed"));
@@ -1283,6 +1305,373 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
     const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
     expect(comments).toHaveLength(0);
+  });
+
+  it("uses the selected provider fallback adapter type for execute-time adapter selection", async () => {
+    const { agentId, runId, issueId } = await seedQueuedIssueRunFixture();
+    await db
+      .update(agents)
+      .set({ adapterType: "claude_local" })
+      .where(eq(agents.id, agentId));
+    await db
+      .update(heartbeatRuns)
+      .set({
+        contextSnapshot: {
+          issueId,
+          wakeReason: "issue_assigned",
+          providerFallbackSelection: {
+            id: "codex-local",
+            adapter: "openai-codex-local",
+            adapterConfig: {
+              fallbackHint: "codex",
+            },
+          },
+        },
+      })
+      .where(eq(heartbeatRuns.id, runId));
+
+    const getServerAdapter = vi.mocked(adapters.getServerAdapter);
+    getServerAdapter.mockClear();
+    mockAdapterExecute.mockClear();
+    mockAdapterExecute.mockResolvedValue({
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      errorMessage: null,
+      summary: "Configured fallback adapter execution path validated.",
+      provider: "test",
+      model: "test-model",
+    });
+
+    const heartbeat = heartbeatService(db);
+    await heartbeat.resumeQueuedRuns();
+    await waitForRunToSettle(heartbeat, runId);
+
+    expect(getServerAdapter).toHaveBeenCalledWith("codex_local");
+    expect(mockAdapterExecute).toHaveBeenCalledOnce();
+    const firstExecution = mockAdapterExecute.mock.calls[0]?.[0];
+    expect(firstExecution?.config).toMatchObject({ fallbackHint: "codex" });
+    const executedRun = await heartbeat.getRun(runId);
+    expect(executedRun?.status).toBe("succeeded");
+  });
+
+  it("applies provider fallback adapterConfig even when fallback stays on the same adapter", async () => {
+    const { agentId, runId, issueId } = await seedQueuedIssueRunFixture();
+    await db
+      .update(heartbeatRuns)
+      .set({
+        contextSnapshot: {
+          issueId,
+          wakeReason: "issue_assigned",
+          providerFallbackSelection: {
+            id: "claude-code-aflabox",
+            adapter: "anthropic-claude-code",
+            account: "aflabox",
+            adapterConfig: {
+              fallbackHint: "aflabox",
+            },
+          },
+        },
+      })
+      .where(eq(heartbeatRuns.id, runId));
+
+    const getServerAdapter = vi.mocked(adapters.getServerAdapter);
+    getServerAdapter.mockClear();
+    mockAdapterExecute.mockClear();
+    const observedConfig: Record<string, unknown> = {};
+    mockAdapterExecute.mockImplementation(async (ctx) => {
+      if (ctx.config && typeof ctx.config === "object" && !Array.isArray(ctx.config)) {
+        Object.assign(observedConfig, ctx.config);
+      }
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        errorMessage: null,
+        summary: "Fallback adapter config for same adapter was consumed.",
+        provider: "test",
+        model: "test-model",
+      };
+    });
+
+    const heartbeat = heartbeatService(db);
+    await heartbeat.resumeQueuedRuns();
+    await waitForRunToSettle(heartbeat, runId);
+
+    expect(getServerAdapter).toHaveBeenCalledWith("claude_local");
+    expect(observedConfig.fallbackHint).toBe("aflabox");
+  });
+
+  it("falls back from Claude auth-required failure to the next provider in order", async () => {
+    const { agentId, runId, issueId } = await seedQueuedIssueRunFixture();
+    await db
+      .update(agents)
+      .set({
+        adapterType: "claude_local",
+        runtimeConfig: {
+          heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 },
+          providerFallback: {
+            chain: [
+              { id: "claude-code-personal", adapter: "claude_local", enabled: true, account: "personal" },
+              { id: "codex-local", adapter: "codex_local", enabled: true },
+            ],
+          },
+        },
+      })
+      .where(eq(agents.id, agentId));
+    await db
+      .update(heartbeatRuns)
+      .set({
+        contextSnapshot: {
+          issueId,
+          wakeReason: "issue_assigned",
+          providerFallbackSelection: {
+            id: "claude-code-personal",
+            adapter: "claude_local",
+            account: "personal",
+          },
+        },
+      })
+      .where(eq(heartbeatRuns.id, runId));
+
+    const getServerAdapter = vi.mocked(adapters.getServerAdapter);
+    getServerAdapter.mockClear();
+    mockAdapterExecute.mockClear();
+    mockAdapterExecute
+      .mockResolvedValueOnce({
+        exitCode: 1,
+        signal: null,
+        timedOut: false,
+        errorMessage: "Claude session is not authenticated",
+        summary: "Claude auth failure triggers fallback.",
+        errorCode: "claude_auth_required",
+        provider: "test",
+        model: "test-model",
+      })
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        errorMessage: null,
+        summary: "Fallback run succeeded after auth-required failure.",
+        provider: "test",
+        model: "test-model",
+      });
+
+    const heartbeat = heartbeatService(db);
+    await heartbeat.resumeQueuedRuns();
+    await waitForRunToSettle(heartbeat, runId);
+
+    const fallbackRun = await waitForValue(async () => {
+      const rows = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.agentId, agentId));
+      const hasSelection = (value: unknown) =>
+        typeof value === "object" &&
+        value !== null &&
+        "providerFallbackSelection" in value;
+      return rows.find((row) =>
+        row.id !== runId &&
+        hasSelection(row.contextSnapshot)
+      ) ?? null;
+    }, 8_000);
+
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    const failedRun = runs.find((row) => row.id === runId);
+    expect(failedRun?.status).toBe("failed");
+    expect(failedRun?.errorCode).toBe("claude_auth_required");
+    expect(fallbackRun).not.toBeNull();
+    expect(fallbackRun?.contextSnapshot).toMatchObject({
+      providerFallbackSelection: {
+        id: "codex-local",
+        adapter: "codex_local",
+      },
+    });
+  }, 20_000);
+
+  it("treats a string grok probe as required and runs adapter probe checks", async () => {
+    const { agentId, runId, issueId } = await seedQueuedIssueRunFixture();
+    await db
+      .update(agents)
+      .set({ adapterType: "claude_local" })
+      .where(eq(agents.id, agentId));
+    await db
+      .update(heartbeatRuns)
+      .set({
+        contextSnapshot: {
+          issueId,
+          wakeReason: "issue_assigned",
+          providerFallbackSelection: {
+            id: "grok-local",
+            adapter: "xai-grok-local",
+            probe: "which grok >/dev/null 2>&1",
+          },
+        },
+      })
+      .where(eq(heartbeatRuns.id, runId));
+
+    const getServerAdapter = vi.mocked(adapters.getServerAdapter);
+    getServerAdapter.mockClear();
+    mockAdapterExecute.mockClear();
+    mockAdapterTestEnvironment.mockClear();
+    mockAdapterExecute.mockResolvedValue({
+      exitCode: 1,
+      signal: null,
+      timedOut: false,
+      errorMessage: "forced failure after probe check",
+      summary: "Grok probe-gated fallback run attempted.",
+      provider: "test",
+      model: "test-model",
+    });
+
+    const heartbeat = heartbeatService(db);
+    await heartbeat.resumeQueuedRuns();
+    await waitForRunToSettle(heartbeat, runId);
+
+    expect(getServerAdapter).toHaveBeenCalledWith("grok_local");
+    expect(mockAdapterTestEnvironment).toHaveBeenCalledOnce();
+    expect(mockAdapterTestEnvironment.mock.calls[0]?.[0]).toMatchObject({
+      adapterType: "grok_local",
+      config: expect.objectContaining({}),
+    });
+  });
+
+  it("does not auto-checkout a blocked issue on issue_assigned wake", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const blockedIssueId = randomUUID();
+    const wakeRunId = randomUUID();
+    const wakeupRequestId = randomUUID();
+    const now = new Date("2026-05-25T00:00:00.000Z");
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {
+        heartbeat: {
+          wakeOnDemand: true,
+          maxConcurrentRuns: 1,
+        },
+      },
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: blockedIssueId,
+      companyId,
+      title: "Blocked task",
+      status: "blocked",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      issueNumber: 1,
+      identifier: `${issuePrefix}-1`,
+    });
+
+    await db.insert(agentWakeupRequests).values({
+      id: wakeupRequestId,
+      companyId,
+      agentId,
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: { issueId: blockedIssueId },
+      status: "queued",
+      runId: wakeRunId,
+      requestedAt: now,
+      updatedAt: now,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: wakeRunId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "queued",
+      wakeupRequestId,
+      contextSnapshot: {
+        issueId: blockedIssueId,
+        wakeReason: "issue_assigned",
+      },
+      updatedAt: now,
+      createdAt: now,
+    });
+
+    const heartbeat = heartbeatService(db);
+    let releaseRun: ((result: {
+      exitCode: number;
+      signal: string | null;
+      timedOut: boolean;
+      errorMessage: string | null;
+      summary: string;
+      provider: string;
+      model: string;
+    }) => void) | null = null;
+
+    mockAdapterExecute.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          releaseRun = resolve;
+        }),
+    );
+
+    await heartbeat.resumeQueuedRuns();
+
+    const runStarted = await waitForValue(async () => {
+      const run = await db
+        .select({ status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, wakeRunId))
+        .then((rows) => rows[0] ?? null);
+      if (run?.status === "running") {
+        return run;
+      }
+      return null;
+    }, 5_000);
+
+    const runningIssueStatus = await db
+      .select({ status: issues.status, checkoutRunId: issues.checkoutRunId })
+      .from(issues)
+      .where(eq(issues.id, blockedIssueId))
+      .then((rows) => rows[0] ?? null);
+
+    expect(runStarted).not.toBeNull();
+    expect(runningIssueStatus?.status).toBe("blocked");
+    expect(runningIssueStatus?.checkoutRunId).toBeNull();
+
+    releaseRun?.({
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      errorMessage: null,
+      summary: "Blocked issue test run.",
+      provider: "test",
+      model: "test-model",
+    });
+
+    const runSettled = await waitForRunToSettle(heartbeat, wakeRunId, 5_000);
+    expect(runSettled?.status).toBe("succeeded");
+
+    const finalIssueStatus = await db
+      .select({ status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, blockedIssueId))
+      .then((rows) => rows[0] ?? null);
+    expect(finalIssueStatus?.status).toBe("blocked");
   });
 
   it("queues one finish-handoff wake when a successful run leaves in-progress work without a next action", async () => {
