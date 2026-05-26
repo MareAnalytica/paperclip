@@ -7,6 +7,10 @@ export const DEFAULT_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS = 24;
 export const MIN_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS = 1;
 export const MAX_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS = 24 * 30;
 
+export const DEFAULT_STRANDED_BLOCKED_CEO_PARENT_THRESHOLD_MINUTES = 30;
+export const MIN_STRANDED_BLOCKED_CEO_PARENT_THRESHOLD_MINUTES = 1;
+export const MAX_STRANDED_BLOCKED_CEO_PARENT_THRESHOLD_MINUTES = 24 * 60;
+
 export interface BackupRetentionPolicy {
   dailyDays: (typeof DAILY_RETENTION_PRESETS)[number];
   weeklyWeeks: (typeof WEEKLY_RETENTION_PRESETS)[number];
@@ -33,6 +37,8 @@ export interface InstanceExperimentalSettings {
   autoRestartDevServerWhenIdle: boolean;
   enableIssueGraphLivenessAutoRecovery: boolean;
   issueGraphLivenessAutoRecoveryLookbackHours: number;
+  // Null disables the stranded_blocked_ceo_parent invariant; positive int is the threshold in minutes.
+  strandedBlockedCeoParentThresholdMinutes: number | null;
 }
 
 export interface InstanceSettings {

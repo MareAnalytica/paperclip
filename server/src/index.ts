@@ -748,6 +748,12 @@ export async function startServer(): Promise<StartedServer> {
         }
       })
       .then(async () => {
+        const reconciled = await heartbeat.reconcileStrandedBlockedCeoParents();
+        if (reconciled.wakesEmitted > 0) {
+          logger.warn({ ...reconciled }, "stranded_blocked_ceo_parent reconciliation emitted wakes");
+        }
+      })
+      .then(async () => {
         const reconciled = await heartbeat.reconcileIssueGraphLiveness();
         if (reconciled.escalationsCreated > 0) {
           logger.warn({ ...reconciled }, "startup issue-graph liveness reconciliation created escalations");
@@ -811,6 +817,12 @@ export async function startServer(): Promise<StartedServer> {
               { promotedScheduledRetries: promotion.promoted, promotedScheduledRetryRunIds: promotion.runIds, ...reconciled },
               "periodic heartbeat recovery changed assigned issue state",
             );
+          }
+        })
+        .then(async () => {
+          const reconciled = await heartbeat.reconcileStrandedBlockedCeoParents();
+          if (reconciled.wakesEmitted > 0) {
+            logger.warn({ ...reconciled }, "periodic stranded_blocked_ceo_parent reconciliation emitted wakes");
           }
         })
         .then(async () => {
