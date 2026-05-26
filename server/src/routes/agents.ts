@@ -101,6 +101,7 @@ import { getTelemetryClient } from "../telemetry.js";
 import { assertEnvironmentSelectionForCompany } from "./environment-selection.js";
 import { recoveryService } from "../services/recovery/service.js";
 import { applyCeoFlowPolicyToAdapterConfig } from "../services/ceo-flow-policy.js";
+import { buildDefaultRuntimeConfigBlock as buildDefaultProviderFallbackBlock } from "../services/provider-fallback-policy.js";
 
 const RUN_LOG_DEFAULT_LIMIT_BYTES = 256_000;
 const RUN_LOG_MAX_LIMIT_BYTES = 1024 * 1024;
@@ -864,7 +865,10 @@ export function agentRoutes(
     };
   }
 
-  function normalizeNewAgentRuntimeConfig(runtimeConfig: unknown): Record<string, unknown> {
+  function normalizeNewAgentRuntimeConfig(
+    runtimeConfig: unknown,
+    companyId: string,
+  ): Record<string, unknown> {
     const parsedRuntimeConfig = asRecord(runtimeConfig);
     const normalizedRuntimeConfig = parsedRuntimeConfig ? { ...parsedRuntimeConfig } : {};
     const parsedHeartbeat = asRecord(normalizedRuntimeConfig.heartbeat);
@@ -878,6 +882,26 @@ export function agentRoutes(
     }
 
     normalizedRuntimeConfig.heartbeat = heartbeat;
+
+    // Seed providerFallback.chain from the resolved policy when the caller has
+    // not supplied one (ELI-294). agentService.create also seeds defensively,
+    // but normalizing at the route layer pins AC4 end-to-end so callers (UI,
+    // API consumers, peer routes) see the chain on the persisted record.
+    const existingFallback = asRecord(normalizedRuntimeConfig.providerFallback);
+    const hasExplicitChain =
+      existingFallback != null && Array.isArray(existingFallback.chain);
+    if (!hasExplicitChain) {
+      try {
+        const block = buildDefaultProviderFallbackBlock(companyId);
+        normalizedRuntimeConfig.providerFallback = existingFallback
+          ? { ...existingFallback, chain: block.chain }
+          : { chain: block.chain };
+      } catch {
+        // Defensive: a misconfigured registry must not block agent creation.
+      }
+    } else if (existingFallback) {
+      normalizedRuntimeConfig.providerFallback = existingFallback;
+    }
     return normalizedRuntimeConfig;
   }
 
@@ -1999,7 +2023,7 @@ export function agentRoutes(
     const normalizedRuntimeConfig = await normalizeRuntimeConfigAdapterConfigsForPersistence(
       companyId,
       hireInput.adapterType,
-      normalizeNewAgentRuntimeConfig(hireInput.runtimeConfig),
+      normalizeNewAgentRuntimeConfig(hireInput.runtimeConfig, companyId),
       normalizedAdapterConfig,
     );
     const adapterConfigAfterCeoFlow =
@@ -2199,7 +2223,7 @@ export function agentRoutes(
     const normalizedRuntimeConfig = await normalizeRuntimeConfigAdapterConfigsForPersistence(
       companyId,
       createInput.adapterType,
-      normalizeNewAgentRuntimeConfig(createInput.runtimeConfig),
+      normalizeNewAgentRuntimeConfig(createInput.runtimeConfig, companyId),
       normalizedAdapterConfig,
     );
     await assertAgentEnvironmentSelection(companyId, createInput.adapterType, createInput.defaultEnvironmentId);
