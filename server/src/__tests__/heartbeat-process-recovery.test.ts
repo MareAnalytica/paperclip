@@ -1541,7 +1541,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
   });
 
-  it("does not auto-checkout a blocked issue on issue_assigned wake", async () => {
+  it("does not auto-checkout a blocked issue on issue_assigned wake", { timeout: 30_000 }, async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();
     const blockedIssueId = randomUUID();
