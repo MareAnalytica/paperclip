@@ -8,6 +8,9 @@ import {
   DEFAULT_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
   MAX_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
   MIN_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
+  DEFAULT_STRANDED_BLOCKED_CEO_PARENT_THRESHOLD_MINUTES,
+  MAX_STRANDED_BLOCKED_CEO_PARENT_THRESHOLD_MINUTES,
+  MIN_STRANDED_BLOCKED_CEO_PARENT_THRESHOLD_MINUTES,
 } from "../types/instance.js";
 import { feedbackDataSharingPreferenceSchema } from "./feedback.js";
 
@@ -47,6 +50,15 @@ export const instanceExperimentalSettingsSchema = z.object({
     .min(MIN_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS)
     .max(MAX_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS)
     .default(DEFAULT_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS),
+  strandedBlockedCeoParentThresholdMinutes: z
+    .union([
+      z.number()
+        .int()
+        .min(MIN_STRANDED_BLOCKED_CEO_PARENT_THRESHOLD_MINUTES)
+        .max(MAX_STRANDED_BLOCKED_CEO_PARENT_THRESHOLD_MINUTES),
+      z.null(),
+    ])
+    .default(DEFAULT_STRANDED_BLOCKED_CEO_PARENT_THRESHOLD_MINUTES),
 }).strict();
 
 export const patchInstanceExperimentalSettingsSchema = instanceExperimentalSettingsSchema.partial();

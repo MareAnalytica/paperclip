@@ -7079,6 +7079,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return recovery.reconcileStrandedAssignedIssues();
   }
 
+  async function reconcileStrandedBlockedCeoParents() {
+    return recovery.reconcileStrandedBlockedCeoParents();
+  }
+
   function issueIdFromRunContext(contextSnapshot: unknown) {
     const context = parseObject(contextSnapshot);
     return readNonEmptyString(context.issueId) ?? readNonEmptyString(context.taskId);
@@ -10278,6 +10282,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     },
 
     reconcileStrandedAssignedIssues,
+
+    reconcileStrandedBlockedCeoParents,
 
     buildIssueGraphLivenessAutoRecoveryPreview,
 

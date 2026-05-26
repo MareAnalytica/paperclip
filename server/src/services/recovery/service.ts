@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { and, asc, desc, eq, gt, gte, inArray, isNull, notInArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
@@ -104,7 +105,10 @@ type LatestIssueRun = Pick<
 > | null;
 type SuccessfulLatestIssueRun = NonNullable<LatestIssueRun> & { status: "succeeded" };
 
-type StrandedRecoveryCause = "stranded_assigned_issue" | typeof SUCCESSFUL_RUN_MISSING_STATE_REASON;
+type StrandedRecoveryCause =
+  | "stranded_assigned_issue"
+  | "stranded_blocked_ceo_parent"
+  | typeof SUCCESSFUL_RUN_MISSING_STATE_REASON;
 
 type SuccessfulRunHandoffRecoveryEvidence = {
   sourceRunId: string | null;
@@ -288,6 +292,43 @@ function unwrapDatabaseConflictError(error: unknown) {
 
 function isAgentInvokable(agent: typeof agents.$inferSelect | null | undefined) {
   return Boolean(agent && !["paused", "terminated", "pending_approval"].includes(agent.status));
+}
+
+const STRANDED_BLOCKED_CEO_PARENT_PRINCIPAL_COOLDOWN_MS = 5 * 60 * 1000;
+const STRANDED_BLOCKED_CEO_PARENT_NAME_REGEX = /\b(?:ceo|mission\s*owner|chief\s*executive|board\s*member)\b/i;
+
+function isCeoLikeAssigneeAgent(agent: Pick<typeof agents.$inferSelect, "name" | "role" | "runtimeConfig">) {
+  const runtimeConfig = parseObject(agent.runtimeConfig);
+  const heartbeat = parseObject(runtimeConfig.heartbeat);
+  const configuredRole = readNonEmptyString(heartbeat.controllerRole) ??
+    readNonEmptyString(heartbeat.role) ??
+    readNonEmptyString(runtimeConfig.controllerRole) ??
+    readNonEmptyString(runtimeConfig.role);
+  if (configuredRole) {
+    const normalized = configuredRole.toLowerCase();
+    if (
+      normalized === "ceo" ||
+      normalized === "company_ceo" ||
+      normalized === "company-flow-controller" ||
+      normalized === "mission_owner" ||
+      normalized === "mission-owner"
+    ) {
+      return true;
+    }
+  }
+
+  const haystack = `${agent.name ?? ""} ${agent.role ?? ""}`;
+  return STRANDED_BLOCKED_CEO_PARENT_NAME_REGEX.test(haystack);
+}
+
+function buildStrandedBlockedCeoParentIdempotencyKey(
+  issueId: string,
+  blockedAtEpochMs: number,
+  windowIndex: number,
+) {
+  const hash = createHash("sha256");
+  hash.update(`stranded_blocked_ceo_parent:${issueId}:${blockedAtEpochMs}:${windowIndex}`);
+  return hash.digest("hex");
 }
 
 function isStrandedIssueRecoveryIssue(issue: Pick<typeof issues.$inferSelect, "originKind">) {
@@ -2407,6 +2448,379 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return updated;
   }
 
+  async function findIssueBlockedAt(companyId: string, issueId: string): Promise<Date | null> {
+    const rows = await db
+      .select({
+        createdAt: activityLog.createdAt,
+        details: activityLog.details,
+      })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.companyId, companyId),
+          eq(activityLog.entityType, "issue"),
+          eq(activityLog.entityId, issueId),
+          eq(activityLog.action, "issue.updated"),
+        ),
+      )
+      .orderBy(desc(activityLog.createdAt))
+      .limit(50);
+
+    let mostRecentBlockedTransitionAt: Date | null = null;
+    for (const row of rows) {
+      const details = parseObject(row.details);
+      const status = readNonEmptyString(details.status);
+      const previous = parseObject(details._previous);
+      const previousStatus = readNonEmptyString(previous.status);
+      if (status === "blocked" && previousStatus !== "blocked") {
+        mostRecentBlockedTransitionAt = row.createdAt;
+        break;
+      }
+    }
+    return mostRecentBlockedTransitionAt;
+  }
+
+  async function hasRecentPrincipalCommentSince(
+    companyId: string,
+    issueId: string,
+    sinceExclusive: Date,
+  ) {
+    const row = await db
+      .select({ id: issueComments.id })
+      .from(issueComments)
+      .where(
+        and(
+          eq(issueComments.companyId, companyId),
+          eq(issueComments.issueId, issueId),
+          sql`${issueComments.authorUserId} is not null`,
+          gt(issueComments.createdAt, sinceExclusive),
+        ),
+      )
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    return Boolean(row);
+  }
+
+  async function hasPrincipalCommentInCooldown(companyId: string, issueId: string, now: Date) {
+    const cutoff = new Date(now.getTime() - STRANDED_BLOCKED_CEO_PARENT_PRINCIPAL_COOLDOWN_MS);
+    return hasRecentPrincipalCommentSince(companyId, issueId, cutoff);
+  }
+
+  async function countRoutineChildrenAwaitingWork(companyId: string, parentIssueId: string) {
+    const [row] = await db
+      .select({ count: sql<number>`count(*)::int` })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, companyId),
+          eq(issues.parentId, parentIssueId),
+          isNull(issues.hiddenAt),
+          inArray(issues.status, ["todo", "in_progress", "in_review", "blocked"]),
+        ),
+      );
+    return row?.count ?? 0;
+  }
+
+  async function hasOpenBoardApprovalWithinSla(
+    companyId: string,
+    issueId: string,
+    now: Date,
+    thresholdMinutes: number,
+  ) {
+    const slaCutoff = new Date(now.getTime() - thresholdMinutes * 60 * 1000);
+    const row = await db
+      .select({ id: approvals.id, createdAt: approvals.createdAt })
+      .from(issueApprovals)
+      .innerJoin(approvals, eq(issueApprovals.approvalId, approvals.id))
+      .where(
+        and(
+          eq(issueApprovals.companyId, companyId),
+          eq(issueApprovals.issueId, issueId),
+          eq(approvals.type, "request_board_approval"),
+          inArray(approvals.status, ["pending", "revision_requested"]),
+          gt(approvals.createdAt, slaCutoff),
+        ),
+      )
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    return Boolean(row);
+  }
+
+  async function findExistingStrandedBlockedCeoParentWake(
+    companyId: string,
+    idempotencyKey: string,
+  ) {
+    const row = await db
+      .select({ id: agentWakeupRequests.id })
+      .from(agentWakeupRequests)
+      .where(
+        and(
+          eq(agentWakeupRequests.companyId, companyId),
+          eq(agentWakeupRequests.idempotencyKey, idempotencyKey),
+        ),
+      )
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    return row;
+  }
+
+  async function logStrandedBlockedCeoParentEvaluation(input: {
+    issue: typeof issues.$inferSelect;
+    outcome: "wake_emitted" | "skipped" | "noop";
+    skipReason?: string | null;
+    blockedAt: Date | null;
+    blockedDurationMinutes: number | null;
+    windowIndex: number | null;
+    idempotencyKey: string | null;
+    thresholdMinutes: number | null;
+    routineChildCount?: number | null;
+  }) {
+    await logActivity(db, {
+      companyId: input.issue.companyId,
+      actorType: "system",
+      actorId: "system",
+      agentId: null,
+      runId: null,
+      action: "issue.stranded_blocked_ceo_parent_evaluated",
+      entityType: "issue",
+      entityId: input.issue.id,
+      details: {
+        kind: "stranded_blocked_ceo_parent.evaluated",
+        identifier: input.issue.identifier,
+        outcome: input.outcome,
+        skipReason: input.skipReason ?? null,
+        blockedAt: input.blockedAt ? input.blockedAt.toISOString() : null,
+        blockedDurationMinutes: input.blockedDurationMinutes,
+        windowIndex: input.windowIndex,
+        idempotencyKey: input.idempotencyKey,
+        thresholdMinutes: input.thresholdMinutes,
+        routineChildCount: input.routineChildCount ?? null,
+        assigneeAgentId: input.issue.assigneeAgentId,
+      },
+    });
+  }
+
+  function buildStrandedBlockedCeoParentWakeBody(blockedDurationMinutes: number) {
+    return (
+      `This issue has been blocked for ${blockedDurationMinutes} minutes with no principal ratification and ≥1 routine child remains. ` +
+      "Post a workstream disposition table or confirm true-blocked status."
+    );
+  }
+
+  async function reconcileStrandedBlockedCeoParents() {
+    const experimental = await instanceSettings.getExperimental();
+    const thresholdMinutes = experimental.strandedBlockedCeoParentThresholdMinutes;
+    const result = {
+      evaluated: 0,
+      wakesEmitted: 0,
+      skipped: 0,
+      skippedReasons: {} as Record<string, number>,
+      issueIds: [] as string[],
+    };
+
+    if (thresholdMinutes === null || thresholdMinutes <= 0) {
+      return result;
+    }
+
+    const candidates = await db
+      .select()
+      .from(issues)
+      .where(
+        and(
+          eq(issues.status, "blocked"),
+          isNull(issues.assigneeUserId),
+          isNull(issues.hiddenAt),
+          sql`${issues.assigneeAgentId} is not null`,
+        ),
+      );
+
+    const now = new Date();
+    const thresholdMs = thresholdMinutes * 60 * 1000;
+
+    const bumpSkip = (reason: string) => {
+      result.skipped += 1;
+      result.skippedReasons[reason] = (result.skippedReasons[reason] ?? 0) + 1;
+    };
+
+    for (const issue of candidates) {
+      result.evaluated += 1;
+
+      const agentId = issue.assigneeAgentId;
+      if (!agentId) {
+        bumpSkip("no_assignee_agent");
+        continue;
+      }
+      const agent = await getAgent(agentId);
+      if (!agent || agent.companyId !== issue.companyId) {
+        bumpSkip("assignee_agent_not_found");
+        continue;
+      }
+      if (!isCeoLikeAssigneeAgent(agent)) {
+        bumpSkip("assignee_not_ceo_role");
+        continue;
+      }
+      if (!isAgentInvokable(agent)) {
+        bumpSkip("assignee_not_invokable");
+        continue;
+      }
+
+      const blockedAt = await findIssueBlockedAt(issue.companyId, issue.id);
+      const blockedAtEffective = blockedAt ?? issue.updatedAt;
+      const blockedDurationMs = now.getTime() - blockedAtEffective.getTime();
+      if (blockedDurationMs < thresholdMs) {
+        await logStrandedBlockedCeoParentEvaluation({
+          issue,
+          outcome: "skipped",
+          skipReason: "blocked_under_threshold",
+          blockedAt: blockedAtEffective,
+          blockedDurationMinutes: Math.floor(blockedDurationMs / 60_000),
+          windowIndex: null,
+          idempotencyKey: null,
+          thresholdMinutes,
+        });
+        bumpSkip("blocked_under_threshold");
+        continue;
+      }
+
+      const routineChildCount = await countRoutineChildrenAwaitingWork(issue.companyId, issue.id);
+      if (routineChildCount === 0) {
+        await logStrandedBlockedCeoParentEvaluation({
+          issue,
+          outcome: "skipped",
+          skipReason: "no_routine_children",
+          blockedAt: blockedAtEffective,
+          blockedDurationMinutes: Math.floor(blockedDurationMs / 60_000),
+          windowIndex: null,
+          idempotencyKey: null,
+          thresholdMinutes,
+          routineChildCount: 0,
+        });
+        bumpSkip("no_routine_children");
+        continue;
+      }
+
+      if (await hasOpenBoardApprovalWithinSla(issue.companyId, issue.id, now, thresholdMinutes)) {
+        await logStrandedBlockedCeoParentEvaluation({
+          issue,
+          outcome: "skipped",
+          skipReason: "open_request_board_approval",
+          blockedAt: blockedAtEffective,
+          blockedDurationMinutes: Math.floor(blockedDurationMs / 60_000),
+          windowIndex: null,
+          idempotencyKey: null,
+          thresholdMinutes,
+          routineChildCount,
+        });
+        bumpSkip("open_request_board_approval");
+        continue;
+      }
+
+      if (await hasPrincipalCommentInCooldown(issue.companyId, issue.id, now)) {
+        await logStrandedBlockedCeoParentEvaluation({
+          issue,
+          outcome: "skipped",
+          skipReason: "principal_comment_cooldown",
+          blockedAt: blockedAtEffective,
+          blockedDurationMinutes: Math.floor(blockedDurationMs / 60_000),
+          windowIndex: null,
+          idempotencyKey: null,
+          thresholdMinutes,
+          routineChildCount,
+        });
+        bumpSkip("principal_comment_cooldown");
+        continue;
+      }
+
+      if (await hasRecentPrincipalCommentSince(issue.companyId, issue.id, blockedAtEffective)) {
+        await logStrandedBlockedCeoParentEvaluation({
+          issue,
+          outcome: "skipped",
+          skipReason: "principal_commented_since_block",
+          blockedAt: blockedAtEffective,
+          blockedDurationMinutes: Math.floor(blockedDurationMs / 60_000),
+          windowIndex: null,
+          idempotencyKey: null,
+          thresholdMinutes,
+          routineChildCount,
+        });
+        bumpSkip("principal_commented_since_block");
+        continue;
+      }
+
+      const windowIndex = Math.floor(blockedDurationMs / thresholdMs);
+      const idempotencyKey = buildStrandedBlockedCeoParentIdempotencyKey(
+        issue.id,
+        blockedAtEffective.getTime(),
+        windowIndex,
+      );
+
+      const existing = await findExistingStrandedBlockedCeoParentWake(issue.companyId, idempotencyKey);
+      if (existing) {
+        await logStrandedBlockedCeoParentEvaluation({
+          issue,
+          outcome: "noop",
+          skipReason: "wake_already_emitted",
+          blockedAt: blockedAtEffective,
+          blockedDurationMinutes: Math.floor(blockedDurationMs / 60_000),
+          windowIndex,
+          idempotencyKey,
+          thresholdMinutes,
+          routineChildCount,
+        });
+        bumpSkip("wake_already_emitted");
+        continue;
+      }
+
+      const blockedDurationMinutes = Math.floor(blockedDurationMs / 60_000);
+      const wakeBody = buildStrandedBlockedCeoParentWakeBody(blockedDurationMinutes);
+
+      await deps.enqueueWakeup(agentId, {
+        source: "automation",
+        triggerDetail: "system",
+        reason: "stranded_blocked_ceo_parent",
+        idempotencyKey,
+        payload: {
+          issueId: issue.id,
+          sourceIssueId: issue.id,
+          recoveryCause: "stranded_blocked_ceo_parent" satisfies StrandedRecoveryCause,
+          blockedAtEpochMs: blockedAtEffective.getTime(),
+          windowIndex,
+          blockedDurationMinutes,
+          routineChildCount,
+          body: wakeBody,
+        },
+        requestedByActorType: "system",
+        requestedByActorId: null,
+        contextSnapshot: {
+          issueId: issue.id,
+          taskId: issue.id,
+          wakeReason: "stranded_blocked_ceo_parent",
+          recoveryCause: "stranded_blocked_ceo_parent",
+          blockedAtEpochMs: blockedAtEffective.getTime(),
+          windowIndex,
+          blockedDurationMinutes,
+          routineChildCount,
+        },
+      });
+
+      await logStrandedBlockedCeoParentEvaluation({
+        issue,
+        outcome: "wake_emitted",
+        skipReason: null,
+        blockedAt: blockedAtEffective,
+        blockedDurationMinutes,
+        windowIndex,
+        idempotencyKey,
+        thresholdMinutes,
+        routineChildCount,
+      });
+      result.wakesEmitted += 1;
+      result.issueIds.push(issue.id);
+    }
+
+    return result;
+  }
+
   async function reconcileStrandedAssignedIssues() {
     const candidates = await db
       .select()
@@ -3533,6 +3947,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     recordWatchdogDecision,
     scanSilentActiveRuns,
     reconcileStrandedAssignedIssues,
+    reconcileStrandedBlockedCeoParents,
     buildIssueGraphLivenessAutoRecoveryPreview,
     reconcileIssueGraphLiveness,
     readRecoveryTimerIntervalMs,
