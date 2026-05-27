@@ -41,6 +41,7 @@ import {
 import { createFeedbackTraceShareClientFromConfig } from "./services/feedback-share-client.js";
 import { ensureSystemPeerIssueUser } from "./services/peer-issue-system-user.js";
 import { initCeoFlowPolicy } from "./services/ceo-flow-policy.js";
+import { initProviderFallbackPolicy } from "./services/provider-fallback-policy.js";
 import { buildRuntimeApiCandidateUrls, choosePrimaryRuntimeApiUrl } from "./runtime-api.js";
 import { createPluginWorkerManager } from "./services/plugin-worker-manager.js";
 import { createStorageServiceFromConfig } from "./storage/index.js";
@@ -694,6 +695,7 @@ export async function startServer(): Promise<StartedServer> {
   });
 
   initCeoFlowPolicy(process.env);
+  initProviderFallbackPolicy(process.env);
 
   void reconcilePersistedRuntimeServicesOnStartup(db as any)
     .then((result) => {

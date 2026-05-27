@@ -20,6 +20,9 @@ import { AGENT_DEFAULT_MAX_CONCURRENT_RUNS, isUuidLike, normalizeAgentUrlKey } f
 import { conflict, notFound, unprocessable } from "../errors.js";
 import { normalizeAgentPermissions } from "./agent-permissions.js";
 import { REDACTED_EVENT_VALUE, sanitizeRecord } from "../redaction.js";
+import {
+  buildDefaultRuntimeConfigBlock as buildDefaultProviderFallbackBlock,
+} from "./provider-fallback-policy.js";
 
 function hashToken(token: string) {
   return createHash("sha256").update(token).digest("hex");
@@ -123,7 +126,10 @@ function parseFiniteNumberLike(value: unknown): number | null {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
-function normalizeRuntimeConfigForNewAgent(runtimeConfig: unknown): Record<string, unknown> {
+export function normalizeRuntimeConfigForNewAgent(
+  runtimeConfig: unknown,
+  companyId?: string | null,
+): Record<string, unknown> {
   const normalizedRuntimeConfig = isPlainRecord(runtimeConfig) ? { ...runtimeConfig } : {};
   const heartbeat = isPlainRecord(normalizedRuntimeConfig.heartbeat)
     ? { ...normalizedRuntimeConfig.heartbeat }
@@ -132,6 +138,28 @@ function normalizeRuntimeConfigForNewAgent(runtimeConfig: unknown): Record<strin
     heartbeat.maxConcurrentRuns = AGENT_DEFAULT_MAX_CONCURRENT_RUNS;
   }
   normalizedRuntimeConfig.heartbeat = heartbeat;
+
+  // Seed providerFallback.chain when missing so every new agent inherits the
+  // resolved default order. Explicit caller-supplied chains are preserved
+  // verbatim so per-agent overrides take precedence.
+  const existingFallback = isPlainRecord(normalizedRuntimeConfig.providerFallback)
+    ? { ...normalizedRuntimeConfig.providerFallback }
+    : null;
+  const hasExplicitChain =
+    existingFallback != null && Array.isArray(existingFallback.chain);
+  if (!hasExplicitChain) {
+    try {
+      const block = buildDefaultProviderFallbackBlock(companyId ?? "");
+      normalizedRuntimeConfig.providerFallback = existingFallback
+        ? { ...existingFallback, chain: block.chain }
+        : { chain: block.chain };
+    } catch {
+      // Defensive: never fail agent creation if the policy registry is
+      // misconfigured — leave runtimeConfig.providerFallback unset.
+    }
+  } else if (existingFallback) {
+    normalizedRuntimeConfig.providerFallback = existingFallback;
+  }
   return normalizedRuntimeConfig;
 }
 
@@ -423,7 +451,7 @@ export function agentService(db: Db) {
 
       const role = data.role ?? "general";
       const normalizedPermissions = normalizeAgentPermissions(data.permissions, role);
-      const runtimeConfig = normalizeRuntimeConfigForNewAgent(data.runtimeConfig);
+      const runtimeConfig = normalizeRuntimeConfigForNewAgent(data.runtimeConfig, companyId);
       const created = await db
         .insert(agents)
         .values({ ...data, name: uniqueName, companyId, role, permissions: normalizedPermissions, runtimeConfig })

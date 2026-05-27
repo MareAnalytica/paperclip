@@ -915,13 +915,29 @@ describe.sequential("agent permission routes", () => {
     expect(mockAgentService.create).toHaveBeenCalledWith(
       companyId,
       expect.objectContaining({
-        runtimeConfig: {
+        runtimeConfig: expect.objectContaining({
           heartbeat: {
             enabled: false,
             intervalSec: 3600,
             maxConcurrentRuns: 1,
           },
-        },
+          providerFallback: expect.objectContaining({
+            chain: [
+              expect.objectContaining({
+                id: "claude-code-personal",
+                adapter: "claude_local",
+                account: "personal",
+              }),
+              expect.objectContaining({
+                id: "claude-code-aflabox",
+                adapter: "claude_local",
+                account: "aflabox",
+              }),
+              expect.objectContaining({ id: "codex-local", adapter: "codex_local" }),
+              expect.objectContaining({ id: "grok-local", adapter: "grok_local" }),
+            ],
+          }),
+        }),
       }),
     );
   });
@@ -1025,13 +1041,29 @@ describe.sequential("agent permission routes", () => {
     expect(mockAgentService.create).toHaveBeenCalledWith(
       companyId,
       expect.objectContaining({
-        runtimeConfig: {
+        runtimeConfig: expect.objectContaining({
           heartbeat: {
             enabled: false,
             intervalSec: 3600,
             maxConcurrentRuns: 1,
           },
-        },
+          providerFallback: expect.objectContaining({
+            chain: [
+              expect.objectContaining({
+                id: "claude-code-personal",
+                adapter: "claude_local",
+                account: "personal",
+              }),
+              expect.objectContaining({
+                id: "claude-code-aflabox",
+                adapter: "claude_local",
+                account: "aflabox",
+              }),
+              expect.objectContaining({ id: "codex-local", adapter: "codex_local" }),
+              expect.objectContaining({ id: "grok-local", adapter: "grok_local" }),
+            ],
+          }),
+        }),
       }),
     );
   });
