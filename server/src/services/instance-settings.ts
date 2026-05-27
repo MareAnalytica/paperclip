@@ -5,6 +5,7 @@ import {
   DEFAULT_BACKUP_RETENTION,
   DEFAULT_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
   DEFAULT_STRANDED_BLOCKED_CEO_PARENT_THRESHOLD_MINUTES,
+  DEFAULT_CEO_BLOCKED_SWEEP_INTERVAL_MINUTES,
   instanceGeneralSettingsSchema,
   type InstanceGeneralSettings,
   instanceExperimentalSettingsSchema,
@@ -54,6 +55,9 @@ export function normalizeExperimentalSettings(raw: unknown): InstanceExperimenta
         parsed.data.strandedBlockedCeoParentThresholdMinutes === undefined
           ? DEFAULT_STRANDED_BLOCKED_CEO_PARENT_THRESHOLD_MINUTES
           : parsed.data.strandedBlockedCeoParentThresholdMinutes,
+      ceoBlockedSweepEnabled: parsed.data.ceoBlockedSweepEnabled ?? false,
+      ceoBlockedSweepIntervalMinutes:
+        parsed.data.ceoBlockedSweepIntervalMinutes ?? DEFAULT_CEO_BLOCKED_SWEEP_INTERVAL_MINUTES,
     };
   }
   return {
@@ -66,6 +70,8 @@ export function normalizeExperimentalSettings(raw: unknown): InstanceExperimenta
       DEFAULT_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
     strandedBlockedCeoParentThresholdMinutes:
       DEFAULT_STRANDED_BLOCKED_CEO_PARENT_THRESHOLD_MINUTES,
+    ceoBlockedSweepEnabled: false,
+    ceoBlockedSweepIntervalMinutes: DEFAULT_CEO_BLOCKED_SWEEP_INTERVAL_MINUTES,
   };
 }
 

@@ -23,6 +23,27 @@ import { REDACTED_EVENT_VALUE, sanitizeRecord } from "../redaction.js";
 import {
   buildDefaultRuntimeConfigBlock as buildDefaultProviderFallbackBlock,
 } from "./provider-fallback-policy.js";
+import { ceoBlockedSweepService } from "./ceo-blocked-sweep.js";
+import { instanceSettingsService } from "./instance-settings.js";
+import { logger } from "../middleware/logger.js";
+
+async function reconcileCeoBlockedSweepForCompany(db: Db, companyId: string) {
+  try {
+    const sweep = ceoBlockedSweepService(db);
+    const settings = instanceSettingsService(db);
+    await sweep.reconcileForCompany(companyId, {
+      experimentalSettings: async () => {
+        const exp = await settings.getExperimental();
+        return {
+          ceoBlockedSweepEnabled: exp.ceoBlockedSweepEnabled,
+          ceoBlockedSweepIntervalMinutes: exp.ceoBlockedSweepIntervalMinutes,
+        };
+      },
+    });
+  } catch (err) {
+    logger.error({ err, companyId }, "ceo blocked sweep reconcile (post-agent-mutation) failed");
+  }
+}
 
 function hashToken(token: string) {
   return createHash("sha256").update(token).digest("hex");
@@ -458,6 +479,13 @@ export function agentService(db: Db) {
         .returning()
         .then((rows) => rows[0]);
 
+      // F6 (ELI-297): a CEO appearing in a company that previously had none
+      // must materialize the sweep routine. Non-CEO creates short-circuit
+      // inside `reconcileCeoBlockedSweepForCompany` so the call is cheap.
+      if (role === "ceo") {
+        await reconcileCeoBlockedSweepForCompany(db, companyId);
+      }
+
       return normalizeAgentRow(created);
     },
 
@@ -523,6 +551,12 @@ export function agentService(db: Db) {
         .set({ revokedAt: new Date() })
         .where(eq(agentApiKeys.agentId, id));
 
+      // F6 (ELI-297): a CEO termination must remove the sweep routine;
+      // a non-CEO termination is a no-op so the cost is negligible.
+      if (existing.role === "ceo") {
+        await reconcileCeoBlockedSweepForCompany(db, existing.companyId);
+      }
+
       return getById(id);
     },
 
@@ -530,7 +564,7 @@ export function agentService(db: Db) {
       const existing = await getById(id);
       if (!existing) return null;
 
-      return db.transaction(async (tx) => {
+      const result = await db.transaction(async (tx) => {
         await tx.update(agents).set({ reportsTo: null }).where(eq(agents.reportsTo, id));
         await tx
           .update(issues)
@@ -557,6 +591,14 @@ export function agentService(db: Db) {
           .then((rows) => rows[0] ?? null);
         return deleted ? normalizeAgentRow(deleted) : null;
       });
+
+      // F6 (ELI-297): same reconcile rationale as terminate. Guarded on role
+      // so non-CEO removals stay cheap.
+      if (existing.role === "ceo") {
+        await reconcileCeoBlockedSweepForCompany(db, existing.companyId);
+      }
+
+      return result;
     },
 
     activatePendingApproval: async (id: string) => {
