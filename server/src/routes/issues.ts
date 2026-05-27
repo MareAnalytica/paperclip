@@ -109,6 +109,7 @@ import {
   setIssueExecutionPolicyMonitorScheduledBy,
 } from "../services/issue-execution-policy.js";
 import { parseIssueExecutionWorkspaceSettings } from "../services/execution-workspace-policy.js";
+import { isAuditSinkIssue } from "../services/recovery/audit-sink-guard.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 
 const MAX_ISSUE_COMMENT_LIMIT = 500;
@@ -2383,8 +2384,14 @@ export function issueRoutes(
       assertBoard(req);
     }
 
+    const auditSinkSuppressed = await isAuditSinkIssue(db, existing.companyId, existing.id);
+    const effectiveSourceIssueStatus = auditSinkSuppressed ? null : sourceIssueStatus;
+    const effectiveResolutionNote = auditSinkSuppressed
+      ? (resolutionNote ? `${resolutionNote} (suppressed: audit-sink issue)` : "suppressed: audit-sink issue")
+      : (resolutionNote ?? null);
+
     const actor = getActorInfo(req);
-    const updateFields = sourceIssueStatus ? { status: sourceIssueStatus } : {};
+    const updateFields = effectiveSourceIssueStatus ? { status: effectiveSourceIssueStatus } : {};
     await assertAgentInReviewReviewPath({
       existing,
       updateFields,
@@ -2418,11 +2425,11 @@ export function issueRoutes(
         }
       }
 
-      if (sourceIssueStatus) {
+      if (effectiveSourceIssueStatus) {
         const updatedIssue = await svc.update(
           id,
           {
-            status: sourceIssueStatus,
+            status: effectiveSourceIssueStatus,
             actorAgentId: actor.agentId ?? null,
             actorUserId: actor.actorType === "user" ? actor.actorId : null,
           },
@@ -2439,7 +2446,7 @@ export function issueRoutes(
           actionId: actionId ?? null,
           status: actionStatus,
           outcome,
-          resolutionNote: resolutionNote ?? null,
+          resolutionNote: effectiveResolutionNote,
         },
         tx,
       );
@@ -2450,7 +2457,7 @@ export function issueRoutes(
 
     await routinesSvc.syncRunStatusForIssue(result.issue.id);
 
-    if (sourceIssueStatus && existing.status !== result.issue.status) {
+    if (effectiveSourceIssueStatus && existing.status !== result.issue.status) {
       await logActivity(db, {
         companyId: result.issue.companyId,
         actorType: actor.actorType,
@@ -2488,11 +2495,12 @@ export function issueRoutes(
         outcome: result.recoveryAction.outcome,
         sourceIssueStatus: sourceIssueStatus ?? null,
         resolutionNote: result.recoveryAction.resolutionNote,
+        ...(auditSinkSuppressed ? { suppressionReason: "audit_sink_target" } : {}),
       },
     });
 
     if (
-      sourceIssueStatus === "todo" &&
+      effectiveSourceIssueStatus === "todo" &&
       existing.status !== result.issue.status &&
       result.issue.assigneeAgentId
     ) {

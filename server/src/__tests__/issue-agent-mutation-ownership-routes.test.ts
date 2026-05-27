@@ -199,6 +199,11 @@ function createRunContextDb(contextSnapshot: Record<string, unknown> = {}) {
     transaction: async (callback: (tx: Record<string, never>) => Promise<unknown>) => callback({}),
     select: vi.fn(() => ({
       from: vi.fn(() => ({
+        innerJoin: vi.fn(() => ({
+          where: vi.fn(() => ({
+            limit: vi.fn(async () => []),
+          })),
+        })),
         where: vi.fn(() => ({
           then: async (resolve: (rows: unknown[]) => unknown) =>
             resolve([{

@@ -215,6 +215,13 @@ export type IssueOriginKind = BuiltInIssueOriginKind | PluginIssueOriginKind;
 export const ISSUE_SURFACE_VISIBILITIES = ["default", "plugin_operation"] as const;
 export type IssueSurfaceVisibility = (typeof ISSUE_SURFACE_VISIBILITIES)[number];
 
+/**
+ * Reserved label name marking an issue as an "audit sink" — append-only
+ * audit/log issue (e.g. CEO sweep log) that recovery code paths must NOT
+ * resurrect into active work. See `docs/specs/2026-05-26-audit-sink-recovery-exemption.md`.
+ */
+export const AUDIT_SINK_LABEL_NAME = "audit-sink";
+
 export const ISSUE_RECOVERY_ACTION_KINDS = [
   "missing_disposition",
   "stranded_assigned_issue",
