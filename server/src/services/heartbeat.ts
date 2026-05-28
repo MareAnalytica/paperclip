@@ -169,6 +169,7 @@ import { environmentService } from "./environments.js";
 import { environmentRuntimeService } from "./environment-runtime.js";
 import { environmentRunOrchestrator } from "./environment-run-orchestrator.js";
 import { isUnsafeSessionWorkspaceCwd } from "./session-workspace-cwd.js";
+import { getProviderFallbackPolicy, policyForCompany } from "./provider-fallback-policy.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 
 const MAX_LIVE_LOG_CHUNK_BYTES = 8 * 1024;
@@ -1161,6 +1162,79 @@ function resolveProviderFallbackChain(runtimeConfig: unknown): ProviderFallbackE
     });
   }
   return normalized;
+}
+
+const PROVIDER_FALLBACK_ENV_ID_RE = /^[a-z][a-z0-9-]{1,40}$/;
+
+// Parse the blueprint-emitted `PROVIDER_FALLBACK_CHAIN` env value (spec
+// ELI-382 §2.3): a comma-joined list of public provider ids. Returns a
+// de-duplicated, slug-validated, order-preserving id list.
+export function parseProviderFallbackChainEnv(value: unknown): string[] {
+  if (typeof value !== "string") return [];
+  const seen = new Set<string>();
+  const ids: string[] = [];
+  for (const raw of value.split(",")) {
+    const id = raw.trim().toLowerCase();
+    if (!id || seen.has(id) || !PROVIDER_FALLBACK_ENV_ID_RE.test(id)) continue;
+    seen.add(id);
+    ids.push(id);
+  }
+  return ids;
+}
+
+// Resolve the effective provider-fallback chain for an agent run.
+//
+// The blueprint env surface (`adapterConfig.env.PROVIDER_FALLBACK_CHAIN`) is
+// the portable read surface and is authoritative for ordering/membership when
+// present — this is what lets a per-agent shortened chain take effect. Entry
+// credentials (adapter/account/adapterConfig) are filled from the agent's
+// `runtimeConfig.providerFallback.chain` when it carries the id, else from the
+// company provider-fallback policy registry. provider-id -> credentials is a
+// deployment concern, never the manifest.
+//
+// When no env surface is present the agent keeps the prior behaviour and runs
+// off `runtimeConfig.providerFallback.chain` alone.
+export function resolveEffectiveProviderFallbackChain(agent: {
+  runtimeConfig?: unknown;
+  adapterConfig?: unknown;
+  companyId: string;
+}): ProviderFallbackEntry[] {
+  const runtimeChain = resolveProviderFallbackChain(agent.runtimeConfig);
+  const adapterEnv = parseObject(parseObject(agent.adapterConfig).env);
+  const envIds = parseProviderFallbackChainEnv(adapterEnv.PROVIDER_FALLBACK_CHAIN);
+  if (envIds.length === 0) return runtimeChain;
+
+  const byId = new Map<string, ProviderFallbackEntry>();
+  for (const entry of runtimeChain) byId.set(entry.id, entry);
+
+  if (envIds.some((id) => !byId.has(id))) {
+    try {
+      const policyChain = policyForCompany(getProviderFallbackPolicy(), agent.companyId).chain;
+      for (const entry of policyChain) {
+        if (byId.has(entry.id)) continue;
+        const adapter = normalizeProviderFallbackAdapterType(entry.adapter);
+        if (!adapter) continue;
+        byId.set(entry.id, {
+          id: entry.id,
+          adapter,
+          enabled: entry.enabled !== false,
+          account: entry.account ?? null,
+          adapterConfig: entry.adapterConfig ?? null,
+          probe: null,
+        });
+      }
+    } catch {
+      // Policy registry unavailable/misconfigured: fall through with whatever
+      // runtimeConfig already provided. Fallback resolution never fails a run.
+    }
+  }
+
+  const effective: ProviderFallbackEntry[] = [];
+  for (const id of envIds) {
+    const entry = byId.get(id);
+    if (entry) effective.push(entry);
+  }
+  return effective.length > 0 ? effective : runtimeChain;
 }
 
 function findProviderFallbackEntry(chain: ProviderFallbackEntry[], id: string | null): ProviderFallbackEntry | null {
@@ -5463,7 +5537,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       retryReason === BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON
         ? readTransientRecoveryContractFromRun(run)
         : null;
-    const providerFallbackChain = resolveProviderFallbackChain(agent.runtimeConfig);
+    const providerFallbackChain = resolveEffectiveProviderFallbackChain(agent);
     const priorFallbackSelection = parseObject(parseObject(run.contextSnapshot).providerFallbackSelection);
     const priorFallbackId = readNonEmptyString(priorFallbackSelection.id);
     const shouldAttemptProviderFallback =
