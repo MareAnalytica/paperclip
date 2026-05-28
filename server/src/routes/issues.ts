@@ -22,6 +22,7 @@ import {
   createIssueThreadInteractionSchema,
   createIssueWorkProductSchema,
   createIssueLabelSchema,
+  updateLabelSchema,
   checkoutIssueSchema,
   createChildIssueSchema,
   createIssueSchema,
@@ -2092,9 +2093,37 @@ export function issueRoutes(
       action: "label.created",
       entityType: "label",
       entityId: label.id,
-      details: { name: label.name, color: label.color },
+      details: { name: label.name, color: label.color, description: label.description },
     });
     res.status(201).json(label);
+  });
+
+  router.patch("/labels/:labelId", validate(updateLabelSchema), async (req, res) => {
+    const labelId = req.params.labelId as string;
+    const existing = await svc.getLabelById(labelId);
+    if (!existing) {
+      res.status(404).json({ error: "Label not found" });
+      return;
+    }
+    assertCompanyAccess(req, existing.companyId);
+    const updated = await svc.updateLabel(labelId, req.body);
+    if (!updated) {
+      res.status(404).json({ error: "Label not found" });
+      return;
+    }
+    const actor = getActorInfo(req);
+    await logActivity(db, {
+      companyId: updated.companyId,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: actor.runId,
+      action: "label.updated",
+      entityType: "label",
+      entityId: updated.id,
+      details: { name: updated.name, color: updated.color, description: updated.description },
+    });
+    res.json(updated);
   });
 
   router.delete("/labels/:labelId", async (req, res) => {

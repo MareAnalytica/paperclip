@@ -1,8 +1,14 @@
 import { z } from "zod";
 import {
   COMPANY_STATUSES,
+  COMPANY_TRUST_LEVELS,
   MAX_COMPANY_ATTACHMENT_MAX_BYTES,
 } from "../constants.js";
+
+const trustLevelSchema = z.enum(COMPANY_TRUST_LEVELS);
+const capabilityTagSchema = z.string().trim().min(1).max(64);
+const capabilityTagsSchema = z.array(capabilityTagSchema).max(64);
+const policiesSchema = z.record(z.unknown()).nullable();
 
 const logoAssetIdSchema = z.string().uuid().nullable().optional();
 const brandColorSchema = z.string().regex(/^#[0-9a-fA-F]{6}$/).nullable().optional();
@@ -18,6 +24,9 @@ export const createCompanySchema = z.object({
   description: z.string().optional().nullable(),
   budgetMonthlyCents: z.number().int().nonnegative().optional().default(0),
   attachmentMaxBytes: attachmentMaxBytesSchema.optional(),
+  trustLevel: trustLevelSchema.optional(),
+  capabilityTags: capabilityTagsSchema.optional(),
+  policies: policiesSchema.optional(),
 });
 
 export type CreateCompany = z.infer<typeof createCompanySchema>;

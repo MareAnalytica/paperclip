@@ -659,6 +659,13 @@
       "when": 1779573019125,
       "tag": "0093_resource_memberships",
       "breakpoints": true
+    },
+    {
+      "idx": 94,
+      "version": "7",
+      "when": 1779926225438,
+      "tag": "0094_dee575_company_trust_label_description",
+      "breakpoints": true
     }
   ]
 }

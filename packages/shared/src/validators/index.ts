@@ -447,3 +447,5 @@ export {
   type SetPluginState,
   type ListPluginState,
 } from "./plugin.js";
+
+export { updateLabelSchema, type UpdateLabel } from "./label.js";

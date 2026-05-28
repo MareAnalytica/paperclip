@@ -1,6 +1,7 @@
 export { agentAdapterTypeSchema, optionalAgentAdapterTypeSchema } from "./adapter-type.js";
 export {
   COMPANY_STATUSES,
+  COMPANY_TRUST_LEVELS,
   DEFAULT_COMPANY_ATTACHMENT_MAX_BYTES,
   MAX_COMPANY_ATTACHMENT_MAX_BYTES,
   DEPLOYMENT_MODES,
@@ -816,6 +817,7 @@ export {
   createChildIssueSchema,
   resolveCreateIssueStatusDefault,
   createIssueLabelSchema,
+  updateLabelSchema,
   issueBlockedInboxAttentionSchema,
   issueBlockedInboxIssueRefSchema,
   issueBlockedInboxReasonSchema,

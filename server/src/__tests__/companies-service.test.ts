@@ -47,4 +47,37 @@ describeEmbeddedPostgres("companyService", () => {
     const rows = await db.select({ issuePrefix: companies.issuePrefix }).from(companies);
     expect(rows.map((row) => row.issuePrefix).sort()).toEqual(["ARO", "AROA"]);
   });
+
+  it("defaults trustLevel/capabilityTags/policies and round-trips overrides", async () => {
+    const svc = companyService(db);
+
+    const defaulted = await svc.create({ name: "Defaulted Co" });
+    expect(defaulted.trustLevel).toBe("standard");
+    expect(defaulted.capabilityTags).toEqual([]);
+    expect(defaulted.policies).toBeNull();
+
+    const custom = await svc.create({
+      name: "Custom Co",
+      trustLevel: "elevated",
+      capabilityTags: ["scraping", "analytics"],
+      policies: { budget: { monthlyCents: 1000 }, model: "sonnet" },
+    });
+    expect(custom.trustLevel).toBe("elevated");
+    expect(custom.capabilityTags).toEqual(["scraping", "analytics"]);
+    expect(custom.policies).toEqual({ budget: { monthlyCents: 1000 }, model: "sonnet" });
+
+    const updated = await svc.update(custom.id, {
+      trustLevel: "restricted",
+      capabilityTags: ["analytics"],
+      policies: null,
+    });
+    expect(updated?.trustLevel).toBe("restricted");
+    expect(updated?.capabilityTags).toEqual(["analytics"]);
+    expect(updated?.policies).toBeNull();
+
+    const fetched = await svc.getById(custom.id);
+    expect(fetched?.trustLevel).toBe("restricted");
+    expect(fetched?.capabilityTags).toEqual(["analytics"]);
+    expect(fetched?.policies).toBeNull();
+  });
 });

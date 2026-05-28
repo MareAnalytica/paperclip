@@ -1,4 +1,4 @@
-import type { CompanyStatus, PauseReason } from "../constants.js";
+import type { CompanyStatus, CompanyTrustLevel, PauseReason } from "../constants.js";
 
 export interface Company {
   id: string;
@@ -18,6 +18,9 @@ export interface Company {
   feedbackDataSharingConsentByUserId: string | null;
   feedbackDataSharingTermsVersion: string | null;
   brandColor: string | null;
+  trustLevel: CompanyTrustLevel;
+  capabilityTags: string[];
+  policies: Record<string, unknown> | null;
   logoAssetId: string | null;
   logoUrl: string | null;
   createdAt: Date;
