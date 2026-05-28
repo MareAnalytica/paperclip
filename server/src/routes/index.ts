@@ -22,4 +22,5 @@ export { accessRoutes } from "./access.js";
 export { instanceSettingsRoutes } from "./instance-settings.js";
 export { instanceDatabaseBackupRoutes } from "./instance-database-backups.js";
 export { peerIssueRoutes } from "./peer-issues.js";
+export { peerGrantRequestRoutes } from "./peer-grant-requests.js";
 export { cloudUpstreamRoutes } from "./cloud-upstreams.js";
