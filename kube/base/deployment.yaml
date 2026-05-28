@@ -95,10 +95,10 @@ spec:
       volumes:
         - name: tmp
           emptyDir:
-            sizeLimit: 100Mi
+            sizeLimit: 1Gi
         - name: data
           emptyDir:
-            sizeLimit: 500Mi
+            sizeLimit: 1Gi
         - name: paperclip-home
           persistentVolumeClaim:
             claimName: paperclip-home-pvc
