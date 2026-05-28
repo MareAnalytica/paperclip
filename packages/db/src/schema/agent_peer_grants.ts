@@ -1,4 +1,4 @@
-import { pgTable, uuid, text, timestamp, index } from "drizzle-orm/pg-core";
+import { pgTable, uuid, text, timestamp, integer, index } from "drizzle-orm/pg-core";
 import { agents } from "./agents.js";
 import { companies } from "./companies.js";
 
@@ -14,6 +14,10 @@ export const agentPeerGrants = pgTable(
     expiresAt: timestamp("expires_at", { withTimezone: true }),
     revokedAt: timestamp("revoked_at", { withTimezone: true }),
     notes: text("notes"),
+    // Server-enforced single-use (spec §8 O1). null max_uses => no per-use cap
+    // (legacy TTL-only behavior, preserved for pre-existing grants).
+    maxUses: integer("max_uses"),
+    usesCount: integer("uses_count").notNull().default(0),
   },
   (table) => ({
     agentTargetIdx: index("agent_peer_grants_agent_target_idx").on(table.agentId, table.targetCompanyId),

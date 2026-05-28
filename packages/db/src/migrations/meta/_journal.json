@@ -666,6 +666,13 @@
       "when": 1779926225438,
       "tag": "0094_dee575_company_trust_label_description",
       "breakpoints": true
+    },
+    {
+      "idx": 95,
+      "version": "7",
+      "when": 1779970941542,
+      "tag": "0095_peer_grant_requests",
+      "breakpoints": true
     }
   ]
 }
