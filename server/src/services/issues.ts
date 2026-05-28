@@ -5053,16 +5053,40 @@ export function issueService(db: Db) {
         .where(eq(labels.id, id))
         .then((rows) => rows[0] ?? null),
 
-    createLabel: async (companyId: string, data: Pick<typeof labels.$inferInsert, "name" | "color">) => {
+    createLabel: async (
+      companyId: string,
+      data: Pick<typeof labels.$inferInsert, "name" | "color"> & {
+        description?: string | null;
+      },
+    ) => {
       const [created] = await db
         .insert(labels)
         .values({
           companyId,
           name: data.name.trim(),
           color: data.color,
+          description: data.description ?? null,
         })
         .returning();
       return created;
+    },
+
+    updateLabel: async (
+      id: string,
+      patch: { name?: string; color?: string; description?: string | null },
+    ) => {
+      const updates: Partial<typeof labels.$inferInsert> & { updatedAt: Date } = {
+        updatedAt: new Date(),
+      };
+      if (patch.name !== undefined) updates.name = patch.name.trim();
+      if (patch.color !== undefined) updates.color = patch.color;
+      if (patch.description !== undefined) updates.description = patch.description;
+      const [updated] = await db
+        .update(labels)
+        .set(updates)
+        .where(eq(labels.id, id))
+        .returning();
+      return updated ?? null;
     },
 
     deleteLabel: async (id: string) =>
