@@ -169,7 +169,19 @@ import { environmentService } from "./environments.js";
 import { environmentRuntimeService } from "./environment-runtime.js";
 import { environmentRunOrchestrator } from "./environment-run-orchestrator.js";
 import { isUnsafeSessionWorkspaceCwd } from "./session-workspace-cwd.js";
-import { getProviderFallbackPolicy, policyForCompany } from "./provider-fallback-policy.js";
+import {
+  getProviderFallbackPolicy,
+  policyForCompany,
+  resolveProviderFallbackEscalation,
+  type ProviderFallbackNotifyKind,
+} from "./provider-fallback-policy.js";
+import {
+  buildProviderFallbackExhaustedReport,
+  computeProviderFallbackBackoff,
+  renderProviderFallbackExhaustedMarkdown,
+  type ProviderFallbackExhaustedReport,
+} from "./provider-fallback-exhaustion.js";
+import { issueThreadInteractionService } from "./issue-thread-interactions.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 
 const MAX_LIVE_LOG_CHUNK_BYTES = 8 * 1024;
@@ -1254,6 +1266,28 @@ function selectNextProviderFallbackEntry(input: {
     : enabledEntries.findIndex((entry) => entry.adapter === input.currentAdapterType);
   if (currentIndex < 0) return enabledEntries[0] ?? null;
   return enabledEntries[currentIndex + 1] ?? null;
+}
+
+// The provider id that just failed on this run: the active fallback selection,
+// or — on the first failure with no selection — the agent's primary provider
+// (the chain entry whose adapter matches the agent, else the chain head).
+function resolvePrimaryProviderId(
+  chain: ProviderFallbackEntry[],
+  adapterType: string,
+): string | null {
+  const match = chain.find((entry) => entry.adapter === adapterType);
+  return match?.id ?? chain[0]?.id ?? null;
+}
+
+// Read the accumulated per-provider reset map from a run's context snapshot,
+// keeping only string|null reset values keyed by provider id.
+function readProviderFallbackResetMap(value: Record<string, unknown>): Record<string, string | null> {
+  const out: Record<string, string | null> = {};
+  for (const [key, raw] of Object.entries(value)) {
+    if (typeof raw === "string") out[key] = raw;
+    else if (raw === null) out[key] = null;
+  }
+  return out;
 }
 
 function readModelProfileKey(value: unknown): ModelProfileKey | null {
@@ -5503,6 +5537,118 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return { outcome: "promoted", run: promoted };
   }
 
+  // Emit the spec §4 provider-fallback exhaustion report. The structured run
+  // event + activity log are always written (audit). When board escalation is
+  // enabled we additionally surface a board-visible artifact routed by
+  // notifyKind, reusing the existing thread/interaction/wake primitives. Telegram
+  // channel routing (company -> board group) is intentionally NOT done here — it
+  // stays a deployment/relay concern so the platform is portable. Board emission
+  // is best-effort and never fails the retry it accompanies.
+  async function emitProviderFallbackExhaustedReport(input: {
+    run: typeof heartbeatRuns.$inferSelect;
+    issueId: string | null;
+    report: ProviderFallbackExhaustedReport;
+    notifyKind: ProviderFallbackNotifyKind;
+    boardEnabled: boolean;
+    scheduledRetryAt: string | null;
+  }) {
+    const { run, issueId, report, notifyKind, boardEnabled, scheduledRetryAt } = input;
+    const markdown = renderProviderFallbackExhaustedMarkdown(report);
+
+    await appendRunEvent(run, await nextRunEventSeq(run.id), {
+      eventType: "lifecycle",
+      stream: "system",
+      level: "warn",
+      message: `Provider fallback exhausted for agent ${report.agentNameKey}; backing off until ${report.nextResetAt}`,
+      payload: { ...report, notifyKind, boardEscalationEnabled: boardEnabled, scheduledRetryAt },
+    });
+    await logActivity(db, {
+      companyId: run.companyId,
+      actorType: "system",
+      actorId: "heartbeat",
+      agentId: run.agentId,
+      runId: run.id,
+      action: "agent.provider_fallback_exhausted",
+      entityType: issueId ? "issue" : "agent",
+      entityId: issueId ?? run.agentId,
+      details: { ...report, notifyKind, boardEscalationEnabled: boardEnabled },
+    });
+
+    if (!boardEnabled || !issueId) return;
+
+    const idempotencyKey = `provider-fallback-exhausted:${run.id}`;
+    try {
+      switch (notifyKind) {
+        case "approval": {
+          await issueThreadInteractionService(db).create(
+            { id: issueId, companyId: run.companyId },
+            {
+              kind: "request_confirmation",
+              idempotencyKey,
+              sourceRunId: run.id,
+              title: "Provider fallback exhausted",
+              summary: markdown.slice(0, 1000),
+              continuationPolicy: "none",
+              payload: {
+                version: 1,
+                prompt: markdown.slice(0, 1000),
+                decisionClass: "human_only",
+                detailsMarkdown: markdown,
+                allowDeclineReason: true,
+                target: null,
+              },
+            },
+            { agentId: null, userId: null },
+          );
+          break;
+        }
+        case "wake": {
+          await db.insert(issueComments).values({
+            companyId: run.companyId,
+            issueId,
+            body: markdown,
+          });
+          await enqueueWakeup(run.agentId, {
+            source: "automation",
+            triggerDetail: "system",
+            reason: "provider_fallback_exhausted",
+            idempotencyKey,
+            payload: withRecoveryModelProfileHint(
+              { issueId, ...report },
+              "status_only",
+            ),
+            contextSnapshot: withRecoveryModelProfileHint(
+              {
+                issueId,
+                source: "provider.fallback.exhausted",
+                wakeReason: "provider_fallback_exhausted",
+              },
+              "status_only",
+            ),
+            requestedByActorType: "system",
+            requestedByActorId: null,
+          });
+          break;
+        }
+        case "comment":
+        case "digest":
+        default: {
+          await db.insert(issueComments).values({
+            companyId: run.companyId,
+            issueId,
+            body: markdown,
+          });
+          break;
+        }
+      }
+    } catch (err) {
+      logger.error(
+        { err, runId: run.id, issueId, notifyKind },
+        "[provider-fallback] board exhaustion report emission failed",
+      );
+    }
+  }
+
   async function scheduleBoundedRetryForRun(
     run: typeof heartbeatRuns.$inferSelect,
     agent: typeof agents.$inferSelect,
@@ -5556,7 +5702,57 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         : null;
     const transientRetryNotBefore = transientRecovery?.retryNotBefore ?? null;
 
+    // Provider-fallback chain exhaustion (spec ELI-382 §3.4 + §4, ELI-396).
+    // Accumulate each failing provider's provider-supplied reset across hops so
+    // that, when the chain is exhausted (eligible failure + no next entry left),
+    // we can report the earliest reset and back off the primary until then.
+    const enabledFallbackChain = providerFallbackChain.filter((entry) => entry.enabled);
+    const providerFallbackExhausted =
+      shouldAttemptProviderFallback && enabledFallbackChain.length > 0 && nextProviderFallback === null;
+    const failedProviderId =
+      priorFallbackId ?? resolvePrimaryProviderId(enabledFallbackChain, agent.adapterType);
+    const failedProviderReset = readTransientRetryNotBeforeFromRun(run);
+    const accumulatedProviderResets = readProviderFallbackResetMap(
+      parseObject(parseObject(run.contextSnapshot).providerFallbackResets),
+    );
+    if (shouldAttemptProviderFallback && failedProviderId) {
+      accumulatedProviderResets[failedProviderId] = failedProviderReset
+        ? failedProviderReset.toISOString()
+        : null;
+    }
+    const providerFallbackEscalation = providerFallbackExhausted
+      ? resolveProviderFallbackEscalation(run.companyId)
+      : null;
+    const providerFallbackBackoff =
+      providerFallbackExhausted && providerFallbackEscalation
+        ? computeProviderFallbackBackoff({
+            perProviderResets: Object.values(accumulatedProviderResets),
+            now,
+            retryAfterMinutesDefault: providerFallbackEscalation.retryAfterMinutesDefault,
+          })
+        : null;
+    const providerFallbackExhaustedReport =
+      providerFallbackBackoff
+        ? buildProviderFallbackExhaustedReport({
+            agentNameKey: normalizeAgentNameKey(agent.name) ?? agent.name ?? run.agentId,
+            companyId: run.companyId,
+            exhaustedProviders: enabledFallbackChain.map((entry) => entry.id),
+            nextResetAt: providerFallbackBackoff.nextResetAt,
+            nextResetSource: providerFallbackBackoff.nextResetSource,
+          })
+        : null;
+
     if (!baseSchedule) {
+      if (providerFallbackExhaustedReport && providerFallbackEscalation) {
+        await emitProviderFallbackExhaustedReport({
+          run,
+          issueId: readNonEmptyString(parseObject(run.contextSnapshot).issueId),
+          report: providerFallbackExhaustedReport,
+          notifyKind: providerFallbackEscalation.boardEscalation.notifyKind,
+          boardEnabled: providerFallbackEscalation.boardEscalation.enabled,
+          scheduledRetryAt: null,
+        });
+      }
       await appendRunEvent(run, await nextRunEventSeq(run.id), {
         eventType: "lifecycle",
         stream: "system",
@@ -5574,7 +5770,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         maxAttempts,
       };
     }
-    const schedule =
+    let schedule =
       transientRetryNotBefore && transientRetryNotBefore.getTime() > baseSchedule.dueAt.getTime()
         ? {
             ...baseSchedule,
@@ -5582,6 +5778,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             delayMs: Math.max(0, transientRetryNotBefore.getTime() - now.getTime()),
           }
         : baseSchedule;
+
+    // On chain exhaustion, back off the primary until the computed reset
+    // (spec §4.2) instead of the bounded-transient delay.
+    if (providerFallbackBackoff) {
+      const exhaustionDueAt = new Date(
+        Math.max(providerFallbackBackoff.nextResetAt.getTime(), now.getTime()),
+      );
+      schedule = {
+        ...schedule,
+        dueAt: exhaustionDueAt,
+        delayMs: Math.max(0, exhaustionDueAt.getTime() - now.getTime()),
+      };
+    }
 
     const contextSnapshot = parseObject(run.contextSnapshot);
     const issueId = readNonEmptyString(contextSnapshot.issueId);
@@ -5620,18 +5829,27 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       scheduledRetryAt: schedule.dueAt.toISOString(),
       ...(transientRetryNotBefore ? { transientRetryNotBefore: transientRetryNotBefore.toISOString() } : {}),
       ...(codexTransientFallbackMode ? { codexTransientFallbackMode } : {}),
-      ...(nextProviderFallback
-        ? {
-            providerFallbackSelection: {
-              id: nextProviderFallback.id,
-              adapter: nextProviderFallback.adapter,
-              account: nextProviderFallback.account ?? null,
-              adapterConfig: nextProviderFallback.adapterConfig ?? null,
-              probe: nextProviderFallback.probe ?? null,
-            },
-          }
-        : {}),
     }, "normal_model");
+    // Manage the provider-fallback selection explicitly only when this is a
+    // fallback-eligible retry. On a hop we record the next provider + the
+    // accumulated reset history; on exhaustion we clear both so the back-off
+    // retries the agent's primary (spec §4.2) and the next cycle starts fresh.
+    // Non-eligible retries keep whatever the failed run carried (preserved via
+    // the spread above).
+    if (shouldAttemptProviderFallback) {
+      delete retryContextSnapshot.providerFallbackSelection;
+      delete retryContextSnapshot.providerFallbackResets;
+      if (nextProviderFallback) {
+        retryContextSnapshot.providerFallbackSelection = {
+          id: nextProviderFallback.id,
+          adapter: nextProviderFallback.adapter,
+          account: nextProviderFallback.account ?? null,
+          adapterConfig: nextProviderFallback.adapterConfig ?? null,
+          probe: nextProviderFallback.probe ?? null,
+        };
+        retryContextSnapshot.providerFallbackResets = accumulatedProviderResets;
+      }
+    }
     const maxTurnContinuationIdempotencyKey = retryReason === MAX_TURN_CONTINUATION_RETRY_REASON
       ? `max-turn-continuation:${run.companyId}:${issueId ?? "no-issue"}:${run.id}:${schedule.attempt}`
       : null;
@@ -5943,6 +6161,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           : {}),
       },
     });
+
+    if (providerFallbackExhaustedReport && providerFallbackEscalation) {
+      await emitProviderFallbackExhaustedReport({
+        run,
+        issueId,
+        report: providerFallbackExhaustedReport,
+        notifyKind: providerFallbackEscalation.boardEscalation.notifyKind,
+        boardEnabled: providerFallbackEscalation.boardEscalation.enabled,
+        scheduledRetryAt: schedule.dueAt.toISOString(),
+      });
+    }
 
     return {
       outcome: "scheduled" as const,

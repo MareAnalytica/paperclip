@@ -24,10 +24,36 @@ export interface ProviderFallbackPolicy {
   chain: ProviderFallbackEntry[];
 }
 
+export const PROVIDER_FALLBACK_NOTIFY_KINDS = [
+  "comment",
+  "wake",
+  "approval",
+  "digest",
+] as const;
+
+export type ProviderFallbackNotifyKind = (typeof PROVIDER_FALLBACK_NOTIFY_KINDS)[number];
+
+export interface ProviderFallbackBoardEscalation {
+  enabled: boolean;
+  notifyKind: ProviderFallbackNotifyKind;
+}
+
+export const PROVIDER_FALLBACK_RETRY_AFTER_MINUTES_MIN = 1;
+export const PROVIDER_FALLBACK_RETRY_AFTER_MINUTES_MAX = 1440;
+export const PROVIDER_FALLBACK_RETRY_AFTER_MINUTES_DEFAULT = 60;
+const DEFAULT_BOARD_ESCALATION: ProviderFallbackBoardEscalation = {
+  enabled: true,
+  notifyKind: "approval",
+};
+
 export interface ResolvedProviderFallbackPolicy {
   schemaVersion: "1";
   default: ProviderFallbackPolicy;
   overrides: Map<string, ProviderFallbackPolicy>;
+  // §4 exhaustion handling (spec ELI-382). Company-wide for v1; per-company
+  // override of these is a documented follow-up.
+  retryAfterMinutesDefault: number;
+  boardEscalation: ProviderFallbackBoardEscalation;
 }
 
 export interface ProviderFallbackLoadOptions {
@@ -204,6 +230,58 @@ function assertChain(value: unknown, ctx: string): ProviderFallbackEntry[] {
   return out;
 }
 
+function parseRetryAfterMinutes(limitDetection: unknown): number {
+  if (limitDetection === undefined || limitDetection === null) {
+    return PROVIDER_FALLBACK_RETRY_AFTER_MINUTES_DEFAULT;
+  }
+  if (typeof limitDetection !== "object" || Array.isArray(limitDetection)) {
+    throw new Error(
+      "[provider-fallback-policy] providerFallback.limitDetection must be an object",
+    );
+  }
+  const raw = (limitDetection as Record<string, unknown>).retryAfterMinutesDefault;
+  if (raw === undefined || raw === null) {
+    return PROVIDER_FALLBACK_RETRY_AFTER_MINUTES_DEFAULT;
+  }
+  if (
+    typeof raw !== "number" ||
+    !Number.isInteger(raw) ||
+    raw < PROVIDER_FALLBACK_RETRY_AFTER_MINUTES_MIN ||
+    raw > PROVIDER_FALLBACK_RETRY_AFTER_MINUTES_MAX
+  ) {
+    throw new Error(
+      `[provider-fallback-policy] providerFallback.limitDetection.retryAfterMinutesDefault must be an integer in [${PROVIDER_FALLBACK_RETRY_AFTER_MINUTES_MIN}, ${PROVIDER_FALLBACK_RETRY_AFTER_MINUTES_MAX}]`,
+    );
+  }
+  return raw;
+}
+
+function parseBoardEscalation(boardEscalation: unknown): ProviderFallbackBoardEscalation {
+  if (boardEscalation === undefined || boardEscalation === null) {
+    return { ...DEFAULT_BOARD_ESCALATION };
+  }
+  if (typeof boardEscalation !== "object" || Array.isArray(boardEscalation)) {
+    throw new Error(
+      "[provider-fallback-policy] providerFallback.boardEscalation must be an object",
+    );
+  }
+  const o = boardEscalation as Record<string, unknown>;
+  const enabled = o.enabled === undefined ? DEFAULT_BOARD_ESCALATION.enabled : Boolean(o.enabled);
+  let notifyKind = DEFAULT_BOARD_ESCALATION.notifyKind;
+  if (o.notifyKind !== undefined && o.notifyKind !== null) {
+    if (
+      typeof o.notifyKind !== "string" ||
+      !PROVIDER_FALLBACK_NOTIFY_KINDS.includes(o.notifyKind as ProviderFallbackNotifyKind)
+    ) {
+      throw new Error(
+        `[provider-fallback-policy] providerFallback.boardEscalation.notifyKind must be one of ${PROVIDER_FALLBACK_NOTIFY_KINDS.join("|")}`,
+      );
+    }
+    notifyKind = o.notifyKind as ProviderFallbackNotifyKind;
+  }
+  return { enabled, notifyKind };
+}
+
 export function parseProviderFallbackPolicy(
   raw: unknown,
   options: ProviderFallbackLoadOptions = {},
@@ -259,7 +337,13 @@ export function parseProviderFallbackPolicy(
     overrides.set(o.companyId, { chain });
   }
 
-  return { schemaVersion: "1", default: { chain: defaultChain }, overrides };
+  return {
+    schemaVersion: "1",
+    default: { chain: defaultChain },
+    overrides,
+    retryAfterMinutesDefault: parseRetryAfterMinutes(block.limitDetection),
+    boardEscalation: parseBoardEscalation(block.boardEscalation),
+  };
 }
 
 export function loadProviderFallbackPolicyFromString(
@@ -283,6 +367,24 @@ export function builtinDefaultProviderFallbackPolicy(): ResolvedProviderFallback
     schemaVersion: "1",
     default: { chain: BUILTIN_DEFAULT_CHAIN.map((entry) => ({ ...entry })) },
     overrides: new Map(),
+    retryAfterMinutesDefault: PROVIDER_FALLBACK_RETRY_AFTER_MINUTES_DEFAULT,
+    boardEscalation: { ...DEFAULT_BOARD_ESCALATION },
+  };
+}
+
+/**
+ * Resolve the §4 exhaustion escalation config for a company. Company-wide for
+ * v1 (per-company override of retry/board settings is a follow-up); `companyId`
+ * is accepted now so callers do not change when overrides land.
+ */
+export function resolveProviderFallbackEscalation(
+  companyId: string,
+  resolved: ResolvedProviderFallbackPolicy = getProviderFallbackPolicy(),
+): { retryAfterMinutesDefault: number; boardEscalation: ProviderFallbackBoardEscalation } {
+  void companyId;
+  return {
+    retryAfterMinutesDefault: resolved.retryAfterMinutesDefault,
+    boardEscalation: { ...resolved.boardEscalation },
   };
 }
 

@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
+  activityLog,
   agents,
   agentRuntimeState,
   agentWakeupRequests,
@@ -11,7 +12,9 @@ import {
   environmentLeases,
   heartbeatRunEvents,
   heartbeatRuns,
+  issueComments,
   issueRelations,
+  issueThreadInteractions,
   issues,
 } from "@paperclipai/db";
 import {
@@ -24,6 +27,11 @@ import {
   MAX_TURN_CONTINUATION_WAKE_REASON,
   heartbeatService,
 } from "../services/heartbeat.ts";
+import {
+  __setProviderFallbackPolicyForTests,
+  builtinDefaultProviderFallbackPolicy,
+  type ProviderFallbackNotifyKind,
+} from "../services/provider-fallback-policy.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -48,8 +56,11 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
   afterEach(async () => {
     await db.delete(heartbeatRunEvents);
     await db.delete(environmentLeases);
+    await db.delete(issueThreadInteractions);
+    await db.delete(issueComments);
     await db.delete(issueRelations);
     await db.delete(issues);
+    await db.delete(activityLog);
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
     await db.delete(agentRuntimeState);
@@ -1650,5 +1661,281 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     ) ?? {};
     expect(selection.id).toBe("grok-local");
     expect(selection.probe).toBe("which grok >/dev/null 2>&1");
+  });
+
+  function setProviderFallbackEscalation(input: {
+    enabled: boolean;
+    notifyKind: ProviderFallbackNotifyKind;
+    retryAfterMinutesDefault?: number;
+  }) {
+    return __setProviderFallbackPolicyForTests({
+      ...builtinDefaultProviderFallbackPolicy(),
+      retryAfterMinutesDefault: input.retryAfterMinutesDefault ?? 60,
+      boardEscalation: { enabled: input.enabled, notifyKind: input.notifyKind },
+    });
+  }
+
+  const EXHAUSTING_CONTEXT = (issueId: string) => ({
+    issueId,
+    wakeReason: "issue_assigned",
+    // Selection already on the last enabled chain entry -> selectNext() === null.
+    providerFallbackSelection: {
+      id: "codex-local",
+      adapter: "codex_local",
+    },
+  });
+
+  const EXHAUSTING_CHAIN = {
+    heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 },
+    providerFallback: {
+      chain: [
+        { id: "claude-code-personal", adapter: "claude_local", enabled: true, account: "personal" },
+        { id: "codex-local", adapter: "codex_local", enabled: true },
+      ],
+    },
+  };
+
+  it("backs off the primary by retryAfterMinutesDefault and clears the selection when the chain is exhausted", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const issueId = randomUUID();
+    const now = new Date("2026-04-22T10:00:00.000Z");
+    const dispose = setProviderFallbackEscalation({ enabled: false, notifyKind: "approval" });
+    try {
+      await seedRetryFixture({
+        runId,
+        companyId,
+        agentId,
+        now,
+        errorCode: "adapter_failed",
+        errorFamily: "transient_upstream",
+        adapterType: "claude_local",
+        runtimeConfig: EXHAUSTING_CHAIN,
+        contextSnapshot: EXHAUSTING_CONTEXT(issueId),
+      });
+
+      const scheduled = await heartbeat.scheduleBoundedRetry(runId, { now, random: () => 0.5 });
+      expect(scheduled.outcome).toBe("scheduled");
+      if (scheduled.outcome !== "scheduled") return;
+
+      // Back off until now + 60min (no provider-supplied reset header present).
+      expect(scheduled.dueAt.getTime()).toBe(now.getTime() + 60 * 60_000);
+
+      const retryRun = await db
+        .select({ contextSnapshot: heartbeatRuns.contextSnapshot })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, scheduled.run.id))
+        .then((rows) => rows[0] ?? null);
+      const snapshot = (retryRun?.contextSnapshot as Record<string, unknown> | null) ?? {};
+      // Primary retried: stale selection + reset history cleared.
+      expect(snapshot.providerFallbackSelection).toBeUndefined();
+      expect(snapshot.providerFallbackResets).toBeUndefined();
+
+      const events = await db
+        .select({ message: heartbeatRunEvents.message, payload: heartbeatRunEvents.payload })
+        .from(heartbeatRunEvents)
+        .where(eq(heartbeatRunEvents.runId, runId));
+      const exhaustionEvent = events.find((e) => e.message.includes("Provider fallback exhausted"));
+      expect(exhaustionEvent).toBeTruthy();
+      const payload = (exhaustionEvent?.payload as Record<string, unknown> | null) ?? {};
+      expect(payload.kind).toBe("provider_fallback_exhausted");
+      expect(payload.nextResetSource).toBe("retryAfterMinutesDefault");
+      expect(payload.exhaustedProviders).toEqual(["claude-code-personal", "codex-local"]);
+    } finally {
+      dispose();
+    }
+  });
+
+  it("uses the earliest provider-supplied reset as the back-off when present", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const issueId = randomUUID();
+    const now = new Date("2026-04-22T10:00:00.000Z");
+    const providerReset = new Date("2026-04-22T12:30:00.000Z");
+    const dispose = setProviderFallbackEscalation({ enabled: false, notifyKind: "approval" });
+    try {
+      await seedRetryFixture({
+        runId,
+        companyId,
+        agentId,
+        now,
+        errorCode: "adapter_failed",
+        errorFamily: "transient_upstream",
+        retryNotBefore: providerReset.toISOString(),
+        adapterType: "claude_local",
+        runtimeConfig: EXHAUSTING_CHAIN,
+        contextSnapshot: EXHAUSTING_CONTEXT(issueId),
+      });
+
+      const scheduled = await heartbeat.scheduleBoundedRetry(runId, { now, random: () => 0.5 });
+      expect(scheduled.outcome).toBe("scheduled");
+      if (scheduled.outcome !== "scheduled") return;
+
+      expect(scheduled.dueAt.getTime()).toBe(providerReset.getTime());
+
+      const events = await db
+        .select({ message: heartbeatRunEvents.message, payload: heartbeatRunEvents.payload })
+        .from(heartbeatRunEvents)
+        .where(eq(heartbeatRunEvents.runId, runId));
+      const exhaustionEvent = events.find((e) => e.message.includes("Provider fallback exhausted"));
+      const payload = (exhaustionEvent?.payload as Record<string, unknown> | null) ?? {};
+      expect(payload.nextResetSource).toBe("provider_header");
+      expect(payload.nextResetAt).toBe(providerReset.toISOString());
+    } finally {
+      dispose();
+    }
+  });
+
+  it("routes the exhaustion report to an issue comment when notifyKind is comment", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const issueId = randomUUID();
+    const now = new Date("2026-04-22T10:00:00.000Z");
+    const dispose = setProviderFallbackEscalation({ enabled: true, notifyKind: "comment" });
+    try {
+      await seedRetryFixture({
+        runId,
+        companyId,
+        agentId,
+        now,
+        errorCode: "adapter_failed",
+        errorFamily: "transient_upstream",
+        adapterType: "claude_local",
+        runtimeConfig: EXHAUSTING_CHAIN,
+        contextSnapshot: EXHAUSTING_CONTEXT(issueId),
+      });
+      const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: "Work paused by provider exhaustion",
+        status: "in_progress",
+        priority: "medium",
+        assigneeAgentId: agentId,
+        executionRunId: runId,
+        issueNumber: 1,
+        identifier: `${issuePrefix}-1`,
+      });
+
+      const scheduled = await heartbeat.scheduleBoundedRetry(runId, { now, random: () => 0.5 });
+      expect(scheduled.outcome).toBe("scheduled");
+
+      const comments = await db
+        .select({ body: issueComments.body })
+        .from(issueComments)
+        .where(eq(issueComments.issueId, issueId));
+      expect(comments).toHaveLength(1);
+      expect(comments[0].body).toContain("Provider fallback exhausted");
+      expect(comments[0].body).toContain("Work is paused for this agent until reset.");
+
+      // No interaction created for the comment kind.
+      const interactions = await db
+        .select({ id: issueThreadInteractions.id })
+        .from(issueThreadInteractions)
+        .where(eq(issueThreadInteractions.issueId, issueId));
+      expect(interactions).toHaveLength(0);
+    } finally {
+      dispose();
+    }
+  });
+
+  it("routes the exhaustion report to a request_confirmation interaction when notifyKind is approval", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const issueId = randomUUID();
+    const now = new Date("2026-04-22T10:00:00.000Z");
+    const dispose = setProviderFallbackEscalation({ enabled: true, notifyKind: "approval" });
+    try {
+      await seedRetryFixture({
+        runId,
+        companyId,
+        agentId,
+        now,
+        errorCode: "adapter_failed",
+        errorFamily: "transient_upstream",
+        adapterType: "claude_local",
+        runtimeConfig: EXHAUSTING_CHAIN,
+        contextSnapshot: EXHAUSTING_CONTEXT(issueId),
+      });
+      const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: "Work paused by provider exhaustion",
+        status: "in_progress",
+        priority: "medium",
+        assigneeAgentId: agentId,
+        executionRunId: runId,
+        issueNumber: 1,
+        identifier: `${issuePrefix}-1`,
+      });
+
+      const scheduled = await heartbeat.scheduleBoundedRetry(runId, { now, random: () => 0.5 });
+      expect(scheduled.outcome).toBe("scheduled");
+
+      const interactions = await db
+        .select({ kind: issueThreadInteractions.kind, payload: issueThreadInteractions.payload })
+        .from(issueThreadInteractions)
+        .where(eq(issueThreadInteractions.issueId, issueId));
+      expect(interactions).toHaveLength(1);
+      expect(interactions[0].kind).toBe("request_confirmation");
+      const payload = (interactions[0].payload as Record<string, unknown> | null) ?? {};
+      expect(payload.decisionClass).toBe("human_only");
+      expect(String(payload.prompt)).toContain("Provider fallback exhausted");
+    } finally {
+      dispose();
+    }
+  });
+
+  it("does not emit an exhaustion report while the chain still has a next provider", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const issueId = randomUUID();
+    const now = new Date("2026-04-22T10:00:00.000Z");
+    const dispose = setProviderFallbackEscalation({ enabled: true, notifyKind: "comment" });
+    try {
+      await seedRetryFixture({
+        runId,
+        companyId,
+        agentId,
+        now,
+        errorCode: "adapter_failed",
+        errorFamily: "transient_upstream",
+        adapterType: "claude_local",
+        runtimeConfig: EXHAUSTING_CHAIN,
+        contextSnapshot: {
+          issueId,
+          wakeReason: "issue_assigned",
+          // First entry selected -> a next provider remains.
+          providerFallbackSelection: { id: "claude-code-personal", adapter: "claude_local", account: "personal" },
+        },
+      });
+
+      const scheduled = await heartbeat.scheduleBoundedRetry(runId, { now, random: () => 0.5 });
+      expect(scheduled.outcome).toBe("scheduled");
+      if (scheduled.outcome !== "scheduled") return;
+
+      const retryRun = await db
+        .select({ contextSnapshot: heartbeatRuns.contextSnapshot })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, scheduled.run.id))
+        .then((rows) => rows[0] ?? null);
+      const snapshot = (retryRun?.contextSnapshot as Record<string, unknown> | null) ?? {};
+      const selection = (snapshot.providerFallbackSelection as Record<string, unknown> | null) ?? {};
+      expect(selection.id).toBe("codex-local");
+
+      const events = await db
+        .select({ message: heartbeatRunEvents.message })
+        .from(heartbeatRunEvents)
+        .where(eq(heartbeatRunEvents.runId, runId));
+      expect(events.some((e) => e.message.includes("Provider fallback exhausted"))).toBe(false);
+    } finally {
+      dispose();
+    }
   });
 });

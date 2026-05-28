@@ -13,6 +13,7 @@ import {
   parseProviderFallbackPolicy,
   policyForCompany,
   reloadProviderFallbackPolicy,
+  resolveProviderFallbackEscalation,
   selectNextProviderFallbackEntry,
 } from "../services/provider-fallback-policy.js";
 
@@ -225,6 +226,83 @@ describe("provider-fallback-policy", () => {
       "codex-local",
       "grok-local",
     ]);
+  });
+
+  describe("§4 exhaustion escalation config", () => {
+    it("defaults retryAfterMinutesDefault to 60 and boardEscalation to enabled/approval", () => {
+      const resolved = builtinDefaultProviderFallbackPolicy();
+      expect(resolved.retryAfterMinutesDefault).toBe(60);
+      expect(resolved.boardEscalation).toEqual({ enabled: true, notifyKind: "approval" });
+    });
+
+    it("parses limitDetection.retryAfterMinutesDefault and boardEscalation", () => {
+      const resolved = parseProviderFallbackPolicy({
+        schemaVersion: "1",
+        providerFallback: {
+          default: { chain: [{ id: "codex-local", adapter: "codex_local" }] },
+          limitDetection: { retryAfterMinutesDefault: 120 },
+          boardEscalation: { enabled: false, notifyKind: "digest" },
+        },
+      });
+      expect(resolved.retryAfterMinutesDefault).toBe(120);
+      expect(resolved.boardEscalation).toEqual({ enabled: false, notifyKind: "digest" });
+    });
+
+    it("omitting limitDetection/boardEscalation keeps the spec defaults", () => {
+      const resolved = parseProviderFallbackPolicy({
+        schemaVersion: "1",
+        providerFallback: { default: { chain: [{ id: "codex-local", adapter: "codex_local" }] } },
+      });
+      expect(resolved.retryAfterMinutesDefault).toBe(60);
+      expect(resolved.boardEscalation).toEqual({ enabled: true, notifyKind: "approval" });
+    });
+
+    it("rejects an out-of-range retryAfterMinutesDefault", () => {
+      expect(() =>
+        parseProviderFallbackPolicy({
+          schemaVersion: "1",
+          providerFallback: {
+            default: { chain: [{ id: "codex-local", adapter: "codex_local" }] },
+            limitDetection: { retryAfterMinutesDefault: 0 },
+          },
+        }),
+      ).toThrow(/retryAfterMinutesDefault must be an integer/);
+      expect(() =>
+        parseProviderFallbackPolicy({
+          schemaVersion: "1",
+          providerFallback: {
+            default: { chain: [{ id: "codex-local", adapter: "codex_local" }] },
+            limitDetection: { retryAfterMinutesDefault: 1441 },
+          },
+        }),
+      ).toThrow(/retryAfterMinutesDefault must be an integer/);
+    });
+
+    it("rejects an unknown notifyKind", () => {
+      expect(() =>
+        parseProviderFallbackPolicy({
+          schemaVersion: "1",
+          providerFallback: {
+            default: { chain: [{ id: "codex-local", adapter: "codex_local" }] },
+            boardEscalation: { notifyKind: "telegram" },
+          },
+        }),
+      ).toThrow(/notifyKind must be one of/);
+    });
+
+    it("resolveProviderFallbackEscalation returns the resolved company-wide settings", () => {
+      const resolved = parseProviderFallbackPolicy({
+        schemaVersion: "1",
+        providerFallback: {
+          default: { chain: [{ id: "codex-local", adapter: "codex_local" }] },
+          limitDetection: { retryAfterMinutesDefault: 30 },
+          boardEscalation: { enabled: true, notifyKind: "wake" },
+        },
+      });
+      const escalation = resolveProviderFallbackEscalation("any-company", resolved);
+      expect(escalation.retryAfterMinutesDefault).toBe(30);
+      expect(escalation.boardEscalation).toEqual({ enabled: true, notifyKind: "wake" });
+    });
   });
 
   describe("selectNextProviderFallbackEntry", () => {
