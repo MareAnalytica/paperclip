@@ -19,6 +19,12 @@ export interface PeerGrantInput {
   grantedByUserId: string;
   expiresAt?: Date | null;
   notes?: string | null;
+  /**
+   * Server-enforced per-grant use cap (spec §8 O1). null => legacy TTL-only
+   * (unlimited uses). CEO-minted grants default to single-use via the request
+   * policy, so this is set on the approval path.
+   */
+  maxUses?: number | null;
 }
 
 export function peerGrantService(db: Db) {
@@ -55,6 +61,7 @@ export function peerGrantService(db: Db) {
           grantedByUserId: input.grantedByUserId,
           expiresAt: input.expiresAt ?? null,
           notes: input.notes ?? null,
+          maxUses: input.maxUses ?? null,
         })
         .returning();
       return row;
