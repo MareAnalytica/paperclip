@@ -12,7 +12,7 @@ concurrency:
 
 jobs:
   policy:
-    runs-on: ubuntu-latest
+    runs-on: arc-runner-set
     timeout-minutes: 5
 
     steps:
@@ -66,7 +66,7 @@ jobs:
   typecheck_release_registry:
     name: Typecheck + Release Registry
     needs: [policy]
-    runs-on: ubuntu-latest
+    runs-on: arc-runner-set
     timeout-minutes: 20
 
     steps:
@@ -96,7 +96,7 @@ jobs:
   general_tests:
     name: General tests (${{ matrix.group_label }})
     needs: [policy]
-    runs-on: ubuntu-latest
+    runs-on: arc-runner-set
     timeout-minutes: 20
     strategy:
       fail-fast: false
@@ -135,7 +135,7 @@ jobs:
     name: verify
     if: ${{ always() }}
     needs: [typecheck_release_registry, general_tests, build]
-    runs-on: ubuntu-latest
+    runs-on: arc-runner-set
     timeout-minutes: 5
 
     steps:
@@ -152,7 +152,7 @@ jobs:
   build:
     name: Build
     needs: [policy]
-    runs-on: ubuntu-latest
+    runs-on: arc-runner-set
     timeout-minutes: 20
 
     steps:
@@ -179,7 +179,7 @@ jobs:
   verify_serialized_server:
     name: Verify serialized server suites (${{ matrix.shard_label }})
     needs: [policy]
-    runs-on: ubuntu-latest
+    runs-on: arc-runner-set
     timeout-minutes: 20
     strategy:
       fail-fast: false
@@ -222,7 +222,7 @@ jobs:
   canary_dry_run:
     name: Canary Dry Run
     needs: [policy]
-    runs-on: ubuntu-latest
+    runs-on: arc-runner-set
     timeout-minutes: 20
 
     steps:
@@ -253,7 +253,7 @@ jobs:
 
   e2e:
     needs: [policy]
-    runs-on: ubuntu-latest
+    runs-on: arc-runner-set
     timeout-minutes: 30
 
     steps:
