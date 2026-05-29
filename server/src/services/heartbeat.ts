@@ -35,10 +35,12 @@ import {
   heartbeatRuns,
   issueApprovals,
   issueComments,
+  issueLabels,
   issueRelations,
   issueThreadInteractions,
   issues,
   issueWorkProducts,
+  labels,
   projects,
   projectWorkspaces,
   routineRevisions,
@@ -245,8 +247,20 @@ const MAX_TURN_CONTINUATION_MAX_ATTEMPTS_CAP = 10;
 const MAX_TURN_CONTINUATION_DEFAULT_DELAY_MS = 1_000;
 const MAX_TURN_CONTINUATION_MAX_DELAY_MS = 5 * 60 * 1000;
 const MAX_TURN_CONTINUATION_LIVE_RUN_STATUSES = ["scheduled_retry", "queued", "running"] as const;
-export const CEO_HEARTBEAT_INSTRUCTION_VERSION = "2026-05-21.board-decision-routing.v3";
+export const CEO_HEARTBEAT_INSTRUCTION_VERSION = "2026-05-29.board-notify.v4";
 export const CEO_HEARTBEAT_TASK_KEY = "__ceo_company_flow__:" + CEO_HEARTBEAT_INSTRUCTION_VERSION;
+
+/** Issue label the CEO applies to board-requested deliverables that should
+ *  notify the board Telegram group on close (ELI-437). No label = never notify. */
+export const BOARD_NOTIFY_LABEL = "board-notify";
+/** Marker comment prefix the CEO posts after a board notice is delivered. The
+ *  heartbeat treats any closed `board-notify` issue carrying a comment whose
+ *  body starts with this prefix as already-notified, so notices fire exactly
+ *  once per issue and survive re-runs and re-opens (ELI-437 idempotency). */
+export const BOARD_NOTIFY_MARKER_PREFIX = "board-notify-sent:";
+/** Cap on board notices surfaced per heartbeat so a backlog never floods the
+ *  board group; remaining pending notices are picked up on later heartbeats. */
+const BOARD_NOTICE_MAX_PER_HEARTBEAT = 25;
 export const CEO_BOARD_FLOW_STATUSES = ["in_review", "in_progress", "todo", "backlog", "blocked", "done", "cancelled"] as const;
 const CEO_BOARD_FLOW_SAMPLE_LIMIT_PER_STATUS = 8;
 type CodexTransientFallbackMode =
@@ -1954,6 +1968,28 @@ export function isCeoHeartbeatControllerAgent(agent: Pick<typeof agents.$inferSe
   );
 }
 
+export interface BoardTelegramConfig {
+  channelName: string;
+  chatId: string;
+}
+
+/**
+ * Resolve this company's board Telegram group for CEO-heartbeat board notices
+ * (ELI-437). The group is configured per-company on the CEO controller agent's
+ * `runtimeConfig.heartbeat.boardTelegram = { channelName, chatId }` — populated
+ * by the company blueprint from its top-level `boardTelegram` block (ELI-436),
+ * never hard-coded in platform code. Returns null when unset or incomplete, in
+ * which case board notices are a safe no-op.
+ */
+export function resolveBoardTelegramConfig(runtimeConfig: unknown): BoardTelegramConfig | null {
+  const heartbeat = parseObject(parseObject(runtimeConfig).heartbeat);
+  const block = parseObject(heartbeat.boardTelegram);
+  const channelName = readNonEmptyString(block.channelName);
+  const chatId = readNonEmptyString(block.chatId);
+  if (!channelName || !chatId) return null;
+  return { channelName, chatId };
+}
+
 function formatCeoBoardIssueLine(issue: {
   identifier: string | null;
   id: string;
@@ -1982,7 +2018,13 @@ export function buildCeoHeartbeatMarkdown(input: {
     assigneeUserId: string | null;
     activeRunStatus: string | null;
   }>>;
+  boardTelegram?: BoardTelegramConfig | null;
+  pendingBoardNotices?: Array<{ identifier: string | null; id: string; title: string }>;
 }) {
+  const boardTelegram = input.boardTelegram ?? null;
+  const boardDecisionRouting = boardTelegram
+    ? `If a real board decision is required, create an ask_user_questions or request_confirmation interaction with payload.decisionClass='human_only', and route it to this company's configured board Telegram group ${boardTelegram.channelName}; include boardNotification { platform: 'telegram', channelName: '${boardTelegram.channelName}', required: true, messageMarkdown: '<concise decision request>' } and record in the issue comment that the Hermes-cluster Eli relay must notify Telegram.`
+    : "If a real board decision is required, create an ask_user_questions or request_confirmation interaction with payload.decisionClass='human_only'. This company has no board Telegram group configured (no boardTelegram on the CEO runtimeConfig), so keep the decision inside the company and name the accountable owner; do not fabricate a board channel.";
   const lines = [
     "## CEO Company Flow Heartbeat",
     "",
@@ -1993,7 +2035,7 @@ export function buildCeoHeartbeatMarkdown(input: {
     "You do not need to personally review every deliverable. Your job is to make sure somebody accountable does, that work has the right owner/status, and that blocked work names the unblock owner/action.",
     "Do not let PR/review gates wait on the board by default. For each in_review issue, make review somebody’s job inside the company: pick the most appropriate idle/active agent (often the CEO for board-level decisions, otherwise an adjacent specialist), assign them as the reviewer or open a bounded review issue, wake them, and name exactly what they must approve, reject, merge, or return for changes. For code changes, the Merge Request/Pull Request author must request review from the designated reviewing agent and record the review request on the issue/PR before waiting. Ask the human board only for budget, credentials, irreversible external actions, policy exceptions, or explicit product/business choices.",
     "Classify every blocker before you wait: agent_actionable, ceo_actionable, human_only, or external_wait. A passive wait is valid only when the blocker is marked human_only/external_wait with a specific reason; otherwise take one concrete action yourself or route it to a named company agent.",
-    "If a real board decision is required, create an ask_user_questions or request_confirmation interaction with payload.decisionClass='human_only'. For each company, route that decision to the company's dedicated Telegram board group. For Eli Board, that group is Mare Operator HQ; include boardNotification { platform: 'telegram', channelName: 'Mare Operator HQ', required: true, messageMarkdown: '<concise decision request>' } and record in the issue comment that the Hermes-cluster Eli relay must notify Telegram.",
+    boardDecisionRouting,
     "If an issue is already in_review with only a stale request_confirmation or historical board prompt, convert it into an agent-owned review path instead of holding. If the designated reviewer is unavailable, blocked, conflicted, or rate-limited, create or wake a contingency reviewer and keep the original reviewer path documented so operations can continue. If the issue is superseded by merged work and no human-only decision remains, close it with an audit comment instead of requesting ratification forever.",
     "",
     "Work the board from right to left every heartbeat:",
@@ -2020,6 +2062,24 @@ export function buildCeoHeartbeatMarkdown(input: {
       continue;
     }
     for (const issue of samples) lines.push(formatCeoBoardIssueLine(issue));
+  }
+
+  const pendingBoardNotices = input.pendingBoardNotices ?? [];
+  if (pendingBoardNotices.length > 0) {
+    lines.push("", "### Board notices to send (board-notify closures)");
+    if (!boardTelegram) {
+      lines.push(
+        `- ${pendingBoardNotices.length} closed \`${BOARD_NOTIFY_LABEL}\` issue(s) are awaiting a board notice, but this company has no board Telegram group configured (no boardTelegram on the CEO runtimeConfig). Board notices are a no-op here — post nothing. This line is informational/audit only.`,
+      );
+    } else {
+      lines.push(
+        `These board-requested deliverables carry the \`${BOARD_NOTIFY_LABEL}\` label and are now closed. For EACH listed issue, post exactly ONE concise completion notice to the board Telegram group ${boardTelegram.channelName} via the Hermes-cluster Eli relay. This is an informational notice, fire-and-forget — NOT a human_only board decision; do not request or wait for an ack. Each notice must include provenance (a link to the issue) and the delivered outcome in one line. Immediately after sending, post a comment on that issue whose body begins with \`${BOARD_NOTIFY_MARKER_PREFIX}<issueId>\` (the suppression marker) so the notice is never re-sent on a later heartbeat or a re-open.`,
+        "Anti-spam guardrail (preserve verbatim): ONLY the issues listed here are eligible for a board notice. Routine internal churn, PR reviews, and build failures must NEVER trigger a board notice. If an issue should not have notified the board, remove its `board-notify` label rather than notifying.",
+      );
+      for (const notice of pendingBoardNotices) {
+        lines.push(`- ${notice.identifier ?? notice.id} (id ${notice.id}): ${notice.title}`);
+      }
+    }
   }
 
   return lines.join("\n");
@@ -6502,10 +6562,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       });
     }
 
+    const boardTelegram = resolveBoardTelegramConfig(agent.runtimeConfig);
+    const pendingBoardNotices = await collectPendingBoardNotices(agent.companyId);
+
     const markdown = buildCeoHeartbeatMarkdown({
       generatedAt: now.toISOString(),
       counts: statusCounts,
       samples,
+      boardTelegram,
+      pendingBoardNotices,
     });
 
     return {
@@ -6514,8 +6579,60 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       boardOrder: [...CEO_BOARD_FLOW_STATUSES],
       counts: statusCounts,
       samples,
+      boardTelegram,
+      pendingBoardNotices,
       markdown,
     };
+  }
+
+  /**
+   * Closed `board-notify` issues for this company that have not yet been
+   * notified to the board group (ELI-437). "Not yet notified" = no comment whose
+   * body starts with BOARD_NOTIFY_MARKER_PREFIX. This is the idempotency gate:
+   * once the CEO posts the marker after delivering a notice, the issue drops out
+   * of this list, so notices fire exactly once and survive re-runs and re-opens.
+   * Returns [] when the company has no `board-notify` label (pattern not adopted).
+   */
+  async function collectPendingBoardNotices(
+    companyId: string,
+  ): Promise<Array<{ identifier: string | null; id: string; title: string }>> {
+    const [notifyLabel] = await db
+      .select({ id: labels.id })
+      .from(labels)
+      .where(and(eq(labels.companyId, companyId), eq(labels.name, BOARD_NOTIFY_LABEL)))
+      .limit(1);
+    if (!notifyLabel) return [];
+
+    const doneRows = await db
+      .select({ id: issues.id, identifier: issues.identifier, title: issues.title })
+      .from(issues)
+      .innerJoin(issueLabels, eq(issueLabels.issueId, issues.id))
+      .where(
+        and(
+          eq(issues.companyId, companyId),
+          isNull(issues.hiddenAt),
+          eq(issues.status, "done"),
+          eq(issueLabels.labelId, notifyLabel.id),
+        ),
+      )
+      .orderBy(desc(issues.updatedAt))
+      .limit(BOARD_NOTICE_MAX_PER_HEARTBEAT);
+    if (doneRows.length === 0) return [];
+
+    const doneIds = doneRows.map((row) => row.id);
+    const markerRows = await db
+      .select({ issueId: issueComments.issueId })
+      .from(issueComments)
+      .where(
+        and(
+          eq(issueComments.companyId, companyId),
+          inArray(issueComments.issueId, doneIds),
+          sql`${issueComments.body} ilike ${BOARD_NOTIFY_MARKER_PREFIX + "%"}`,
+        ),
+      );
+    const notified = new Set(markerRows.map((row) => row.issueId));
+
+    return doneRows.filter((row) => !notified.has(row.id));
   }
 
   function parseMaxTurnContinuationPolicy(agent: typeof agents.$inferSelect): MaxTurnContinuationPolicy {
