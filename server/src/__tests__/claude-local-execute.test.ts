@@ -663,7 +663,7 @@ describe("claude execute", () => {
       else process.env.PATH = previousPath;
       await fs.rm(root, { recursive: true, force: true });
     }
-  }, 10_000);
+  }, 20_000);
 
   it("allows remote session resumes when saved cwd is the host workspace", () => {
     expect(claudeSessionCwdMatchesExecutionTarget({

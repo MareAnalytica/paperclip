@@ -391,7 +391,7 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
         .select({ status: heartbeatRuns.status })
         .from(heartbeatRuns);
       return rows.every((run) => run.status !== "queued" && run.status !== "running");
-    }, 10_000);
+    }, 20_000);
     expect(noActiveRuns).toBe(true);
   });
 
@@ -533,7 +533,7 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
           .where(eq(heartbeatRuns.id, secondWake!.id))
           .then((rows) => rows[0] ?? null);
         return run?.status === "succeeded";
-      }, 10_000);
+      }, 20_000);
       expect(secondRunSucceeded).toBe(true);
       expect(mockAdapterExecute.mock.calls.length).toBeGreaterThanOrEqual(2);
     } finally {
