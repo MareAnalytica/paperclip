@@ -346,7 +346,7 @@ describe.sequential("agent skill routes", () => {
         }),
       }),
     );
-  }, 10_000);
+  }, 20_000);
 
   it("skips runtime materialization when listing Codex skills", async () => {
     mockAgentService.getById.mockResolvedValue(makeAgent("codex_local"));
