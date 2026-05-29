@@ -10,6 +10,12 @@ metadata:
 spec:
   accessModes:
     - ReadWriteOnce
+  # storageClassName is immutable once the PVC is bound. Pin it explicitly so
+  # repeated `kubectl apply` is idempotent: omitting the field after a prior
+  # apply set it makes the 3-way merge compute a removal, which the API server
+  # rejects with "spec is immutable" and fails the whole deploy. Must match the
+  # cluster's provisioner — `local-path` is the k3s default (rancher.io/local-path).
+  storageClassName: local-path
   resources:
     requests:
       storage: 5Gi
