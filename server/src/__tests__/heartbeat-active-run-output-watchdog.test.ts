@@ -657,6 +657,161 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
     expect(evaluations.filter((issue) => !["done", "cancelled"].includes(issue.status))).toHaveLength(1);
   });
 
+  it("uses the company-configured re-arm window for continue decisions (§10)", async () => {
+    const now = new Date("2026-04-22T20:00:00.000Z");
+    const { companyId, managerId, runId } = await seedRunningRun({
+      now,
+      ageMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000,
+    });
+    // §10: the re-arm window is config-driven (companies.policies.watchdog.reArmWindow),
+    // not the hardcoded default. An explicit number overrides.
+    const customReArmMs = 90 * 60 * 1000;
+    expect(customReArmMs).not.toBe(ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS);
+    await db
+      .update(companies)
+      .set({ policies: { watchdog: { reArmWindow: customReArmMs } } })
+      .where(eq(companies.id, companyId));
+    const heartbeat = heartbeatService(db);
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn() });
+
+    const scan = await heartbeat.scanSilentActiveRuns({ now, companyId });
+    const evaluationIssueId = scan.evaluationIssueIds[0];
+    expect(evaluationIssueId).toBeTruthy();
+
+    const decision = await recovery.recordWatchdogDecision({
+      runId,
+      actor: { type: "agent", agentId: managerId },
+      decision: "continue",
+      evaluationIssueId,
+      reason: "Acceptable evidence; keep watching on the configured window.",
+      now,
+    });
+    expect(decision.snoozedUntil?.toISOString()).toBe(
+      new Date(now.getTime() + customReArmMs).toISOString(),
+    );
+
+    // The configured window also governs creation-side suppression: no re-creation
+    // before the configured window elapses, then a fresh evaluation after it.
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, evaluationIssueId));
+    const customRearmAt = new Date(now.getTime() + customReArmMs);
+    const beforeDefault = await heartbeat.scanSilentActiveRuns({
+      now: new Date(now.getTime() + ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS + 60_000),
+      companyId,
+    });
+    expect(beforeDefault).toMatchObject({ created: 0, snoozed: 1 });
+    const afterCustom = await heartbeat.scanSilentActiveRuns({
+      now: new Date(customRearmAt.getTime() + 60_000),
+      companyId,
+    });
+    expect(afterCustom.created).toBe(1);
+  });
+
+  it("creation dedup and re-arm cover source-less runs (§10)", async () => {
+    const now = new Date("2026-04-22T20:00:00.000Z");
+    const companyId = randomUUID();
+    const managerId = randomUUID();
+    const coderId = randomUUID();
+    const runId = randomUUID();
+    const issuePrefix = `S${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const silenceMs = ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000;
+    const startedAt = new Date(now.getTime() - silenceMs);
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Sourceless Watchdog Co",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values([
+      {
+        id: managerId,
+        companyId,
+        name: "CTO",
+        role: "cto",
+        status: "idle",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: coderId,
+        companyId,
+        name: "Timer Worker",
+        role: "engineer",
+        status: "running",
+        reportsTo: managerId,
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+    ]);
+    // Source-less run: a timer/system run with no linked source issue in its context.
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId: coderId,
+      status: "running",
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      startedAt,
+      processStartedAt: startedAt,
+      lastOutputAt: null,
+      lastOutputSeq: 0,
+      lastOutputStream: null,
+      contextSnapshot: {},
+      logBytes: 0,
+    });
+
+    const heartbeat = heartbeatService(db);
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn() });
+
+    // A silent source-less run is first-class: it gets exactly one evaluation.
+    const scan1 = await heartbeat.scanSilentActiveRuns({ now, companyId });
+    expect(scan1).toMatchObject({ created: 1 });
+    const evaluationIssueId = scan1.evaluationIssueIds[0];
+    expect(evaluationIssueId).toBeTruthy();
+
+    // Open-evaluation dedup is keyed on (companyId, runId) with no source issue involved.
+    const scan2 = await heartbeat.scanSilentActiveRuns({ now, companyId });
+    expect(scan2).toMatchObject({ created: 0, existing: 1 });
+
+    // The assigned owner records a continue decision that arms the re-arm window.
+    const [created] = await db
+      .select({ assigneeAgentId: issues.assigneeAgentId })
+      .from(issues)
+      .where(eq(issues.id, evaluationIssueId));
+    expect(created.assigneeAgentId).toBeTruthy();
+    const decision = await recovery.recordWatchdogDecision({
+      runId,
+      actor: { type: "agent", agentId: created.assigneeAgentId! },
+      decision: "continue",
+      evaluationIssueId,
+      reason: "Source-less timer run is intentionally quiet; keep watching.",
+      now,
+    });
+    const rearmAt = new Date(now.getTime() + ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS);
+    expect(decision.snoozedUntil?.toISOString()).toBe(rearmAt.toISOString());
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, evaluationIssueId));
+
+    // Within the re-arm window the source-less run is not re-created (counts the
+    // recently-resolved action, not only currently-open ones).
+    const beforeRearm = await heartbeat.scanSilentActiveRuns({
+      now: new Date(rearmAt.getTime() - 60_000),
+      companyId,
+    });
+    expect(beforeRearm).toMatchObject({ created: 0, snoozed: 1 });
+
+    // After the window it re-arms with a fresh evaluation.
+    const afterRearm = await heartbeat.scanSilentActiveRuns({
+      now: new Date(rearmAt.getTime() + 60_000),
+      companyId,
+    });
+    expect(afterRearm.created).toBe(1);
+    expect(afterRearm.evaluationIssueIds[0]).not.toBe(evaluationIssueId);
+  });
+
   it("rejects agent watchdog decisions using issues not bound to the target run", async () => {
     const now = new Date("2026-04-22T20:00:00.000Z");
     const { companyId, managerId, coderId, runId, issuePrefix } = await seedRunningRun({

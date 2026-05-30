@@ -70,6 +70,15 @@ export const ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS = 60 * 60 * 1000;
 export const ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS = 4 * 60 * 60 * 1000;
 export const ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS = 30 * 60 * 1000;
 const ACTIVE_RUN_OUTPUT_EVIDENCE_TAIL_BYTES = 8 * 1024;
+
+// §10 silence-watchdog idempotency contract (doc/execution-semantics.md): the
+// creation-side `(companyId, runId)` re-arm window is configuration, not a
+// hardcoded value, so the contract stays portable across companies. Read from
+// `companies.policies.watchdog.reArmWindow`; absent/non-numeric falls back to the
+// default so existing deployments are unaffected.
+export type WatchdogConfig = {
+  reArmWindowMs: number;
+};
 export const STRANDED_ASSIGNEE_COMMENT_LIVENESS_WINDOW_MS = 5 * 60 * 1000;
 const STRANDED_OPEN_CHILD_STATUSES = ["in_review", "in_progress"] as const;
 const STRANDED_ISSUE_RECOVERY_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.strandedIssueRecovery;
@@ -750,6 +759,18 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   function silenceAgeMsForRun(run: Pick<typeof heartbeatRuns.$inferSelect, "lastOutputAt" | "processStartedAt" | "startedAt" | "createdAt">, now = new Date()) {
     const startedAt = silenceStartedAtForRun(run);
     return startedAt ? Math.max(0, now.getTime() - startedAt.getTime()) : null;
+  }
+
+  async function resolveWatchdogConfig(companyId: string): Promise<WatchdogConfig> {
+    const [row] = await db
+      .select({ policies: companies.policies })
+      .from(companies)
+      .where(eq(companies.id, companyId))
+      .limit(1);
+    const watchdog = parseObject(parseObject(row?.policies)["watchdog"]);
+    // null/undefined in policies means "use default"; an explicit number overrides.
+    const reArmWindowMs = asNumber(watchdog["reArmWindow"], ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS);
+    return { reArmWindowMs };
   }
 
   async function latestActiveOutputQuietUntilDecision(companyId: string, runId: string, now = new Date()) {
@@ -1699,12 +1720,13 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     }
 
     const decisionNow = input.now ?? new Date();
+    const watchdogConfig = await resolveWatchdogConfig(run.companyId);
     const effectiveSnoozedUntil = input.decision === "snooze"
       ? input.snoozedUntil ?? null
       : input.decision === "continue"
         ? input.snoozedUntil && input.snoozedUntil > decisionNow
           ? input.snoozedUntil
-          : new Date(decisionNow.getTime() + ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS)
+          : new Date(decisionNow.getTime() + watchdogConfig.reArmWindowMs)
         : null;
 
     const [row] = await db
