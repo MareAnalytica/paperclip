@@ -373,6 +373,8 @@ Watchdog decisions are explicit operator/recovery-owner decisions:
 
 Operators should prefer `snooze` for known time-bounded quiet periods. `continue` is only a short acknowledgement of the current evidence; if the run remains silent after the re-arm window, the periodic watchdog scan can create or update review work again.
 
+Watchdog evaluation *creation* is idempotent on `(companyId, runId)` across the active re-arm window. This creation-side key is distinct from the folding-side `(companyId, runId, sourceIssueId)` key in the next subsection: it omits `sourceIssueId` on purpose so the same dedupe also covers source-less runs — timer, system, and scan runs with no linked source issue, which are first-class in this model rather than an exception path. Within the re-arm window the watchdog counts recently-resolved evaluation actions, not only currently-open ones, when it decides whether to create new review work, so a run whose evaluation was just auto-resolved is not immediately re-created. Counting resolved-but-retained actions, instead of deleting them, is what preserves the audit trail. A scan-created evaluation that is auto-resolved without operator input must record a `continue` decision; that `continue` sets the standard re-arm window (`watchdog.reArmWindow`, default 30 minutes) and is what arms this creation-side dedupe, so auto-resolution is never silent — it always leaves an explicit decision row with its re-arm timestamp.
+
 The board can record watchdog decisions. The assigned owner of an issue-backed watchdog evaluation can also record them. Other agents cannot.
 
 ### Source-aware watchdog folding
@@ -387,6 +389,8 @@ Fold watchdog work when all of these are true:
 - there is no independent evidence that the still-running or detached process is doing harmful work, still owns external cleanup that needs an operator decision, or needs a separate security/ownership review
 
 Folding means resolving or cancelling the watchdog recovery action or issue-backed evaluation through the explicit recovery lifecycle. It must preserve the run id, source issue, detected silence or detached-process evidence, terminal source activity, decision reason, and best-effort process cleanup result. It must be idempotent for the `(companyId, runId, sourceIssueId)` signal and must not recursively recover the watchdog evaluation issue itself.
+
+Source-less runs cannot fold, because there is no linked source issue to reach a terminal disposition. Their watchdog noise control relies solely on the creation-side `(companyId, runId)` dedupe above, the `continue` re-arm window, and the escalation horizon in §11. This keeps timer and system runs inside the same run-health and auditability model as source-linked runs rather than as a silent exception.
 
 Do not fold watchdog work only because the run is quiet. The watchdog must still create or continue reviewer work when:
 
@@ -443,6 +447,8 @@ Examples:
 - all candidate recovery owners are paused, terminated, pending approval, or budget-blocked
 - the issue is human-owned rather than agent-owned
 - the run is intentionally quiet but needs an operator decision before cancellation or continuation
+
+A critical-silent run that never recovers must not loop in review forever. Once the run has stayed past the critical threshold for a bounded escalation horizon — a configured number of re-arm windows (`watchdog.escalationHorizon.maxReArmWindows`) or an elapsed-time ceiling (`watchdog.escalationHorizon.maxSilentHours`), whichever the operator configures and whichever trips first — the watchdog must escalate to a terminal operator decision under this section instead of creating another evaluation. The horizon escalation routes to an operator cancel or snooze; it must not auto-cancel or otherwise mutate the live run. Source-less runs are in scope for this horizon exactly as source-linked runs are. The window and horizon are configuration, not hardcoded values, so the contract stays portable across companies.
 
 In these cases Paperclip should leave a visible issue/comment trail instead of silently retrying.
 
