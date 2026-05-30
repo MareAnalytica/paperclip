@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { Router, type Request, type Response } from "express";
 import multer from "multer";
 import { z } from "zod";
-import { and, desc, eq, inArray, notInArray } from "drizzle-orm";
+import { and, desc, eq, inArray, notInArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   activityLog,
@@ -44,6 +44,7 @@ import {
   getClosedIsolatedExecutionWorkspaceMessage,
   isClosedIsolatedExecutionWorkspace,
   normalizeIssueIdentifier as normalizeIssueReferenceIdentifier,
+  isTerminalIssueStatus,
   type CompanySearchQuery,
   type CompanySearchResponse,
   type ExecutionWorkspace,
@@ -2413,14 +2414,23 @@ export function issueRoutes(
       assertBoard(req);
     }
 
+    // Suppress the source-issue status restore when the issue is an audit-sink
+    // log OR already in a terminal state. A terminal issue (`done`/`cancelled`)
+    // carries a valid disposition, so applying `sourceIssueStatus` here would
+    // flip a closed issue back into an active state and re-arm the
+    // missing-disposition recovery loop (DEE-569). The recovery action itself
+    // is still resolved; only the status mutation is treated as a no-op.
+    //
+    // The audit-sink label is read once here; the terminal-status decision is
+    // re-evaluated under a row lock inside the transaction below so a close that
+    // commits after this pre-transaction snapshot cannot be undone by the
+    // restore (otherwise a freshly `done` issue would be re-opened).
     const auditSinkSuppressed = await isAuditSinkIssue(db, existing.companyId, existing.id);
-    const effectiveSourceIssueStatus = auditSinkSuppressed ? null : sourceIssueStatus;
-    const effectiveResolutionNote = auditSinkSuppressed
-      ? (resolutionNote ? `${resolutionNote} (suppressed: audit-sink issue)` : "suppressed: audit-sink issue")
-      : (resolutionNote ?? null);
+    const snapshotRestoreSuppressed = auditSinkSuppressed || isTerminalIssueStatus(existing.status);
+    const snapshotSourceIssueStatus = snapshotRestoreSuppressed ? null : sourceIssueStatus;
 
     const actor = getActorInfo(req);
-    const updateFields = effectiveSourceIssueStatus ? { status: effectiveSourceIssueStatus } : {};
+    const updateFields = snapshotSourceIssueStatus ? { status: snapshotSourceIssueStatus } : {};
     await assertAgentInReviewReviewPath({
       existing,
       updateFields,
@@ -2435,6 +2445,37 @@ export function issueRoutes(
     const actionStatus = outcome === "cancelled" ? "cancelled" : "resolved";
     const result = await db.transaction(async (tx) => {
       let issue = existing;
+
+      // Lock the issue row and re-read its live status so a close that committed
+      // after the pre-transaction snapshot is honored: a now-terminal issue is
+      // never re-opened by the recovery resolve (DEE-569 race).
+      await tx.execute(
+        sql`select ${issueRows.id} from ${issueRows} where ${issueRows.id} = ${id} and ${issueRows.companyId} = ${existing.companyId} for update`,
+      );
+      const lockedStatus = await tx
+        .select({ status: issueRows.status })
+        .from(issueRows)
+        .where(eq(issueRows.id, id))
+        .then((rows) => rows[0]?.status ?? null);
+      if (lockedStatus === null) throw notFound("Issue not found");
+
+      const terminalStatusSuppressed = isTerminalIssueStatus(lockedStatus);
+      const restoreSuppressed = auditSinkSuppressed || terminalStatusSuppressed;
+      const suppressionReason = auditSinkSuppressed
+        ? "audit_sink_target"
+        : terminalStatusSuppressed
+          ? "terminal_status_target"
+          : null;
+      const suppressionNote = auditSinkSuppressed
+        ? "suppressed: audit-sink issue"
+        : terminalStatusSuppressed
+          ? `suppressed: terminal issue status (${lockedStatus})`
+          : null;
+      const effectiveSourceIssueStatus = restoreSuppressed ? null : sourceIssueStatus;
+      const effectiveResolutionNote = suppressionNote
+        ? (resolutionNote ? `${resolutionNote} (${suppressionNote})` : suppressionNote)
+        : (resolutionNote ?? null);
+
       if (outcome === "blocked") {
         const unresolvedBlockers = await tx
           .select({ id: issueRows.id })
@@ -2481,12 +2522,12 @@ export function issueRoutes(
       );
       if (!recoveryAction) throw notFound("Active recovery action not found");
 
-      return { issue, recoveryAction };
+      return { issue, recoveryAction, effectiveSourceIssueStatus, suppressionReason };
     });
 
     await routinesSvc.syncRunStatusForIssue(result.issue.id);
 
-    if (effectiveSourceIssueStatus && existing.status !== result.issue.status) {
+    if (result.effectiveSourceIssueStatus && existing.status !== result.issue.status) {
       await logActivity(db, {
         companyId: result.issue.companyId,
         actorType: actor.actorType,
@@ -2524,12 +2565,12 @@ export function issueRoutes(
         outcome: result.recoveryAction.outcome,
         sourceIssueStatus: sourceIssueStatus ?? null,
         resolutionNote: result.recoveryAction.resolutionNote,
-        ...(auditSinkSuppressed ? { suppressionReason: "audit_sink_target" } : {}),
+        ...(result.suppressionReason ? { suppressionReason: result.suppressionReason } : {}),
       },
     });
 
     if (
-      effectiveSourceIssueStatus === "todo" &&
+      result.effectiveSourceIssueStatus === "todo" &&
       existing.status !== result.issue.status &&
       result.issue.assigneeAgentId
     ) {
