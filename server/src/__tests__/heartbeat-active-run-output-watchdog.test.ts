@@ -799,3 +799,278 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
     expect(decision.createdByRunId).toBe(managerRunId);
   });
 });
+
+// §11 bounded escalation horizon tests
+describeEmbeddedPostgres("watchdog escalation horizon (§11)", () => {
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+  let db: ReturnType<typeof createDb>;
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-watchdog-horizon-");
+    db = createDb(tempDb.connectionString);
+  }, 30_000);
+
+  afterEach(async () => {
+    await db.execute(sql.raw(`TRUNCATE TABLE "companies" CASCADE`));
+  });
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  });
+
+  // Seeds a critically-silent run and adds N prior re-arm decisions to simulate elapsed windows.
+  async function seedHorizonRun(opts: {
+    now: Date;
+    priorReArmWindows: number;
+    watchdogPolicies?: Record<string, unknown>;
+  }) {
+    const companyId = randomUUID();
+    const managerId = randomUUID();
+    const coderId = randomUUID();
+    const issueId = randomUUID();
+    const runId = randomUUID();
+    const issuePrefix = `H${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    // Started well past critical threshold so the horizon check applies
+    const startedAt = new Date(opts.now.getTime() - ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS - 60_000);
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Horizon Co",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+      policies: opts.watchdogPolicies ? { watchdog: opts.watchdogPolicies } : null,
+    });
+    await db.insert(agents).values([
+      {
+        id: managerId,
+        companyId,
+        name: "CTO",
+        role: "cto",
+        status: "idle",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: coderId,
+        companyId,
+        name: "Coder",
+        role: "engineer",
+        status: "running",
+        reportsTo: managerId,
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+    ]);
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Long running horizon test",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: coderId,
+      issueNumber: 1,
+      identifier: `${issuePrefix}-1`,
+      originKind: "manual",
+      updatedAt: startedAt,
+      createdAt: startedAt,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId: coderId,
+      status: "running",
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      startedAt,
+      processStartedAt: startedAt,
+      lastOutputAt: null,
+      lastOutputSeq: 0,
+      lastOutputStream: null,
+      contextSnapshot: { issueId },
+      logBytes: 0,
+    });
+    await db.update(issues).set({ executionRunId: runId }).where(eq(issues.id, issueId));
+
+    // Insert N prior continue decisions to simulate elapsed re-arm windows
+    for (let i = 0; i < opts.priorReArmWindows; i++) {
+      const windowTime = new Date(startedAt.getTime() + i * 30 * 60 * 1000);
+      await db.insert(heartbeatRunWatchdogDecisions).values({
+        companyId,
+        runId,
+        decision: "continue",
+        snoozedUntil: new Date(windowTime.getTime() + 30 * 60 * 1000),
+        createdAt: windowTime,
+      });
+    }
+
+    return { companyId, runId, issueId, coderId, issuePrefix };
+  }
+
+  it("does NOT horizon-escalate before maxReArmWindows is reached", async () => {
+    const now = new Date();
+    const { companyId, runId } = await seedHorizonRun({
+      now,
+      priorReArmWindows: 3, // below default of 8
+    });
+
+    const recovery = recoveryService(db, {
+      enqueueWakeup: vi.fn(async () => null),
+      issueService: (await import("../services/issues.ts")).issueService(db),
+    });
+    const result = await recovery.scanSilentActiveRuns({ now, companyId });
+
+    expect(result.horizonEscalated).toBe(0);
+    expect(result.created + result.existing + result.escalated).toBeGreaterThanOrEqual(1);
+  });
+
+  it("horizon-escalates when maxReArmWindows is reached (default 8)", async () => {
+    const now = new Date();
+    const { companyId, runId } = await seedHorizonRun({
+      now,
+      priorReArmWindows: 8, // exactly at default
+    });
+
+    const recovery = recoveryService(db, {
+      enqueueWakeup: vi.fn(async () => null),
+      issueService: (await import("../services/issues.ts")).issueService(db),
+    });
+    const result = await recovery.scanSilentActiveRuns({ now, companyId });
+
+    expect(result.horizonEscalated).toBe(1);
+    expect(result.created).toBe(0);
+
+    // Verify the evaluation issue was created at critical priority and is not cancelled
+    const [evalIssue] = await db
+      .select()
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, companyId),
+          eq(issues.originId, runId),
+        ),
+      );
+    expect(evalIssue).toBeTruthy();
+    expect(evalIssue!.priority).toBe("critical");
+    expect(["cancelled", "done"]).not.toContain(evalIssue!.status);
+
+    // Verify the live run was NOT mutated (must still be running)
+    const [activeRun] = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId));
+    expect(activeRun!.status).toBe("running");
+  });
+
+  it("horizon-escalates using config-override maxReArmWindows", async () => {
+    const now = new Date();
+    const { companyId } = await seedHorizonRun({
+      now,
+      priorReArmWindows: 3, // 3 windows elapsed
+      watchdogPolicies: { maxReArmWindows: 3 }, // company-level override: trip at 3
+    });
+
+    const recovery = recoveryService(db, {
+      enqueueWakeup: vi.fn(async () => null),
+      issueService: (await import("../services/issues.ts")).issueService(db),
+    });
+    const result = await recovery.scanSilentActiveRuns({ now, companyId });
+
+    expect(result.horizonEscalated).toBe(1);
+  });
+
+  it("horizon-escalates via maxSilentHours when configured", async () => {
+    // Silence age is CRITICAL_THRESHOLD_MS + 60s ≈ 4h 1m
+    // Set maxSilentHours=4 so it trips immediately.
+    const now = new Date();
+    const { companyId, runId } = await seedHorizonRun({
+      now,
+      priorReArmWindows: 0, // no prior decisions needed — maxSilentHours trips first
+      watchdogPolicies: { maxReArmWindows: null, maxSilentHours: 4 },
+    });
+
+    const recovery = recoveryService(db, {
+      enqueueWakeup: vi.fn(async () => null),
+      issueService: (await import("../services/issues.ts")).issueService(db),
+    });
+    const result = await recovery.scanSilentActiveRuns({ now, companyId });
+
+    expect(result.horizonEscalated).toBe(1);
+
+    // Verify run still running (not mutated)
+    const [activeRun] = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId));
+    expect(activeRun!.status).toBe("running");
+  });
+
+  it("source-less run (no contextSnapshot issueId) is in scope for horizon", async () => {
+    const now = new Date();
+    const companyId = randomUUID();
+    const coderId = randomUUID();
+    const runId = randomUUID();
+    const issuePrefix = `S${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const startedAt = new Date(now.getTime() - ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS - 60_000);
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Sourceless Co",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: coderId,
+      companyId,
+      name: "Timer Agent",
+      role: "engineer",
+      status: "running",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId: coderId,
+      status: "running",
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      startedAt,
+      processStartedAt: startedAt,
+      lastOutputAt: null,
+      lastOutputSeq: 0,
+      lastOutputStream: null,
+      contextSnapshot: {}, // no issueId — source-less run
+      logBytes: 0,
+    });
+    // Add 8 continue decisions to trip default horizon
+    for (let i = 0; i < 8; i++) {
+      await db.insert(heartbeatRunWatchdogDecisions).values({
+        companyId,
+        runId,
+        decision: "continue",
+        snoozedUntil: new Date(startedAt.getTime() + (i + 1) * 30 * 60 * 1000),
+        createdAt: new Date(startedAt.getTime() + i * 30 * 60 * 1000),
+      });
+    }
+
+    const recovery = recoveryService(db, {
+      enqueueWakeup: vi.fn(async () => null),
+      issueService: (await import("../services/issues.ts")).issueService(db),
+    });
+    const result = await recovery.scanSilentActiveRuns({ now, companyId });
+
+    expect(result.horizonEscalated).toBe(1);
+    // Run must not be mutated
+    const [activeRun] = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId));
+    expect(activeRun!.status).toBe("running");
+  });
+});
