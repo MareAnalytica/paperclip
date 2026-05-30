@@ -33,6 +33,16 @@ issue the same way it treats an audit-sink target:
 Audit-sink suppression takes precedence when both apply, preserving the existing
 `audit_sink_target` marker and behavior.
 
+### Concurrency
+
+The terminal decision is **re-evaluated under a row lock inside the resolve
+transaction**, not from the pre-transaction `getById()` snapshot. The route
+issues `SELECT ... FOR UPDATE` on the issue row and re-reads its status before
+deciding whether to apply `sourceIssueStatus`. This serializes against a
+concurrent close (the exact scenario DEE-569 cares about: an operator marking the
+issue `done` to stop the loop) so a close that commits after the snapshot can no
+longer be undone by an in-flight recovery resolution.
+
 `isTerminalIssueStatus` / `TERMINAL_ISSUE_STATUSES` are exported from
 `@paperclipai/shared` so the route, the recovery service, and future callers
 share one definition instead of duplicating the `done`/`cancelled` literal set.
