@@ -138,6 +138,22 @@ export const ISSUE_STATUSES = [
 ] as const;
 export type IssueStatus = (typeof ISSUE_STATUSES)[number];
 
+/**
+ * Terminal issue statuses — an issue that has reached one of these is closed and
+ * carries a valid disposition. Recovery code paths must treat a terminal status
+ * as the disposition itself (a no-op) and never re-open it as a recovery side
+ * effect, otherwise a closed issue can be flipped back into an active state and
+ * re-enter the missing-disposition recovery loop.
+ *
+ * See `docs/specs/2026-05-30-recovery-terminal-status-exemption.md`.
+ */
+export const TERMINAL_ISSUE_STATUSES = ["done", "cancelled"] as const;
+export type TerminalIssueStatus = (typeof TERMINAL_ISSUE_STATUSES)[number];
+
+export function isTerminalIssueStatus(status: string | null | undefined): status is TerminalIssueStatus {
+  return status === "done" || status === "cancelled";
+}
+
 export const INBOX_MINE_ISSUE_STATUSES = [
   "backlog",
   "todo",

@@ -5,6 +5,7 @@ import {
   DEFAULT_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
   MAX_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
   MIN_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
+  isTerminalIssueStatus,
   type IssueGraphLivenessAutoRecoveryPreview,
   type IssueGraphLivenessAutoRecoveryPreviewItem,
 } from "@paperclipai/shared";
@@ -734,10 +735,6 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
 
   function staleActiveRunOriginFingerprint(companyId: string, runId: string) {
     return `stale_active_run:${companyId}:${runId}`;
-  }
-
-  function isTerminalIssueStatus(status: string | null | undefined) {
-    return status === "done" || status === "cancelled";
   }
 
   function isRecoveryOriginIssue(issue: typeof issues.$inferSelect) {

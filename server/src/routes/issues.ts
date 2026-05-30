@@ -44,6 +44,7 @@ import {
   getClosedIsolatedExecutionWorkspaceMessage,
   isClosedIsolatedExecutionWorkspace,
   normalizeIssueIdentifier as normalizeIssueReferenceIdentifier,
+  isTerminalIssueStatus,
   type CompanySearchQuery,
   type CompanySearchResponse,
   type ExecutionWorkspace,
@@ -2413,10 +2414,28 @@ export function issueRoutes(
       assertBoard(req);
     }
 
+    // Suppress the source-issue status restore when the issue is an audit-sink
+    // log OR already in a terminal state. A terminal issue (`done`/`cancelled`)
+    // carries a valid disposition, so applying `sourceIssueStatus` here would
+    // flip a closed issue back into an active state and re-arm the
+    // missing-disposition recovery loop (DEE-569). The recovery action itself
+    // is still resolved; only the status mutation is treated as a no-op.
     const auditSinkSuppressed = await isAuditSinkIssue(db, existing.companyId, existing.id);
-    const effectiveSourceIssueStatus = auditSinkSuppressed ? null : sourceIssueStatus;
-    const effectiveResolutionNote = auditSinkSuppressed
-      ? (resolutionNote ? `${resolutionNote} (suppressed: audit-sink issue)` : "suppressed: audit-sink issue")
+    const terminalStatusSuppressed = isTerminalIssueStatus(existing.status);
+    const restoreSuppressed = auditSinkSuppressed || terminalStatusSuppressed;
+    const suppressionReason = auditSinkSuppressed
+      ? "audit_sink_target"
+      : terminalStatusSuppressed
+        ? "terminal_status_target"
+        : null;
+    const suppressionNote = auditSinkSuppressed
+      ? "suppressed: audit-sink issue"
+      : terminalStatusSuppressed
+        ? `suppressed: terminal issue status (${existing.status})`
+        : null;
+    const effectiveSourceIssueStatus = restoreSuppressed ? null : sourceIssueStatus;
+    const effectiveResolutionNote = suppressionNote
+      ? (resolutionNote ? `${resolutionNote} (${suppressionNote})` : suppressionNote)
       : (resolutionNote ?? null);
 
     const actor = getActorInfo(req);
@@ -2524,7 +2543,7 @@ export function issueRoutes(
         outcome: result.recoveryAction.outcome,
         sourceIssueStatus: sourceIssueStatus ?? null,
         resolutionNote: result.recoveryAction.resolutionNote,
-        ...(auditSinkSuppressed ? { suppressionReason: "audit_sink_target" } : {}),
+        ...(suppressionReason ? { suppressionReason } : {}),
       },
     });
 
