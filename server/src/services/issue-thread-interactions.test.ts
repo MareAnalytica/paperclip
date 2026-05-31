@@ -78,6 +78,170 @@ describe("issueThreadInteractionService", () => {
     vi.clearAllMocks();
   });
 
+  describe("hydrate read-path guard (DEE-582)", () => {
+    const baseRow = {
+      companyId: "company-1",
+      issueId: "11111111-1111-4111-8111-111111111111",
+      status: "pending",
+      continuationPolicy: "wake_assignee",
+      idempotencyKey: null,
+      sourceCommentId: null,
+      sourceRunId: null,
+      title: null,
+      summary: null,
+      createdByAgentId: "agent-1",
+      createdByUserId: null,
+      resolvedByAgentId: null,
+      resolvedByUserId: null,
+      resolvedAt: null,
+      createdAt: new Date("2026-04-20T10:00:00.000Z"),
+      updatedAt: new Date("2026-04-20T10:00:00.000Z"),
+    };
+
+    const validSuggest = {
+      ...baseRow,
+      id: "i-valid",
+      kind: "suggest_tasks",
+      payload: { version: 1, tasks: [{ clientKey: "t1", title: "One" }] },
+      result: null,
+    };
+    // DEE-441 failure mode: legacy result.outcome:"declined" is not in the enum.
+    const poisonConfirm = {
+      ...baseRow,
+      id: "i-poison",
+      kind: "request_confirmation",
+      payload: { version: 1, prompt: "Confirm?" },
+      result: { version: 1, outcome: "declined" },
+    };
+    const validAsk = {
+      ...baseRow,
+      id: "i-valid-2",
+      kind: "ask_user_questions",
+      payload: {
+        version: 1,
+        questions: [
+          { id: "q1", prompt: "Pick", selectionMode: "single", options: [{ id: "o1", label: "L" }] },
+        ],
+      },
+      result: null,
+    };
+
+    it("listForIssue returns 200-equivalent results with one poison row degraded, valid rows intact", async () => {
+      const { issueThreadInteractionService } = await import("./issue-thread-interactions.js");
+
+      const rows = [validSuggest, poisonConfirm, validAsk];
+      const db: any = {
+        select: vi.fn(() => ({
+          from: () => ({
+            where: () => ({
+              orderBy: async () => rows,
+            }),
+          }),
+        })),
+      };
+
+      const svc = issueThreadInteractionService(db as never);
+      const list = await svc.listForIssue("11111111-1111-4111-8111-111111111111");
+
+      expect(list).toHaveLength(3);
+
+      const poison = list.find((i) => i.id === "i-poison")!;
+      expect(poison.result).toBeNull();
+      expect(poison.unparseableResult).toBe(true);
+      expect(poison.unparseablePayload).toBeUndefined();
+      expect(typeof poison.parseErrorCode).toBe("string");
+      // raw payload (which is valid here) is preserved and the row stays visible
+      expect(poison.kind).toBe("request_confirmation");
+
+      const valid = list.find((i) => i.id === "i-valid")!;
+      expect(valid.unparseableResult).toBeUndefined();
+      expect(valid.unparseablePayload).toBeUndefined();
+      expect(valid.parseErrorCode).toBeUndefined();
+
+      const valid2 = list.find((i) => i.id === "i-valid-2")!;
+      expect(valid2.unparseableResult).toBeUndefined();
+      expect(valid2.unparseablePayload).toBeUndefined();
+    });
+
+    it("getById returns a degraded interaction for a poison row instead of throwing", async () => {
+      const { issueThreadInteractionService } = await import("./issue-thread-interactions.js");
+
+      const db: any = {
+        select: vi.fn(() => ({
+          from: () => ({
+            where: () => ({
+              then: (cb: (rows: unknown[]) => unknown) => Promise.resolve(cb([poisonConfirm])),
+            }),
+          }),
+        })),
+      };
+
+      const svc = issueThreadInteractionService(db as never);
+      const got = await svc.getById("i-poison");
+
+      expect(got).not.toBeNull();
+      expect(got!.result).toBeNull();
+      expect(got!.unparseableResult).toBe(true);
+    });
+
+    it("hydrates a row with an unparseable payload by preserving the raw payload and flagging it", async () => {
+      const { issueThreadInteractionService } = await import("./issue-thread-interactions.js");
+
+      const poisonPayload = {
+        ...baseRow,
+        id: "i-bad-payload",
+        kind: "suggest_tasks",
+        // missing required `tasks` -> payload schema fails
+        payload: { version: 1, garbage: true },
+        result: null,
+      };
+      const db: any = {
+        select: vi.fn(() => ({
+          from: () => ({
+            where: () => ({
+              orderBy: async () => [poisonPayload],
+            }),
+          }),
+        })),
+      };
+
+      const svc = issueThreadInteractionService(db as never);
+      const list = await svc.listForIssue("11111111-1111-4111-8111-111111111111");
+
+      expect(list).toHaveLength(1);
+      expect(list[0].unparseablePayload).toBe(true);
+      // raw payload preserved (not dropped) so the row stays repairable
+      expect((list[0].payload as unknown as Record<string, unknown>).garbage).toBe(true);
+    });
+
+    it("expirePendingForTerminalIssue resolves a pending poison-payload row instead of throwing (DEE-582 AC)", async () => {
+      const { issueThreadInteractionService } = await import("./issue-thread-interactions.js");
+
+      const pendingPoisonPayload = {
+        ...baseRow,
+        id: "i-exp",
+        kind: "request_confirmation",
+        // missing required `prompt` -> payload schema fails on read; old code would throw here
+        payload: { version: 1 },
+        result: null,
+      };
+      const { db } = createFakeDb({ interactionRow: pendingPoisonPayload });
+      const svc = issueThreadInteractionService(db as never);
+
+      const expired = await svc.expirePendingForTerminalIssue(
+        { id: "11111111-1111-4111-8111-111111111111", companyId: "company-1", status: "done" },
+        { agentId: "agent-x" },
+      );
+
+      expect(expired).toHaveLength(1);
+      expect(expired[0].status).toBe("expired");
+      // terminal auto-resolve still wrote a valid result...
+      expect((expired[0].result as { outcome?: string } | null)?.outcome).toBe("issue_terminal_status");
+      // ...and the unparseable payload was degraded-but-flagged rather than throwing
+      expect(expired[0].unparseablePayload).toBe(true);
+    });
+  });
+
   it("create reuses an existing interaction for the same idempotency key", async () => {
     const { issueThreadInteractionService } = await import("./issue-thread-interactions.js");
 

@@ -37,6 +37,7 @@ import {
 } from "@paperclipai/shared";
 import { conflict, notFound, unprocessable } from "../errors.js";
 import { issueService } from "./issues.js";
+import { logger } from "../middleware/logger.js";
 
 type InteractionActor = {
   agentId?: string | null;
@@ -186,6 +187,75 @@ function assertHumanBoardPrReviewEscalationAllowed(input: CreateIssueThreadInter
   );
 }
 
+type SafeParseLike<T> = {
+  safeParse(data: unknown):
+    | { success: true; data: T }
+    | { success: false; error: { issues: Array<{ code?: string }> } };
+};
+
+type HydratedField<T> = {
+  value: T;
+  unparseable: boolean;
+  errorCode?: string;
+};
+
+type DegradedInteractionMeta = {
+  unparseablePayload?: true;
+  unparseableResult?: true;
+  parseErrorCode?: string;
+};
+
+/**
+ * Read-path guard (DEE-582). `payload` is required, so on a validation failure we
+ * preserve the raw stored value (cast) and flag it rather than throwing — a single
+ * forward-incompatible / operator-corrupted row must not 400 the whole collection.
+ */
+function hydratePayloadField<T>(schema: SafeParseLike<T>, raw: unknown): HydratedField<T> {
+  const parsed = schema.safeParse(raw);
+  if (parsed.success) return { value: parsed.data, unparseable: false };
+  return { value: raw as T, unparseable: true, errorCode: parsed.error.issues[0]?.code };
+}
+
+/**
+ * Read-path guard (DEE-582). `result` is nullable; on a validation failure we
+ * degrade it to null and flag it (the exact DEE-441 `result.outcome:"declined"`
+ * failure mode) instead of throwing.
+ */
+function hydrateResultField<T>(schema: SafeParseLike<T>, raw: unknown): HydratedField<T | null> {
+  if (raw === null || raw === undefined) return { value: null, unparseable: false };
+  const parsed = schema.safeParse(raw);
+  if (parsed.success) return { value: parsed.data, unparseable: false };
+  return { value: null, unparseable: true, errorCode: parsed.error.issues[0]?.code };
+}
+
+function buildDegradedInteractionMeta(
+  row: IssueThreadInteractionRow,
+  payload: HydratedField<unknown>,
+  result: HydratedField<unknown>,
+): DegradedInteractionMeta {
+  if (!payload.unparseable && !result.unparseable) return {};
+
+  const parseErrorCode = payload.errorCode ?? result.errorCode ?? "invalid";
+  logger.warn(
+    {
+      interactionId: row.id,
+      companyId: row.companyId,
+      issueId: row.issueId,
+      kind: row.kind,
+      unparseablePayload: payload.unparseable,
+      unparseableResult: result.unparseable,
+      parseErrorCode,
+    },
+    "[issue-thread-interactions] hydrateInteraction read an unparseable row; returning a degraded interaction (DEE-582)",
+  );
+
+  return {
+    ...(payload.unparseable ? { unparseablePayload: true as const } : {}),
+    ...(result.unparseable ? { unparseableResult: true as const } : {}),
+    parseErrorCode,
+  };
+}
+
 function hydrateInteraction(
   row: IssueThreadInteractionRow,
 ): IssueThreadInteraction {
@@ -197,27 +267,39 @@ function hydrateInteraction(
   };
 
   switch (row.kind) {
-    case "suggest_tasks":
+    case "suggest_tasks": {
+      const payload = hydratePayloadField(suggestTasksPayloadSchema, row.payload);
+      const result = hydrateResultField(suggestTasksResultSchema, row.result);
       return {
         ...base,
         kind: "suggest_tasks",
-        payload: suggestTasksPayloadSchema.parse(row.payload),
-        result: row.result ? suggestTasksResultSchema.parse(row.result) : null,
+        payload: payload.value,
+        result: result.value,
+        ...buildDegradedInteractionMeta(row, payload, result),
       } satisfies SuggestTasksInteraction;
-    case "ask_user_questions":
+    }
+    case "ask_user_questions": {
+      const payload = hydratePayloadField(askUserQuestionsPayloadSchema, row.payload);
+      const result = hydrateResultField(askUserQuestionsResultSchema, row.result);
       return {
         ...base,
         kind: "ask_user_questions",
-        payload: askUserQuestionsPayloadSchema.parse(row.payload),
-        result: row.result ? askUserQuestionsResultSchema.parse(row.result) : null,
+        payload: payload.value,
+        result: result.value,
+        ...buildDegradedInteractionMeta(row, payload, result),
       } satisfies AskUserQuestionsInteraction;
-    case "request_confirmation":
+    }
+    case "request_confirmation": {
+      const payload = hydratePayloadField(requestConfirmationPayloadSchema, row.payload);
+      const result = hydrateResultField(requestConfirmationResultSchema, row.result);
       return {
         ...base,
         kind: "request_confirmation",
-        payload: requestConfirmationPayloadSchema.parse(row.payload),
-        result: row.result ? requestConfirmationResultSchema.parse(row.result) : null,
+        payload: payload.value,
+        result: result.value,
+        ...buildDegradedInteractionMeta(row, payload, result),
       } satisfies RequestConfirmationInteraction;
+    }
     default:
       throw unprocessable(`Unknown interaction kind: ${row.kind}`);
   }

@@ -769,6 +769,20 @@ export interface IssueThreadInteractionBase extends IssueThreadInteractionActorF
   createdAt: Date | string;
   updatedAt: Date | string;
   resolvedAt?: Date | string | null;
+  /**
+   * Read-path degradation marker (DEE-582). Set by the server's hydrateInteraction
+   * when the stored payload failed schema validation on read: the raw stored
+   * payload is returned unchanged and must not be trusted. The row stays visible
+   * for targeted repair instead of taking down the whole interactions collection.
+   */
+  unparseablePayload?: boolean;
+  /**
+   * Read-path degradation marker (DEE-582). Set when the stored result failed
+   * schema validation on read; `result` is degraded to null in that case.
+   */
+  unparseableResult?: boolean;
+  /** Short parse-error code for the first validation failure, for targeted repair. */
+  parseErrorCode?: string | null;
 }
 
 export interface SuggestTasksInteraction extends IssueThreadInteractionBase {
