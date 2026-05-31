@@ -240,6 +240,52 @@ describe("issueThreadInteractionService", () => {
       // ...and the unparseable payload was degraded-but-flagged rather than throwing
       expect(expired[0].unparseablePayload).toBe(true);
     });
+
+    it("historical-supersede catch-up does not throw on a pending request_confirmation with a null payload (DEE-582 read-path AC)", async () => {
+      const { issueThreadInteractionService } = await import("./issue-thread-interactions.js");
+
+      // GET /interactions runs expireRequestConfirmationsSupersededByHistoricalComments
+      // BEFORE listForIssue. That path hydrates each pending request_confirmation and reads
+      // payload.supersedeOnUserComment. A null/non-object payload would dereference-throw and
+      // 500 the whole read path — the exact one-poison-row outage this issue closes.
+      const pendingNullPayload = {
+        ...baseRow,
+        id: "i-super-null",
+        kind: "request_confirmation",
+        payload: null, // non-object: payload.supersedeOnUserComment would throw without the guard
+        result: null,
+      };
+      const userComment = {
+        id: "c-1",
+        companyId: "company-1",
+        issueId: "11111111-1111-4111-8111-111111111111",
+        authorUserId: "user-1",
+        createdAt: new Date("2026-04-21T10:00:00.000Z"),
+      };
+
+      let call = 0;
+      const db: any = {
+        select: vi.fn(() => {
+          call += 1;
+          if (call === 1) {
+            // interactions query (awaited directly)
+            return { from: () => ({ where: async () => [pendingNullPayload] }) };
+          }
+          // comments query (chains .orderBy)
+          return { from: () => ({ where: () => ({ orderBy: async () => [userComment] }) }) };
+        }),
+      };
+
+      const svc = issueThreadInteractionService(db as never);
+
+      // Must not throw; the degraded row simply does not participate in supersede.
+      const expired = await svc.expireRequestConfirmationsSupersededByHistoricalComments({
+        id: "11111111-1111-4111-8111-111111111111",
+        companyId: "company-1",
+      });
+
+      expect(expired).toEqual([]);
+    });
   });
 
   it("create reuses an existing interaction for the same idempotency key", async () => {

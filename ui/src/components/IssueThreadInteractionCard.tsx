@@ -370,10 +370,13 @@ function SuggestTasksCard({
 
   const roots = useMemo(
     () =>
-      buildSuggestedTaskTree(interaction.payload.tasks).filter(
-        (node) => !node.task.hiddenInPreview,
-      ),
-    [interaction.payload.tasks],
+      // DEE-582: a degraded (unparseablePayload) row carries its raw stored payload, which
+      // may not have a valid `tasks` array; fall back to empty so the card stays visible
+      // (flagged for repair) instead of crashing the render.
+      buildSuggestedTaskTree(
+        interaction.unparseablePayload ? [] : interaction.payload.tasks,
+      ).filter((node) => !node.task.hiddenInPreview),
+    [interaction.unparseablePayload, interaction.payload.tasks],
   );
   const createdByClientKey = useMemo(
     () => createdTaskMap(interaction.result?.createdTasks),
@@ -676,7 +679,9 @@ function AskUserQuestionsCard({
     );
   }, [interaction.result?.answers]);
 
-  const questions = interaction.payload.questions;
+  // DEE-582: a degraded (unparseablePayload) row may carry a raw payload without a valid
+  // `questions` array; fall back to empty so the card renders (flagged) instead of crashing.
+  const questions = interaction.unparseablePayload ? [] : interaction.payload.questions;
   const requiredQuestions = questions.filter((question) => question.required);
   const canSubmit = requiredQuestions.every(
     (question) => (draftAnswers[question.id] ?? []).length > 0,

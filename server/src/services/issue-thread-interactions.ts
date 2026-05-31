@@ -345,6 +345,12 @@ function shouldReturnAcceptedConfirmationToCreatorAgent(args: {
 }
 
 function shouldSupersedeRequestConfirmationOnUserComment(interaction: RequestConfirmationInteraction) {
+  // DEE-582: a row whose payload failed schema validation on read is degraded to its raw
+  // stored value (possibly null/scalar) and must not participate in payload-dependent
+  // transitions. The historical-supersede catch-up runs on the GET /interactions read path,
+  // so dereferencing a non-object payload here would re-introduce the collection-wide outage
+  // this guard exists to prevent. After this check the payload is a validated object.
+  if (interaction.unparseablePayload) return false;
   return interaction.payload.supersedeOnUserComment === true;
 }
 
