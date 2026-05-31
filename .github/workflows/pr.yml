@@ -280,38 +280,6 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Resolve Playwright version
-        id: pw
-        run: |
-          VERSION=$(node -p "require('@playwright/test/package.json').version")
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-
-      # Cache the downloaded browser binaries so a healthy run never re-downloads
-      # them, and a node with flaky CDN/DNS egress (DEE-584 variance) restores from
-      # cache instead of hanging. Keyed on the resolved Playwright version so it
-      # busts automatically on upgrade. See DEE-640.
-      - name: Cache Playwright browsers
-        id: pw-cache
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/ms-playwright
-          key: playwright-${{ runner.os }}-${{ steps.pw.outputs.version }}
-
-      # Browser binary download only runs on a cache miss, and is fail-fast bounded
-      # so a doomed CDN egress releases the ARC runner slot in minutes, not ~27min.
-      - name: Install Playwright browser (chromium)
-        if: steps.pw-cache.outputs.cache-hit != 'true'
-        timeout-minutes: 4
-        run: npx playwright install chromium
-
-      # OS deps are apt-installed (not in the ms-playwright cache); the stock ARC
-      # runner image ships none of chromium's shared libs. Fail-fast bounded for the
-      # same slot-waste reason. Durable apt-elimination tracked as a follow-up
-      # (pre-bake browsers + deps into a custom runner image).
-      - name: Install Playwright OS dependencies (apt)
-        timeout-minutes: 4
-        run: npx playwright install-deps chromium
-
       - name: Generate Paperclip config
         run: |
           mkdir -p ~/.paperclip/instances/default
