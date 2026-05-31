@@ -106,6 +106,7 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
     sourceStatus?: "in_progress" | "done" | "cancelled";
     sourceOriginKind?: string;
     sameRunTerminalEvidence?: "activity" | "comment";
+    watchdogPolicies?: Record<string, unknown>;
   }) {
     const companyId = randomUUID();
     const managerId = randomUUID();
@@ -123,6 +124,7 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
       name: "Watchdog Co",
       issuePrefix,
       requireBoardApprovalForNewAgents: false,
+      policies: opts.watchdogPolicies ? { watchdog: opts.watchdogPolicies } : null,
     });
     await db.insert(agents).values([
       {
@@ -603,6 +605,35 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
       snoozedUntil,
       evaluationIssueId,
     });
+  });
+
+  it("honors a company-configured re-arm window for continue decisions", async () => {
+    const now = new Date("2026-04-22T20:00:00.000Z");
+    const configuredReArmMs = 90 * 60 * 1000; // 90m — distinct from the 30m default
+    const { companyId, managerId, runId } = await seedRunningRun({
+      now,
+      ageMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000,
+      watchdogPolicies: { reArmWindow: configuredReArmMs },
+    });
+    const heartbeat = heartbeatService(db);
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn() });
+
+    const scan = await heartbeat.scanSilentActiveRuns({ now, companyId });
+    const evaluationIssueId = scan.evaluationIssueIds[0];
+    expect(evaluationIssueId).toBeTruthy();
+
+    const decision = await recovery.recordWatchdogDecision({
+      runId,
+      actor: { type: "agent", agentId: managerId },
+      decision: "continue",
+      evaluationIssueId,
+      reason: "Acceptable; re-check after the configured window.",
+      now,
+    });
+
+    // The configured 90m window must be applied, not the hard-coded 30m default.
+    const expectedRearmAt = new Date(now.getTime() + configuredReArmMs);
+    expect(decision.snoozedUntil?.toISOString()).toBe(expectedRearmAt.toISOString());
   });
 
   it("re-arms continue decisions after the default quiet window", async () => {

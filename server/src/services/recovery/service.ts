@@ -1975,13 +1975,22 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     }
 
     const decisionNow = input.now ?? new Date();
-    const effectiveSnoozedUntil = input.decision === "snooze"
-      ? input.snoozedUntil ?? null
-      : input.decision === "continue"
-        ? input.snoozedUntil && input.snoozedUntil > decisionNow
-          ? input.snoozedUntil
-          : new Date(decisionNow.getTime() + ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS)
-        : null;
+    let effectiveSnoozedUntil: Date | null;
+    if (input.decision === "snooze") {
+      effectiveSnoozedUntil = input.snoozedUntil ?? null;
+    } else if (input.decision === "continue") {
+      if (input.snoozedUntil && input.snoozedUntil > decisionNow) {
+        effectiveSnoozedUntil = input.snoozedUntil;
+      } else {
+        // Honor the company-configured re-arm window (watchdog.reArmWindow) so the
+        // re-arm/horizon contract stays portable per doc/execution-semantics.md §11,
+        // falling back to the default when unset.
+        const { reArmWindowMs } = await resolveWatchdogConfig(run.companyId);
+        effectiveSnoozedUntil = new Date(decisionNow.getTime() + reArmWindowMs);
+      }
+    } else {
+      effectiveSnoozedUntil = null;
+    }
 
     const [row] = await db
       .insert(heartbeatRunWatchdogDecisions)
