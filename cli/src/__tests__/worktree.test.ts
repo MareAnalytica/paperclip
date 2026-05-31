@@ -848,7 +848,7 @@ describe("worktree helpers", () => {
     }
   });
 
-  it("reseed preserves the current worktree ports, instance id, and branding", async () => {
+  itEmbeddedPostgres("reseed preserves the current worktree ports, instance id, and branding", async () => {
     const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-worktree-reseed-"));
     const repoRoot = path.join(tempRoot, "repo");
     const sourceRoot = path.join(tempRoot, "source");
@@ -926,7 +926,7 @@ describe("worktree helpers", () => {
       }
       fs.rmSync(tempRoot, { recursive: true, force: true });
     }
-  }, 30_000);
+  }, EMBEDDED_PG_TEST_TIMEOUT_MS);
 
   it("restores the current worktree config and instance data if reseed fails", async () => {
     const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-worktree-reseed-rollback-"));
