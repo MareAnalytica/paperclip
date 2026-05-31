@@ -970,7 +970,8 @@ describeEmbeddedPostgres("watchdog escalation horizon (§11)", () => {
     const { companyId } = await seedHorizonRun({
       now,
       priorReArmWindows: 3, // 3 windows elapsed
-      watchdogPolicies: { maxReArmWindows: 3 }, // company-level override: trip at 3
+      // Contract shape (doc §11): policies.watchdog.escalationHorizon.maxReArmWindows
+      watchdogPolicies: { escalationHorizon: { maxReArmWindows: 3 } }, // override: trip at 3
     });
 
     const recovery = recoveryService(db, {
@@ -989,7 +990,8 @@ describeEmbeddedPostgres("watchdog escalation horizon (§11)", () => {
     const { companyId, runId } = await seedHorizonRun({
       now,
       priorReArmWindows: 0, // no prior decisions needed — maxSilentHours trips first
-      watchdogPolicies: { maxReArmWindows: null, maxSilentHours: 4 },
+      // Contract shape (doc §11): nested under escalationHorizon
+      watchdogPolicies: { escalationHorizon: { maxReArmWindows: null, maxSilentHours: 4 } },
     });
 
     const recovery = recoveryService(db, {
@@ -1006,6 +1008,64 @@ describeEmbeddedPostgres("watchdog escalation horizon (§11)", () => {
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.id, runId));
     expect(activeRun!.status).toBe("running");
+  });
+
+  it("does NOT re-log horizon escalation on repeated scans (§11 idempotency)", async () => {
+    const now = new Date();
+    const { companyId, runId } = await seedHorizonRun({
+      now,
+      priorReArmWindows: 8, // at default horizon — escalates on first scan
+    });
+
+    const recovery = recoveryService(db, {
+      enqueueWakeup: vi.fn(async () => null),
+      issueService: (await import("../services/issues.ts")).issueService(db),
+    });
+
+    // Three consecutive scans with the run still silent and still running.
+    await recovery.scanSilentActiveRuns({ now, companyId });
+    await recovery.scanSilentActiveRuns({ now, companyId });
+    await recovery.scanSilentActiveRuns({ now, companyId });
+
+    // The horizon escalation is a one-time terminal hand-off: exactly one activity entry,
+    // not one per scan. Without the idempotency guard this would be 3.
+    const escalationEvents = await db
+      .select({ id: activityLog.id })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.companyId, companyId),
+          eq(activityLog.runId, runId),
+          eq(activityLog.action, "heartbeat.output_stale_horizon_escalated"),
+        ),
+      );
+    expect(escalationEvents.length).toBe(1);
+
+    // Run still untouched.
+    const [activeRun] = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId));
+    expect(activeRun!.status).toBe("running");
+  });
+
+  it("ignores legacy flat watchdog.maxReArmWindows — contract requires nested escalationHorizon", async () => {
+    const now = new Date();
+    const { companyId } = await seedHorizonRun({
+      now,
+      priorReArmWindows: 3,
+      // Legacy/incorrect flat shape: must be ignored so the default (8) applies, not 3.
+      watchdogPolicies: { maxReArmWindows: 3 },
+    });
+
+    const recovery = recoveryService(db, {
+      enqueueWakeup: vi.fn(async () => null),
+      issueService: (await import("../services/issues.ts")).issueService(db),
+    });
+    const result = await recovery.scanSilentActiveRuns({ now, companyId });
+
+    // 3 < default 8, and the flat shape is not the contract key → no horizon escalation.
+    expect(result.horizonEscalated).toBe(0);
   });
 
   it("source-less run (no contextSnapshot issueId) is in scope for horizon", async () => {

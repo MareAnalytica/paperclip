@@ -751,12 +751,16 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       .limit(1);
     const watchdog = parseObject(parseObject(row?.policies)["watchdog"]);
     const reArmWindowMs = asNumber(watchdog["reArmWindow"], ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS);
-    // null/undefined in policies means "use default"; explicit number overrides
-    const rawMaxReArmWindows = "maxReArmWindows" in watchdog ? watchdog["maxReArmWindows"] : undefined;
+    // §11 horizon config is nested under `escalationHorizon` per the silence-watchdog
+    // contract (doc/execution-semantics.md §11): `watchdog.escalationHorizon.maxReArmWindows`
+    // and `watchdog.escalationHorizon.maxSilentHours`. null/undefined means "use default";
+    // an explicit number overrides.
+    const horizon = parseObject(watchdog["escalationHorizon"]);
+    const rawMaxReArmWindows = "maxReArmWindows" in horizon ? horizon["maxReArmWindows"] : undefined;
     const maxReArmWindows = typeof rawMaxReArmWindows === "number"
       ? rawMaxReArmWindows
       : DEFAULT_WATCHDOG_ESCALATION_MAX_REARM_WINDOWS;
-    const rawMaxSilentHours = "maxSilentHours" in watchdog ? watchdog["maxSilentHours"] : undefined;
+    const rawMaxSilentHours = "maxSilentHours" in horizon ? horizon["maxSilentHours"] : undefined;
     const maxSilentHours = typeof rawMaxSilentHours === "number"
       ? rawMaxSilentHours
       : DEFAULT_WATCHDOG_ESCALATION_MAX_SILENT_HOURS;
@@ -1463,6 +1467,31 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return true;
   }
 
+  // §11 idempotency: a run that has already been horizon-escalated within the current
+  // silence episode must not be re-commented/re-logged on every subsequent scan. Returns
+  // true when a `heartbeat.output_stale_horizon_escalated` activity entry already exists
+  // for this run since silence onset.
+  async function hasHorizonEscalationRecorded(
+    companyId: string,
+    runId: string,
+    silenceStartedAt: Date | null,
+  ): Promise<boolean> {
+    const after = silenceStartedAt ?? new Date(0);
+    const [row] = await db
+      .select({ id: activityLog.id })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.companyId, companyId),
+          eq(activityLog.runId, runId),
+          eq(activityLog.action, "heartbeat.output_stale_horizon_escalated"),
+          gte(activityLog.createdAt, after),
+        ),
+      )
+      .limit(1);
+    return Boolean(row);
+  }
+
   async function escalateToHorizonTerminalDecision(input: {
     run: typeof heartbeatRuns.$inferSelect;
     runningAgent: typeof agents.$inferSelect;
@@ -1470,6 +1499,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     existingEvaluation: Awaited<ReturnType<typeof findOpenStaleRunEvaluation>>;
     reArmWindowsElapsed: number;
     silenceAgeMs: number | null;
+    silenceStartedAt: Date | null;
     now: Date;
   }) {
     // §11: a critical-silent run that has passed the escalation horizon must reach
@@ -1492,6 +1522,15 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     ].join("\n");
 
     if (target) {
+      // §11: the horizon escalation is a one-time terminal hand-off, not a loop. If this run's
+      // current silence episode has already been horizon-escalated, do not re-comment or re-log
+      // on every subsequent scan — just confirm the existing escalated evaluation.
+      if (await hasHorizonEscalationRecorded(input.run.companyId, input.run.id, input.silenceStartedAt)) {
+        if (target.priority !== "critical") {
+          await issuesSvc.update(target.id, { priority: "critical" });
+        }
+        return { kind: "horizon_escalated" as const, evaluationIssueId: target.id };
+      }
       if (target.priority !== "critical") {
         await issuesSvc.update(target.id, { priority: "critical" });
       }
@@ -1666,6 +1705,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           existingEvaluation: existing,
           reArmWindowsElapsed,
           silenceAgeMs,
+          silenceStartedAt,
           now: input.now,
         });
       }
