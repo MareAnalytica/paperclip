@@ -282,7 +282,9 @@ jobs:
 
       - name: Resolve Playwright version
         id: pw
-        run: echo "version=$(node -p 'require(\"@playwright/test/package.json\").version')" >> "$GITHUB_OUTPUT"
+        run: |
+          VERSION=$(node -p "require('@playwright/test/package.json').version")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       # Cache the downloaded browser binaries so a healthy run never re-downloads
       # them, and a node with flaky CDN/DNS egress (DEE-584 variance) restores from
