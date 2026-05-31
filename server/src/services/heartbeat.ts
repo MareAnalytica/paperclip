@@ -1422,6 +1422,29 @@ export function mergeModelProfileAdapterConfig(input: {
   };
 }
 
+/**
+ * Adapter-boundary guard (DEE-659): when a provider fallback engages a
+ * non-claude adapter (grok_local / codex_local), the agent's primary
+ * adapterConfig still carries its claude `model` id (e.g. claude-opus-4-8).
+ * grok-local then invokes `--model claude-opus-4-8` and the CLI rejects it
+ * ("unknown model id"), so the run errors and the agent sticks in
+ * status=error during claude-exhaustion windows. Strip the inherited claude
+ * model from the base config for non-claude fallback adapters so the engaged
+ * adapter uses its own provider-valid default. An explicit provider-appropriate
+ * model supplied by the fallback chain entry, the adapter model profile, or an
+ * issue override still layers on top via the normal merge order.
+ */
+export function stripInheritedModelForNonClaudeFallback(input: {
+  baseConfig: Record<string, unknown>;
+  selectedFallbackAdapterType: string | null;
+}): Record<string, unknown> {
+  const adapterType = input.selectedFallbackAdapterType;
+  if (!adapterType || adapterType === "claude_local") return input.baseConfig;
+  if (!("model" in input.baseConfig)) return input.baseConfig;
+  const { model: _inheritedModel, ...rest } = input.baseConfig;
+  return rest;
+}
+
 function modelProfileRunMetadata(
   modelProfile: ModelProfileApplication,
 ): Record<string, unknown> | null {
@@ -7989,7 +8012,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       delete context.paperclipModelProfile;
     }
     const mergedConfig = mergeModelProfileAdapterConfig({
-      baseConfig: persistedWorkspaceManagedConfig,
+      baseConfig: stripInheritedModelForNonClaudeFallback({
+        baseConfig: persistedWorkspaceManagedConfig,
+        selectedFallbackAdapterType,
+      }),
       modelProfile: modelProfileApplication,
       issueAdapterConfig: selectedFallbackAdapterType
         ? {

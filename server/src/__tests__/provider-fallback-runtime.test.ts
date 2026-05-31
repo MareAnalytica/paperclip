@@ -1,8 +1,10 @@
 import { afterEach, describe, expect, it } from "vitest";
 
 import {
+  mergeModelProfileAdapterConfig,
   parseProviderFallbackChainEnv,
   resolveEffectiveProviderFallbackChain,
+  stripInheritedModelForNonClaudeFallback,
 } from "../services/heartbeat.ts";
 import {
   __setProviderFallbackPolicyForTests,
@@ -116,5 +118,125 @@ describe("resolveEffectiveProviderFallbackChain", () => {
       companyId: "co-1",
     });
     expect(chain).toEqual([]);
+  });
+});
+
+describe("stripInheritedModelForNonClaudeFallback", () => {
+  it("strips the inherited claude model for a grok_local fallback adapter", () => {
+    expect(
+      stripInheritedModelForNonClaudeFallback({
+        baseConfig: { model: "claude-opus-4-8", command: "claude", env: { A: "1" } },
+        selectedFallbackAdapterType: "grok_local",
+      }),
+    ).toEqual({ command: "claude", env: { A: "1" } });
+  });
+
+  it("also strips the inherited claude model for codex_local", () => {
+    expect(
+      stripInheritedModelForNonClaudeFallback({
+        baseConfig: { model: "claude-opus-4-8" },
+        selectedFallbackAdapterType: "codex_local",
+      }),
+    ).toEqual({});
+  });
+
+  it("preserves the model for a claude_local fallback adapter", () => {
+    const base = { model: "claude-opus-4-8", account: "aflabox" };
+    expect(
+      stripInheritedModelForNonClaudeFallback({
+        baseConfig: base,
+        selectedFallbackAdapterType: "claude_local",
+      }),
+    ).toBe(base);
+  });
+
+  it("preserves the model when no fallback adapter is engaged", () => {
+    const base = { model: "claude-opus-4-8" };
+    expect(
+      stripInheritedModelForNonClaudeFallback({
+        baseConfig: base,
+        selectedFallbackAdapterType: null,
+      }),
+    ).toBe(base);
+  });
+
+  it("is a no-op when the base config carries no model", () => {
+    const base = { command: "/paperclip/.grok/bin/grok" };
+    expect(
+      stripInheritedModelForNonClaudeFallback({
+        baseConfig: base,
+        selectedFallbackAdapterType: "grok_local",
+      }),
+    ).toBe(base);
+  });
+
+  it("does not mutate the input base config", () => {
+    const base = { model: "claude-opus-4-8", command: "claude" };
+    stripInheritedModelForNonClaudeFallback({
+      baseConfig: base,
+      selectedFallbackAdapterType: "grok_local",
+    });
+    expect(base).toEqual({ model: "claude-opus-4-8", command: "claude" });
+  });
+});
+
+describe("provider fallback model boundary (merge integration)", () => {
+  it("grok fallback receives no claude model id so the adapter uses its own default", () => {
+    const merged = mergeModelProfileAdapterConfig({
+      baseConfig: stripInheritedModelForNonClaudeFallback({
+        baseConfig: { model: "claude-opus-4-8", command: "/paperclip/.grok/bin/grok" },
+        selectedFallbackAdapterType: "grok_local",
+      }),
+      modelProfile: {
+        requested: null,
+        requestedBy: null,
+        applied: null,
+        configSource: null,
+        fallbackReason: null,
+        adapterConfig: null,
+      },
+      issueAdapterConfig: { command: "/paperclip/.grok/bin/grok" },
+    });
+    expect(merged.model).toBeUndefined();
+    expect("model" in merged).toBe(false);
+    expect(merged.command).toBe("/paperclip/.grok/bin/grok");
+  });
+
+  it("a provider-valid chain-entry model still wins for a non-claude fallback", () => {
+    const merged = mergeModelProfileAdapterConfig({
+      baseConfig: stripInheritedModelForNonClaudeFallback({
+        baseConfig: { model: "claude-opus-4-8" },
+        selectedFallbackAdapterType: "codex_local",
+      }),
+      modelProfile: {
+        requested: null,
+        requestedBy: null,
+        applied: null,
+        configSource: null,
+        fallbackReason: null,
+        adapterConfig: null,
+      },
+      issueAdapterConfig: { command: "codex", model: "gpt-5.3-codex" },
+    });
+    expect(merged.model).toBe("gpt-5.3-codex");
+  });
+
+  it("claude fallback keeps the inherited claude model", () => {
+    const merged = mergeModelProfileAdapterConfig({
+      baseConfig: stripInheritedModelForNonClaudeFallback({
+        baseConfig: { model: "claude-opus-4-8" },
+        selectedFallbackAdapterType: "claude_local",
+      }),
+      modelProfile: {
+        requested: null,
+        requestedBy: null,
+        applied: null,
+        configSource: null,
+        fallbackReason: null,
+        adapterConfig: null,
+      },
+      issueAdapterConfig: { account: "aflabox" },
+    });
+    expect(merged.model).toBe("claude-opus-4-8");
   });
 });
