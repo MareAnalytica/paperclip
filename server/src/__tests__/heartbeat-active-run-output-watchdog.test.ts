@@ -265,6 +265,195 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
     expect(evaluations[0]?.description).not.toContain("sk-test-secret-value");
   });
 
+  it("re-arms an evaluation auto-resolved without an explicit decision instead of re-creating it every scan (§10)", async () => {
+    // Regression for the 314-issue churn: an evaluation auto-resolved to `done`
+    // with no recorded watchdog decision previously left no re-arm window, so the
+    // next ~60s scan re-created it. The creation-side dedupe must count the
+    // recently-resolved action and back-fill a `continue` decision.
+    const now = new Date("2026-04-22T20:00:00.000Z");
+    const { companyId, runId } = await seedRunningRun({
+      now,
+      ageMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const first = await heartbeat.scanSilentActiveRuns({ now, companyId });
+    expect(first.created).toBe(1);
+    const firstEvaluationId = first.evaluationIssueIds[0];
+    expect(firstEvaluationId).toBeTruthy();
+
+    // The owner marks it done WITHOUT calling the watchdog-decision route — the
+    // exact path that produced the churn.
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, firstEvaluationId));
+
+    // Next scan, still inside the re-arm window: no new evaluation, an explicit
+    // `continue` decision is back-filled, and the run is counted as re-armed.
+    const second = await heartbeat.scanSilentActiveRuns({ now, companyId });
+    expect(second).toMatchObject({ created: 0, rearmed: 1 });
+
+    const decisions = await db
+      .select()
+      .from(heartbeatRunWatchdogDecisions)
+      .where(and(eq(heartbeatRunWatchdogDecisions.companyId, companyId), eq(heartbeatRunWatchdogDecisions.runId, runId)));
+    expect(decisions).toHaveLength(1);
+    expect(decisions[0]).toMatchObject({ decision: "continue", evaluationIssueId: firstEvaluationId });
+    expect(decisions[0]?.snoozedUntil?.toISOString()).toBe(
+      new Date(now.getTime() + ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS).toISOString(),
+    );
+
+    // A third scan still inside the window stays quiet (no second re-arm).
+    const third = await heartbeat.scanSilentActiveRuns({
+      now: new Date(now.getTime() + ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS - 60_000),
+      companyId,
+    });
+    expect(third).toMatchObject({ created: 0, rearmed: 0, snoozed: 1 });
+
+    // After the window elapses, a single fresh evaluation is minted (not 314).
+    const afterWindow = await heartbeat.scanSilentActiveRuns({
+      now: new Date(now.getTime() + ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS + 60_000),
+      companyId,
+    });
+    expect(afterWindow.created).toBe(1);
+    expect(afterWindow.evaluationIssueIds[0]).not.toBe(firstEvaluationId);
+  });
+
+  it("honors the company-configured re-arm window for explicit and back-filled continues (§10)", async () => {
+    const now = new Date("2026-04-22T20:00:00.000Z");
+    const { companyId, managerId, runId } = await seedRunningRun({
+      now,
+      ageMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000,
+    });
+    const customReArmMs = 90 * 60 * 1000;
+    expect(customReArmMs).not.toBe(ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS);
+    await db
+      .update(companies)
+      .set({ policies: { watchdog: { reArmWindow: customReArmMs } } })
+      .where(eq(companies.id, companyId));
+    const heartbeat = heartbeatService(db);
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn() });
+
+    const scan = await heartbeat.scanSilentActiveRuns({ now, companyId });
+    const evaluationIssueId = scan.evaluationIssueIds[0];
+    expect(evaluationIssueId).toBeTruthy();
+
+    // Explicit continue uses the configured window.
+    const decision = await recovery.recordWatchdogDecision({
+      runId,
+      actor: { type: "agent", agentId: managerId },
+      decision: "continue",
+      evaluationIssueId,
+      reason: "Acceptable evidence; keep watching on the configured window.",
+      now,
+    });
+    expect(decision.snoozedUntil?.toISOString()).toBe(
+      new Date(now.getTime() + customReArmMs).toISOString(),
+    );
+
+    // The configured window also suppresses re-creation: nothing before it, a
+    // fresh evaluation only after it elapses.
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, evaluationIssueId));
+    const beforeDefault = await heartbeat.scanSilentActiveRuns({
+      now: new Date(now.getTime() + ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS + 60_000),
+      companyId,
+    });
+    expect(beforeDefault).toMatchObject({ created: 0, snoozed: 1 });
+    const afterCustom = await heartbeat.scanSilentActiveRuns({
+      now: new Date(now.getTime() + customReArmMs + 60_000),
+      companyId,
+    });
+    expect(afterCustom.created).toBe(1);
+  });
+
+  it("creation dedup and re-arm cover source-less timer/system runs (§10)", async () => {
+    // Source-less runs (no linked source issue) are first-class: they cannot fold
+    // (§10), so they rely entirely on the creation-side (companyId, runId) dedupe
+    // and re-arm window.
+    const now = new Date("2026-04-22T20:00:00.000Z");
+    const companyId = randomUUID();
+    const managerId = randomUUID();
+    const workerId = randomUUID();
+    const runId = randomUUID();
+    const issuePrefix = `S${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const silenceMs = ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000;
+    const startedAt = new Date(now.getTime() - silenceMs);
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Sourceless Watchdog Co",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values([
+      {
+        id: managerId,
+        companyId,
+        name: "CTO",
+        role: "cto",
+        status: "idle",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: workerId,
+        companyId,
+        name: "Timer Worker",
+        role: "engineer",
+        status: "running",
+        reportsTo: managerId,
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+    ]);
+    // Source-less: a timer/system run with no linked source issue in its context.
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId: workerId,
+      status: "running",
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      startedAt,
+      processStartedAt: startedAt,
+      lastOutputAt: null,
+      lastOutputSeq: 0,
+      lastOutputStream: null,
+      contextSnapshot: {},
+      logBytes: 0,
+    });
+
+    const heartbeat = heartbeatService(db);
+
+    // Exactly one evaluation, then open-evaluation dedup keyed on (companyId, runId).
+    const scan1 = await heartbeat.scanSilentActiveRuns({ now, companyId });
+    expect(scan1).toMatchObject({ created: 1 });
+    const evaluationIssueId = scan1.evaluationIssueIds[0];
+    expect(evaluationIssueId).toBeTruthy();
+    const scan2 = await heartbeat.scanSilentActiveRuns({ now, companyId });
+    expect(scan2).toMatchObject({ created: 0, existing: 1 });
+
+    // Auto-resolved without a decision — source-less runs are re-armed too.
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, evaluationIssueId));
+    const scan3 = await heartbeat.scanSilentActiveRuns({ now, companyId });
+    expect(scan3).toMatchObject({ created: 0, rearmed: 1 });
+
+    const rearmAt = new Date(now.getTime() + ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS);
+    const beforeRearm = await heartbeat.scanSilentActiveRuns({
+      now: new Date(rearmAt.getTime() - 60_000),
+      companyId,
+    });
+    expect(beforeRearm).toMatchObject({ created: 0, snoozed: 1 });
+    const afterRearm = await heartbeat.scanSilentActiveRuns({
+      now: new Date(rearmAt.getTime() + 60_000),
+      companyId,
+    });
+    expect(afterRearm.created).toBe(1);
+    expect(afterRearm.evaluationIssueIds[0]).not.toBe(evaluationIssueId);
+  });
+
   it("redacts sensitive values from actual run-log evidence", async () => {
     const now = new Date("2026-04-22T20:00:00.000Z");
     const leakedJwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";
