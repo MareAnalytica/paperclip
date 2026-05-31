@@ -22,6 +22,8 @@ import {
 import {
   ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS,
   ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS,
+  ACTIVE_RUN_OUTPUT_REARM_MAX_MS,
+  ACTIVE_RUN_OUTPUT_REARM_MIN_MS,
   ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS,
   heartbeatService,
 } from "../services/heartbeat.ts";
@@ -362,6 +364,69 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
       companyId,
     });
     expect(afterCustom.created).toBe(1);
+  });
+
+  it("clamps a misconfigured re-arm window to operational bounds (§10/ELI-776)", async () => {
+    // A `0`/negative window would re-create an evaluation every ~60s scan (the
+    // exact churn this contract stops); an absurd window would suppress watchdog
+    // review of a critical-silent run indefinitely. Both are clamped, not honored.
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn() });
+
+    // Disarming value (0) → clamped up to the floor.
+    {
+      const { companyId, managerId, runId } = await seedRunningRun({
+        now: new Date("2026-04-22T20:00:00.000Z"),
+        ageMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000,
+      });
+      const now = new Date("2026-04-22T20:00:00.000Z");
+      await db
+        .update(companies)
+        .set({ policies: { watchdog: { reArmWindow: 0 } } })
+        .where(eq(companies.id, companyId));
+      const heartbeat = heartbeatService(db);
+      const scan = await heartbeat.scanSilentActiveRuns({ now, companyId });
+      const evaluationIssueId = scan.evaluationIssueIds[0];
+      expect(evaluationIssueId).toBeTruthy();
+      const decision = await recovery.recordWatchdogDecision({
+        runId,
+        actor: { type: "agent", agentId: managerId },
+        decision: "continue",
+        evaluationIssueId,
+        reason: "Misconfigured (0) window must be clamped to the floor.",
+        now,
+      });
+      expect(decision.snoozedUntil?.toISOString()).toBe(
+        new Date(now.getTime() + ACTIVE_RUN_OUTPUT_REARM_MIN_MS).toISOString(),
+      );
+    }
+
+    // Absurdly large value → clamped down to the ceiling.
+    {
+      const { companyId, managerId, runId } = await seedRunningRun({
+        now: new Date("2026-04-22T20:00:00.000Z"),
+        ageMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000,
+      });
+      const now = new Date("2026-04-22T20:00:00.000Z");
+      await db
+        .update(companies)
+        .set({ policies: { watchdog: { reArmWindow: 365 * 24 * 60 * 60 * 1000 } } })
+        .where(eq(companies.id, companyId));
+      const heartbeat = heartbeatService(db);
+      const scan = await heartbeat.scanSilentActiveRuns({ now, companyId });
+      const evaluationIssueId = scan.evaluationIssueIds[0];
+      expect(evaluationIssueId).toBeTruthy();
+      const decision = await recovery.recordWatchdogDecision({
+        runId,
+        actor: { type: "agent", agentId: managerId },
+        decision: "continue",
+        evaluationIssueId,
+        reason: "Absurd window must be clamped to the ceiling.",
+        now,
+      });
+      expect(decision.snoozedUntil?.toISOString()).toBe(
+        new Date(now.getTime() + ACTIVE_RUN_OUTPUT_REARM_MAX_MS).toISOString(),
+      );
+    }
   });
 
   it("creation dedup and re-arm cover source-less timer/system runs (§10)", async () => {

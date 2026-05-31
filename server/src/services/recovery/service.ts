@@ -75,6 +75,16 @@ export const ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS = 30 * 60 * 1000;
 const DEFAULT_WATCHDOG_ESCALATION_MAX_REARM_WINDOWS = 8; // ~4h at default 30m reArm
 const DEFAULT_WATCHDOG_ESCALATION_MAX_SILENT_HOURS: number | null = null; // disabled by default
 
+// §10 re-arm window clamp (CTO verdict ELI-776): the configurable
+// `companies.policies.watchdog.reArmWindow` is clamped to a sane operational
+// range. A window at or below the ~60s scan cadence would re-create an
+// evaluation every scan — the exact churn this contract exists to stop — and an
+// absurdly large window would silently suppress watchdog review of a
+// critical-silent run, which §11 requires an operator to see. So a misconfigured
+// `0`/negative/tiny value is clamped up to the floor and an absurd value down to
+// the ceiling, with a warning, rather than being honored verbatim.
+export const ACTIVE_RUN_OUTPUT_REARM_MIN_MS = 5 * 60 * 1000;
+export const ACTIVE_RUN_OUTPUT_REARM_MAX_MS = 24 * 60 * 60 * 1000;
 export type WatchdogConfig = {
   reArmWindowMs: number;
   escalationHorizon: {
@@ -750,7 +760,27 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       .where(eq(companies.id, companyId))
       .limit(1);
     const watchdog = parseObject(parseObject(row?.policies)["watchdog"]);
-    const reArmWindowMs = asNumber(watchdog["reArmWindow"], ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS);
+    // §10 re-arm window: absent/non-numeric falls back to the default; an explicit
+    // finite number overrides but is clamped to [MIN, MAX] (ELI-776) so a
+    // misconfigured value can never disarm the watchdog (≤ scan cadence) or
+    // indefinitely suppress review of a critical-silent run (absurdly large).
+    const requestedReArmWindowMs = asNumber(watchdog["reArmWindow"], ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS);
+    const reArmWindowMs = Math.min(
+      ACTIVE_RUN_OUTPUT_REARM_MAX_MS,
+      Math.max(ACTIVE_RUN_OUTPUT_REARM_MIN_MS, requestedReArmWindowMs),
+    );
+    if (reArmWindowMs !== requestedReArmWindowMs) {
+      logger.warn(
+        {
+          companyId,
+          requestedReArmWindowMs,
+          clampedReArmWindowMs: reArmWindowMs,
+          minMs: ACTIVE_RUN_OUTPUT_REARM_MIN_MS,
+          maxMs: ACTIVE_RUN_OUTPUT_REARM_MAX_MS,
+        },
+        "watchdog reArmWindow out of range; clamped to operational bounds (§10/ELI-776)",
+      );
+    }
     // §11 horizon config is nested under `escalationHorizon` per the silence-watchdog
     // contract (doc/execution-semantics.md §11): `watchdog.escalationHorizon.maxReArmWindows`
     // and `watchdog.escalationHorizon.maxSilentHours`. Resolution semantics (DEE-583 F2):
