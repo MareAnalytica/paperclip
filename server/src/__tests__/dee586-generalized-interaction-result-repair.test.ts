@@ -223,6 +223,32 @@ describeEmbeddedPostgres("DEE-586 generalized interaction-result repair migratio
     expect(rc?.result).toMatchObject({ version: 1, outcome: "accepted", reason: "looks good" });
   });
 
+  it("repairs a string version \"1\" (zod requires numeric literal 1) and a scalar result", async () => {
+    const { companyId, issueId } = await seedIssue();
+    // version is the JSON string "1", not the number 1 -> fails z.literal(1).
+    const strVerId = await insertRow({
+      companyId, issueId, kind: "request_confirmation", status: "rejected",
+      payloadJson: '{"version":1,"prompt":"Confirm?"}',
+      resultJson: '{"version":"1","outcome":"rejected"}',
+    });
+    // result is a bare JSON scalar (not an object) -> jsonb || must not array-concat it.
+    const scalarId = await insertRow({
+      companyId, issueId, kind: "request_confirmation", status: "cancelled",
+      payloadJson: '{"version":1,"prompt":"Confirm?"}',
+      resultJson: '"declined"',
+    });
+
+    await runRepair();
+
+    const strVer = await interactionsSvc.getById(strVerId);
+    expect(strVer?.result).toMatchObject({ version: 1, outcome: "rejected" });
+    expect(strVer?.unparseableResult).toBeFalsy();
+
+    const scalar = await interactionsSvc.getById(scalarId);
+    expect(scalar?.result).toMatchObject({ version: 1, outcome: "cancelled" });
+    expect(scalar?.unparseableResult).toBeFalsy();
+  });
+
   it("resets a pending row with a non-null malformed result back to NULL", async () => {
     const { companyId, issueId } = await seedIssue();
     const id = await insertRow({

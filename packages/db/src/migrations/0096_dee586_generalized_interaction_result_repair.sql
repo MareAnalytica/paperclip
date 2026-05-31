@@ -43,7 +43,7 @@ UPDATE "issue_thread_interactions"
 SET "result" =
       -- Preserve existing fields; backfill version; only override outcome when it is
       -- missing / out-of-enum (don't clobber a valid recorded outcome or its reason).
-      COALESCE("result", '{}'::jsonb)
+      (CASE WHEN jsonb_typeof("result") = 'object' THEN "result" ELSE '{}'::jsonb END)
       || jsonb_build_object('version', 1)
       || CASE
            WHEN "result" ->> 'outcome' IN
@@ -67,7 +67,7 @@ WHERE "kind" = 'request_confirmation'
   -- IS NOT TRUE (not NOT (...)) so rows missing version/outcome — where the predicate is
   -- NULL under SQL three-valued logic, e.g. the ELI-795 {"reason":...} shape — are still swept.
   AND (
-    ("result" ->> 'version') = '1'
+    ("result" -> 'version') = '1'::jsonb
     AND "result" ->> 'outcome' IN
       ('accepted','rejected','cancelled','superseded_by_comment','stale_target','issue_terminal_status')
   ) IS NOT TRUE;
@@ -79,7 +79,7 @@ SET "result" =
       -- Preserve existing fields; backfill version; only reset answers (to an empty
       -- cancelled shape) when the recorded answers are not a valid array, so real
       -- user answers that merely lack version:1 are kept.
-      COALESCE("result", '{}'::jsonb)
+      (CASE WHEN jsonb_typeof("result") = 'object' THEN "result" ELSE '{}'::jsonb END)
       || jsonb_build_object('version', 1)
       || CASE
            WHEN jsonb_typeof("result" -> 'answers') = 'array'
@@ -95,7 +95,7 @@ WHERE "kind" = 'ask_user_questions'
   AND "status" <> 'pending'
   AND "result" IS NOT NULL
   AND (
-    ("result" ->> 'version') = '1'
+    ("result" -> 'version') = '1'::jsonb
     AND jsonb_typeof("result" -> 'answers') = 'array'
   ) IS NOT TRUE;
 --> statement-breakpoint
@@ -106,7 +106,7 @@ SET "result" =
       -- Preserve existing fields; backfill version; only coerce createdTasks /
       -- skippedClientKeys to [] when they are present but not arrays, so real
       -- created-task data that merely lacks version:1 is kept.
-      COALESCE("result", '{}'::jsonb)
+      (CASE WHEN jsonb_typeof("result") = 'object' THEN "result" ELSE '{}'::jsonb END)
       || jsonb_build_object('version', 1)
       || CASE WHEN "result" -> 'createdTasks' IS NOT NULL AND jsonb_typeof("result" -> 'createdTasks') <> 'array'
            THEN jsonb_build_object('createdTasks', '[]'::jsonb) ELSE '{}'::jsonb END
@@ -117,7 +117,7 @@ WHERE "kind" = 'suggest_tasks'
   AND "status" <> 'pending'
   AND "result" IS NOT NULL
   AND (
-    ("result" ->> 'version') = '1'
+    ("result" -> 'version') = '1'::jsonb
     AND ("result" -> 'createdTasks' IS NULL OR jsonb_typeof("result" -> 'createdTasks') = 'array')
     AND ("result" -> 'skippedClientKeys' IS NULL OR jsonb_typeof("result" -> 'skippedClientKeys') = 'array')
   ) IS NOT TRUE;
@@ -131,14 +131,14 @@ WHERE "status" = 'pending'
   AND "result" IS NOT NULL
   AND (
     ("kind" = 'request_confirmation'
-       AND ("result" ->> 'version') = '1'
+       AND ("result" -> 'version') = '1'::jsonb
        AND "result" ->> 'outcome' IN
          ('accepted','rejected','cancelled','superseded_by_comment','stale_target','issue_terminal_status'))
     OR ("kind" = 'ask_user_questions'
-       AND ("result" ->> 'version') = '1'
+       AND ("result" -> 'version') = '1'::jsonb
        AND jsonb_typeof("result" -> 'answers') = 'array')
     OR ("kind" = 'suggest_tasks'
-       AND ("result" ->> 'version') = '1'
+       AND ("result" -> 'version') = '1'::jsonb
        AND ("result" -> 'createdTasks' IS NULL OR jsonb_typeof("result" -> 'createdTasks') = 'array')
        AND ("result" -> 'skippedClientKeys' IS NULL OR jsonb_typeof("result" -> 'skippedClientKeys') = 'array'))
   ) IS NOT TRUE;
