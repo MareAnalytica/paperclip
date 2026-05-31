@@ -1568,7 +1568,24 @@ export async function worktreeMakeCommand(nameArg: string, opts: WorktreeMakeOpt
   }
 }
 
+function shouldSkipDependencyInstall(): boolean {
+  // Skip the real `pnpm install` under test runs. The install is best-effort
+  // (failures are swallowed below) and no test asserts its behaviour, so running
+  // it only adds network/registry flakiness and several seconds of wall-clock to
+  // the worktree-seed/reseed tests — the dominant cost behind the DEE-637 CI
+  // timeouts. An explicit env flag wins in either direction; otherwise we
+  // auto-detect vitest so current and future cli tests never shell out to pnpm.
+  const flag = process.env.PAPERCLIP_WORKTREE_SKIP_INSTALL;
+  if (flag !== undefined) {
+    return flag !== "" && flag !== "0" && flag.toLowerCase() !== "false";
+  }
+  return process.env.VITEST === "true";
+}
+
 function installDependenciesBestEffort(targetPath: string): void {
+  if (shouldSkipDependencyInstall()) {
+    return;
+  }
   const installSpinner = p.spinner();
   installSpinner.start("Installing dependencies...");
   try {
