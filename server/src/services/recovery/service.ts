@@ -1521,6 +1521,21 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     // into a horizon-escalated state and records the activity. It MUST NOT auto-cancel
     // or otherwise mutate the live run — only the operator can do that.
     const target = input.existingEvaluation;
+
+    // §11: the horizon escalation is a one-time terminal hand-off, not a loop. If this run's
+    // current silence episode has ALREADY been horizon-escalated, never re-comment, re-log, or
+    // create a second [Horizon] issue — regardless of whether the prior evaluation issue is
+    // still open. This guard must precede the open-evaluation/create split: an operator who
+    // closed the evaluation without acting on the live run has still received the terminal
+    // hand-off, and `findOpenStaleRunEvaluation` returning null must NOT let the create branch
+    // manufacture a duplicate escalation for the same silence episode (DEE-583, Codex P2).
+    if (await hasHorizonEscalationRecorded(input.run.companyId, input.run.id, input.silenceStartedAt)) {
+      if (target && target.priority !== "critical") {
+        await issuesSvc.update(target.id, { priority: "critical" });
+      }
+      return { kind: "horizon_escalated" as const, evaluationIssueId: target?.id ?? null };
+    }
+
     const body = [
       "## Watchdog escalation horizon reached",
       "",
@@ -1535,15 +1550,6 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     ].join("\n");
 
     if (target) {
-      // §11: the horizon escalation is a one-time terminal hand-off, not a loop. If this run's
-      // current silence episode has already been horizon-escalated, do not re-comment or re-log
-      // on every subsequent scan — just confirm the existing escalated evaluation.
-      if (await hasHorizonEscalationRecorded(input.run.companyId, input.run.id, input.silenceStartedAt)) {
-        if (target.priority !== "critical") {
-          await issuesSvc.update(target.id, { priority: "critical" });
-        }
-        return { kind: "horizon_escalated" as const, evaluationIssueId: target.id };
-      }
       if (target.priority !== "critical") {
         await issuesSvc.update(target.id, { priority: "critical" });
       }

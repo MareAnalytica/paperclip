@@ -1113,6 +1113,63 @@ describeEmbeddedPostgres("watchdog escalation horizon (§11)", () => {
     expect(activeRun!.status).toBe("running");
   });
 
+  it("does NOT re-escalate after the horizon evaluation is closed while the run stays silent (§11 one-time hand-off)", async () => {
+    // Codex P2 (DEE-583): the idempotency guard previously lived only inside the
+    // open-evaluation branch. If an operator closed/cancelled the [Horizon] evaluation
+    // while the run remained running and silent, the next scan found no open evaluation
+    // and the create branch manufactured a SECOND escalation + duplicate activity log.
+    const now = new Date();
+    const { companyId, runId } = await seedHorizonRun({
+      now,
+      priorReArmWindows: 8, // at default horizon — escalates on first scan
+    });
+
+    const recovery = recoveryService(db, {
+      enqueueWakeup: vi.fn(async () => null),
+    });
+
+    // First scan escalates and creates the [Horizon] evaluation issue.
+    const first = await recovery.scanSilentActiveRuns({ now, companyId });
+    expect(first.horizonEscalated).toBe(1);
+
+    // Operator closes the evaluation issue (cancel) WITHOUT stopping the live run.
+    await db
+      .update(issues)
+      .set({ status: "cancelled" })
+      .where(and(eq(issues.companyId, companyId), eq(issues.originId, runId)));
+
+    // Second scan: run still silent + still running, but the prior escalation already
+    // happened for this silence episode → must NOT create a second [Horizon] issue or
+    // log a second escalation.
+    await recovery.scanSilentActiveRuns({ now, companyId });
+
+    const escalationEvents = await db
+      .select({ id: activityLog.id })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.companyId, companyId),
+          eq(activityLog.runId, runId),
+          eq(activityLog.action, "heartbeat.output_stale_horizon_escalated"),
+        ),
+      );
+    expect(escalationEvents.length).toBe(1);
+
+    // Exactly one stale-run evaluation issue ever created for this run (no duplicate [Horizon]).
+    const evalIssues = await db
+      .select({ id: issues.id })
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.originId, runId)));
+    expect(evalIssues.length).toBe(1);
+
+    // Live run still untouched.
+    const [activeRun] = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId));
+    expect(activeRun!.status).toBe("running");
+  });
+
   it("does NOT count pre-critical (suspicious-phase) re-arm windows toward the §11 horizon", async () => {
     const now = new Date();
     // No post-critical windows; the run is just past the critical threshold.
