@@ -15,6 +15,10 @@
 -- such a row to null instead of 400-ing, but a degraded row lingers (unparseableResult);
 -- this cleans the data so reads return the real outcome and terminal transitions are sound.
 --
+-- DATA-PRESERVING: each repair merges (||) onto the existing result — it backfills version:1
+-- and ONLY rewrites the specific field that is invalid (outcome / answers / createdTasks /
+-- skippedClientKeys). A row whose sole fault is a missing version keeps all its real data.
+--
 -- Validity predicates mirror packages/shared/src/validators/issue.ts:
 --   requestConfirmationResultSchema (version literal 1 + outcome in 6-value enum)
 --   askUserQuestionsResultSchema    (version literal 1 + answers array)
@@ -34,19 +38,28 @@
 -- (expirePendingForTerminalIssue). A pending row with a non-null malformed result is corrupt;
 -- we reset it to NULL (the valid pending shape) rather than fabricate a resolution.
 
--- 1) request_confirmation: non-pending, malformed result -> status-aware valid outcome
+-- 1) request_confirmation: backfill version; replace only a missing/out-of-enum outcome
 UPDATE "issue_thread_interactions"
-SET "result" = jsonb_build_object(
-      'version', 1,
-      'outcome', CASE "status"
-        WHEN 'accepted'  THEN 'accepted'
-        WHEN 'rejected'  THEN 'rejected'
-        WHEN 'cancelled' THEN 'cancelled'
-        WHEN 'expired'   THEN 'issue_terminal_status'
-        ELSE 'cancelled'          -- answered/failed/other -> safe terminal
-      END,
-      'reason', 'Backfilled by DEE-586 generalized interaction-result repair (original result failed requestConfirmationResultSchema).'
-    ),
+SET "result" =
+      -- Preserve existing fields; backfill version; only override outcome when it is
+      -- missing / out-of-enum (don't clobber a valid recorded outcome or its reason).
+      COALESCE("result", '{}'::jsonb)
+      || jsonb_build_object('version', 1)
+      || CASE
+           WHEN "result" ->> 'outcome' IN
+             ('accepted','rejected','cancelled','superseded_by_comment','stale_target','issue_terminal_status')
+           THEN '{}'::jsonb
+           ELSE jsonb_build_object(
+             'outcome', CASE "status"
+               WHEN 'accepted'  THEN 'accepted'
+               WHEN 'rejected'  THEN 'rejected'
+               WHEN 'cancelled' THEN 'cancelled'
+               WHEN 'expired'   THEN 'issue_terminal_status'
+               ELSE 'cancelled'          -- answered/failed/other -> safe terminal
+             END,
+             'reason', 'Backfilled by DEE-586 generalized interaction-result repair (outcome was missing/out-of-enum).'
+           )
+         END,
     "updated_at" = now()
 WHERE "kind" = 'request_confirmation'
   AND "status" <> 'pending'
@@ -59,15 +72,23 @@ WHERE "kind" = 'request_confirmation'
       ('accepted','rejected','cancelled','superseded_by_comment','stale_target','issue_terminal_status')
   ) IS NOT TRUE;
 
--- 2) ask_user_questions: non-pending, malformed result -> cancelled-shape valid result
+-- 2) ask_user_questions: backfill version; reset only a non-array answers field
 UPDATE "issue_thread_interactions"
-SET "result" = jsonb_build_object(
-      'version', 1,
-      'answers', '[]'::jsonb,
-      'cancelled', true,
-      'cancellationReason', 'Backfilled by DEE-586 generalized interaction-result repair (original result failed askUserQuestionsResultSchema).',
-      'summaryMarkdown', NULL
-    ),
+SET "result" =
+      -- Preserve existing fields; backfill version; only reset answers (to an empty
+      -- cancelled shape) when the recorded answers are not a valid array, so real
+      -- user answers that merely lack version:1 are kept.
+      COALESCE("result", '{}'::jsonb)
+      || jsonb_build_object('version', 1)
+      || CASE
+           WHEN jsonb_typeof("result" -> 'answers') = 'array'
+           THEN '{}'::jsonb
+           ELSE jsonb_build_object(
+             'answers', '[]'::jsonb,
+             'cancelled', true,
+             'cancellationReason', 'Backfilled by DEE-586 generalized interaction-result repair (answers were missing/not an array).'
+           )
+         END,
     "updated_at" = now()
 WHERE "kind" = 'ask_user_questions'
   AND "status" <> 'pending'
@@ -77,14 +98,18 @@ WHERE "kind" = 'ask_user_questions'
     AND jsonb_typeof("result" -> 'answers') = 'array'
   ) IS NOT TRUE;
 
--- 3) suggest_tasks: non-pending, malformed result -> empty valid result
+-- 3) suggest_tasks: backfill version; coerce only a non-array createdTasks/skippedClientKeys
 UPDATE "issue_thread_interactions"
-SET "result" = jsonb_build_object(
-      'version', 1,
-      'createdTasks', '[]'::jsonb,
-      'skippedClientKeys', '[]'::jsonb,
-      'rejectionReason', 'Backfilled by DEE-586 generalized interaction-result repair (original result failed suggestTasksResultSchema).'
-    ),
+SET "result" =
+      -- Preserve existing fields; backfill version; only coerce createdTasks /
+      -- skippedClientKeys to [] when they are present but not arrays, so real
+      -- created-task data that merely lacks version:1 is kept.
+      COALESCE("result", '{}'::jsonb)
+      || jsonb_build_object('version', 1)
+      || CASE WHEN "result" -> 'createdTasks' IS NOT NULL AND jsonb_typeof("result" -> 'createdTasks') <> 'array'
+           THEN jsonb_build_object('createdTasks', '[]'::jsonb) ELSE '{}'::jsonb END
+      || CASE WHEN "result" -> 'skippedClientKeys' IS NOT NULL AND jsonb_typeof("result" -> 'skippedClientKeys') <> 'array'
+           THEN jsonb_build_object('skippedClientKeys', '[]'::jsonb) ELSE '{}'::jsonb END,
     "updated_at" = now()
 WHERE "kind" = 'suggest_tasks'
   AND "status" <> 'pending'

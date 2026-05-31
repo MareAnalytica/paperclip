@@ -189,6 +189,33 @@ describeEmbeddedPostgres("DEE-586 generalized interaction-result repair migratio
     expect(repaired?.unparseableResult).toBeFalsy();
   });
 
+  it("preserves real data when the only fault is a missing version (Codex P1)", async () => {
+    const { companyId, issueId } = await seedIssue();
+    // ask_user_questions: valid recorded answers but no version:1 -> must KEEP the answers.
+    const askId = await insertRow({
+      companyId, issueId, kind: "ask_user_questions", status: "answered",
+      payloadJson: '{"version":1,"questions":[{"id":"q1","prompt":"Pick","selectionMode":"single","options":[{"id":"o1","label":"A"}]}]}',
+      resultJson: '{"answers":[{"questionId":"q1","optionIds":["o1"]}]}',
+    });
+    // request_confirmation: valid outcome but no version:1 -> must KEEP outcome "accepted".
+    const rcId = await insertRow({
+      companyId, issueId, kind: "request_confirmation", status: "accepted",
+      payloadJson: '{"version":1,"prompt":"Confirm?"}',
+      resultJson: '{"outcome":"accepted","reason":"looks good"}',
+    });
+
+    await runRepair();
+
+    const ask = await interactionsSvc.getById(askId);
+    expect(ask?.result).toMatchObject({ version: 1 });
+    const answers = (ask?.result as { answers: Array<{ questionId: string }> }).answers;
+    expect(answers).toHaveLength(1);
+    expect(answers[0].questionId).toBe("q1"); // real answer preserved, NOT wiped to []
+
+    const rc = await interactionsSvc.getById(rcId);
+    expect(rc?.result).toMatchObject({ version: 1, outcome: "accepted", reason: "looks good" });
+  });
+
   it("resets a pending row with a non-null malformed result back to NULL", async () => {
     const { companyId, issueId } = await seedIssue();
     const id = await insertRow({
