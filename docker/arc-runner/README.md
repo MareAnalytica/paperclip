@@ -31,14 +31,38 @@ it exists in the registry would break all CI. Order:
    `registry.mareanalytica.com/arc-runner-playwright:1.58.2`, then
    `helm upgrade arc-runner-set <chart> -n arc-runners -f values.yaml`.
    The set rolls ephemeral runners to the new image on the next job.
-3. Verify a runner pod launches chromium with **no** egress (see below).
-4. Only then simplify `.github/workflows/pr.yml`: drop the **Install Playwright
+3. **Bounce the listener and re-verify acquisition** (do this after *every*
+   AutoscalingRunnerSet image/spec change). The Helm `template.spec` change
+   in step 2 rolls the set and starts a fresh runner-scale-set *listener*
+   session. That fresh session can acquire in-flight matrix jobs yet
+   silently fail to re-acquire already-`queued` **gate** jobs (e.g.
+   `policy`), logging `totalAvailableJobs:0` while those jobs sit queued —
+   a stale acquisition session, not a capacity or runner-label problem
+   (DEE-642). Force a clean session by deleting the listener pod (the
+   controller recreates it automatically):
+   ```
+   kubectl delete pod -n arc-systems \
+     -l app.kubernetes.io/component=runner-scale-set-listener
+   ```
+   Within ~2 min confirm acquisition recovered: the new listener logs a
+   non-zero `totalAvailableJobs`/assigned count and the previously-queued
+   jobs move out of `queued`. If they stay queued, re-bounce and check
+   `maxRunners` capacity (always via `helm upgrade ... -f
+   arc-runner-set.values.yaml`, never a `kubectl patch`; DEE-643) and the
+   listener log. Then confirm the **old** EphemeralRunnerSet is
+   garbage-collected once its last runner finishes:
+   `kubectl get ephemeralrunnerset -n arc-runners` should show only the
+   current set; delete a lingering orphan by name if it persists.
+4. Verify a runner pod launches chromium with **no** egress (see below).
+5. Only then simplify `.github/workflows/pr.yml`: drop the **Install Playwright
    OS dependencies (apt)** step and the browser-download/cache steps (the image
    is warm). This step also depends on DEE-640 / PR #58 being merged.
 
 ### Rollback
 Revert the values image back to `ghcr.io/actions/actions-runner:latest` and
-`helm upgrade` again; ephemeral runners recycle to stock within one job cycle.
+`helm upgrade` again; ephemeral runners recycle to stock within one job
+cycle. A rollback is itself an image swap, so bounce the listener and
+re-verify acquisition per step 3.
 
 ## Verification (acceptance)
 The whole point is that chromium's shared libs are present in the image, so the
