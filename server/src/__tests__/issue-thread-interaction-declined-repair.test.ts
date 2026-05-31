@@ -111,12 +111,18 @@ describeEmbeddedPostgres("DEE-570 declined interaction outcome repair migration"
     await db.execute(sql.raw(MIGRATION_SQL));
   }
 
-  it("reproduces the read failure, then repairs it via the migration", async () => {
+  it("degrades the corrupt row on read (DEE-582), then repairs it via the migration", async () => {
     const { companyId, issueId } = await seedConfirmationIssue();
     const interactionId = await insertCorruptedDeclinedInteraction({ companyId, issueId });
 
-    // Before repair: hydrateInteraction zod-parses result on read and throws on the bad enum/version.
-    await expect(interactionsSvc.listForIssue(issueId)).rejects.toThrow();
+    // Before repair: the DEE-582 read-path guard no longer throws on the corrupt
+    // enum / missing version — hydrateInteraction degrades `result` to null and flags
+    // the row (unparseableResult). The migration, not a read-time 400, restores a clean outcome.
+    const beforeRepair = await interactionsSvc.listForIssue(issueId);
+    expect(beforeRepair).toHaveLength(1);
+    expect(beforeRepair[0].id).toBe(interactionId);
+    expect(beforeRepair[0].result).toBeNull();
+    expect(beforeRepair[0].unparseableResult).toBe(true);
 
     await runRepairMigration();
 
