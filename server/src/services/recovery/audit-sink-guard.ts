@@ -1,6 +1,6 @@
 import { and, eq } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { issueLabels, labels } from "@paperclipai/db";
+import { issueLabels, issues, labels } from "@paperclipai/db";
 import { AUDIT_SINK_LABEL_NAME } from "@paperclipai/shared";
 
 /**
@@ -94,4 +94,28 @@ export async function isPermanentSinkIssue(
 ): Promise<boolean> {
   if (matchesPermanentSinkTitle(issue.title, issue.description)) return true;
   return isAuditSinkIssue(db, companyId, issue.id);
+}
+
+/**
+ * DEE-651: by-id convenience for the durable permanent-sink predicate. Recovery
+ * paths that only hold an issue id — the heartbeat successful-run handoff and
+ * run-liveness-continuation guards — must use this instead of the label-only
+ * {@link isAuditSinkIssue}, otherwise an un-labeled, `-SWEEP-LOG` title-shaped
+ * sink (e.g. DEE-567) falls through and is re-blocked / re-woken every cycle via
+ * the `successful_run_missing_state` recovery. Fetches the title/description the
+ * title-shape check needs, then defers to {@link isPermanentSinkIssue}.
+ */
+export async function isPermanentSinkIssueById(
+  db: Db,
+  companyId: string,
+  issueId: string,
+): Promise<boolean> {
+  const row = await db
+    .select({ id: issues.id, title: issues.title, description: issues.description })
+    .from(issues)
+    .where(and(eq(issues.id, issueId), eq(issues.companyId, companyId)))
+    .limit(1)
+    .then((rows) => rows[0] ?? null);
+  if (!row) return false;
+  return isPermanentSinkIssue(db, companyId, row);
 }
