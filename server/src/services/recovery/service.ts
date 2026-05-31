@@ -836,6 +836,39 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return startedAt ? Math.max(0, now.getTime() - startedAt.getTime()) : null;
   }
 
+  // §9 step 1 vs §10 separation of concerns: a run whose process is gone is dead
+  // work owned by the startup/periodic reap pass (`reapOrphanedRuns`, §9 step 1),
+  // not by the silence watchdog. We can only *positively confirm* a run is orphaned
+  // for local-child-tracked adapters, whose liveness is fully observable from this
+  // service: the in-memory child handle (`runningProcesses`) plus the recorded OS
+  // pid / process group. Cloud and sessionless adapters track execution out of
+  // process (the heartbeat service's private `activeRunExecutions`), which is not
+  // visible here, so we never classify them as orphaned — they stay on the §11
+  // escalation-horizon path.
+  //
+  // "Positively confirm" is the binding bar (CTO verdict, ELI-776 constraint 2:
+  // never auto-cancel a run we cannot prove is dead). We therefore require POSITIVE
+  // evidence of a once-tracked process that is now gone: the run must have recorded a
+  // pid or process group, that recorded pid/group must be dead, and there must be no
+  // live in-memory handle. A run that never recorded any process metadata is treated
+  // as "not confirmable" (e.g. still mid-spawn, or out-of-process execution), NOT as
+  // orphaned, so it keeps its existing watchdog path rather than being short-circuited.
+  // A still-live detached child (pid or group alive) is likewise not orphaned and
+  // stays on the horizon path. This is intentionally stricter than `reapOrphanedRuns`,
+  // which can additionally consult `activeRunExecutions` to reap never-tracked runs.
+  function isOrphanedLocalChildRun(
+    run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "processPid" | "processGroupId">,
+    runningAgent: Pick<typeof agents.$inferSelect, "adapterType">,
+  ): boolean {
+    if (!SESSIONED_LOCAL_ADAPTERS.has(runningAgent.adapterType)) return false;
+    if (runningProcesses.has(run.id)) return false;
+    const hadTrackedProcess = run.processPid != null || run.processGroupId != null;
+    if (!hadTrackedProcess) return false;
+    if (run.processPid && isPidAlive(run.processPid)) return false;
+    if (isProcessGroupAlive(run.processGroupId)) return false;
+    return true;
+  }
+
   async function latestActiveOutputQuietUntilDecision(companyId: string, runId: string, now = new Date()) {
     const [row] = await db
       .select()
@@ -1706,6 +1739,37 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         });
       }
     }
+    // §9 step 1: a run whose local child process is positively gone (no in-memory
+    // handle, no live pid, no live process group) is dead work, not a silent-but-live
+    // run. The silence watchdog must NOT create or re-arm an evaluation for it — that
+    // is the churn the ELI-774 incident surfaced. Defer it to the periodic reap pass
+    // (`reapOrphanedRuns`, §9 step 1), which owns finalization (failed/process_lost),
+    // issue-execution release, and retry. We only short-circuit for adapters whose
+    // liveness is fully observable from this service (SESSIONED_LOCAL_ADAPTERS); cloud
+    // and sessionless runs stay on the §11 operator-decision horizon below so we never
+    // auto-cancel a run we cannot positively confirm dead.
+    if (isOrphanedLocalChildRun(input.run, runningAgent)) {
+      await logActivity(db, {
+        companyId: input.run.companyId,
+        actorType: "system",
+        actorId: "system",
+        agentId: input.run.agentId,
+        runId: input.run.id,
+        action: "heartbeat.output_stale_orphan_reap_deferred",
+        entityType: "heartbeat_run",
+        entityId: input.run.id,
+        details: {
+          source: "recovery.scan_silent_active_runs",
+          adapterType: runningAgent.adapterType,
+          processPid: input.run.processPid ?? null,
+          processGroupId: input.run.processGroupId ?? null,
+          inMemoryHandle: runningProcesses.has(input.run.id),
+          existingEvaluationIssueId: existing?.id ?? null,
+        },
+      });
+      return { kind: "reap_deferred" as const, evaluationIssueId: existing?.id ?? null };
+    }
+
     const silenceAgeMs = silenceAgeMsForRun(input.run, input.now);
 
     // §11: check escalation horizon before creating or re-arming another evaluation.
@@ -1883,6 +1947,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       snoozed: 0,
       skipped: 0,
       horizonEscalated: 0,
+      reapDeferred: 0,
       evaluationIssueIds: [] as string[],
     };
 
@@ -1897,6 +1962,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       else if (outcome.kind === "escalated") result.escalated += 1;
       else if (outcome.kind === "folded") result.folded += 1;
       else if (outcome.kind === "horizon_escalated") result.horizonEscalated += 1;
+      else if (outcome.kind === "reap_deferred") result.reapDeferred += 1;
       else result.skipped += 1;
       if ("evaluationIssueId" in outcome && outcome.evaluationIssueId) {
         result.evaluationIssueIds.push(outcome.evaluationIssueId);

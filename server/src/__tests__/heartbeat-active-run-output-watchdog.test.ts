@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
@@ -1287,5 +1288,142 @@ describeEmbeddedPostgres("watchdog escalation horizon (§11)", () => {
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.id, runId));
     expect(activeRun!.status).toBe("running");
+  });
+
+  // §9 step 1 reap-defer: a SESSIONED_LOCAL_ADAPTERS run whose recorded pid is
+  // positively dead and which holds no in-memory handle is orphaned dead work. The
+  // watchdog must NOT create/re-arm an evaluation or horizon-escalate it (that is the
+  // ELI-774 churn); it defers to the §9 `reapOrphanedRuns` pass. The run itself is left
+  // untouched (the reaper owns finalization), and an audit activity is recorded.
+  async function seedSilentLocalRun(opts: {
+    now: Date;
+    processPid: number | null;
+    processGroupId?: number | null;
+    priorReArmWindows: number;
+  }) {
+    const companyId = randomUUID();
+    const coderId = randomUUID();
+    const runId = randomUUID();
+    const issuePrefix = `O${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const startedAt = new Date(
+      opts.now.getTime() -
+        ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS -
+        opts.priorReArmWindows * 30 * 60 * 1000 -
+        60_000,
+    );
+    const criticalOnset = new Date(startedAt.getTime() + ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS);
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Orphan Co",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: coderId,
+      companyId,
+      name: "Local Coder",
+      role: "engineer",
+      status: "running",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId: coderId,
+      status: "running",
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      startedAt,
+      processStartedAt: startedAt,
+      processPid: opts.processPid,
+      processGroupId: opts.processGroupId ?? null,
+      lastOutputAt: null,
+      lastOutputSeq: 0,
+      lastOutputStream: null,
+      contextSnapshot: {},
+      logBytes: 0,
+    });
+    for (let i = 0; i < opts.priorReArmWindows; i++) {
+      const windowTime = new Date(criticalOnset.getTime() + i * 30 * 60 * 1000);
+      await db.insert(heartbeatRunWatchdogDecisions).values({
+        companyId,
+        runId,
+        decision: "continue",
+        snoozedUntil: new Date(windowTime.getTime() + 30 * 60 * 1000),
+        createdAt: windowTime,
+      });
+    }
+    return { companyId, runId, coderId };
+  }
+
+  it("reap-defers an orphaned local-child run (recorded pid dead, no handle) instead of escalating", async () => {
+    const now = new Date();
+    // A child that has already exited by the time spawnSync returns → its pid is dead.
+    const deadPid = spawnSync(process.execPath, ["-e", "process.exit(0)"]).pid!;
+    expect(typeof deadPid).toBe("number");
+    // 8 prior re-arm windows would ALSO trip the default horizon — proves reap-defer
+    // takes precedence over both evaluation creation and §11 horizon escalation.
+    const { companyId, runId } = await seedSilentLocalRun({
+      now,
+      processPid: deadPid,
+      priorReArmWindows: 8,
+    });
+
+    const recovery = recoveryService(db, {
+      enqueueWakeup: vi.fn(async () => null),
+    });
+    const result = await recovery.scanSilentActiveRuns({ now, companyId });
+
+    expect(result.reapDeferred).toBe(1);
+    expect(result.horizonEscalated).toBe(0);
+    expect(result.created).toBe(0);
+    expect(result.escalated).toBe(0);
+
+    // No evaluation issue was manufactured for the dead run.
+    const evalIssues = await db
+      .select({ id: issues.id })
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.originId, runId)));
+    expect(evalIssues).toHaveLength(0);
+
+    // The reaper (§9), not the watchdog, owns finalization — run is left running here.
+    const [activeRun] = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId));
+    expect(activeRun!.status).toBe("running");
+
+    // Audit trail preserved (ELI-776 constraint 3).
+    const audit = await db
+      .select({ action: activityLog.action })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.companyId, companyId),
+          eq(activityLog.action, "heartbeat.output_stale_orphan_reap_deferred"),
+        ),
+      );
+    expect(audit).toHaveLength(1);
+  });
+
+  it("does NOT reap-defer a live-but-silent local run (recorded pid alive) — stays on horizon", async () => {
+    const now = new Date();
+    // process.pid is this test process — definitively alive → not orphaned.
+    const { companyId } = await seedSilentLocalRun({
+      now,
+      processPid: process.pid,
+      priorReArmWindows: 8,
+    });
+
+    const recovery = recoveryService(db, {
+      enqueueWakeup: vi.fn(async () => null),
+    });
+    const result = await recovery.scanSilentActiveRuns({ now, companyId });
+
+    expect(result.reapDeferred).toBe(0);
+    expect(result.horizonEscalated).toBe(1);
   });
 });
