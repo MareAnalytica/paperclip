@@ -192,10 +192,6 @@ function parseCliOptions(argv) {
     fail("--shard-index and --shard-count must be provided together.");
   }
 
-  if (mode !== serializedModeName && shardIndex !== null) {
-    fail("--shard-index/--shard-count are only valid with --mode serialized.");
-  }
-
   if (group !== null && mode !== generalModeName) {
     fail("--group is only valid with --mode general.");
   }
@@ -204,18 +200,33 @@ function parseCliOptions(argv) {
     fail(`Unknown group "${group}". Expected one of: ${generalGroupNames.join(", ")}.`);
   }
 
-  if (mode === serializedModeName) {
+  const shardableInGeneralMode = mode === generalModeName && group === generalServerGroupName;
+  if (mode !== serializedModeName && !shardableInGeneralMode && shardIndex !== null) {
+    fail("--shard-index/--shard-count are only valid with --mode serialized or --mode general --group general-server.");
+  }
+
+  if (mode === serializedModeName || shardableInGeneralMode) {
     const resolvedShardCount = shardCount ?? 1;
     const resolvedShardIndex = shardIndex ?? 0;
     if (resolvedShardIndex >= resolvedShardCount) {
       fail(`--shard-index must be less than --shard-count. Received ${resolvedShardIndex} of ${resolvedShardCount}.`);
     }
 
+    if (mode === serializedModeName) {
+      return {
+        mode,
+        shardIndex: resolvedShardIndex,
+        shardCount: resolvedShardCount,
+        group: null,
+        dryRun,
+      };
+    }
+
     return {
       mode,
       shardIndex: resolvedShardIndex,
       shardCount: resolvedShardCount,
-      group: null,
+      group,
       dryRun,
     };
   }
@@ -263,7 +274,7 @@ function runVitest(args, label) {
 
 function runGeneralSuites(routeTests) {
   for (const groupName of generalGroupNames) {
-    runGeneralGroup(routeTests, groupName);
+    runGeneralGroup(routeTests, groupName, null, null);
   }
 }
 
@@ -273,12 +284,18 @@ function runProjectGroup(projects, groupName) {
   }
 }
 
-function runGeneralGroup(routeTests, groupName) {
+function runGeneralGroup(routeTests, groupName, shardIndex, shardCount) {
   if (groupName === generalServerGroupName) {
     const excludeRouteArgs = routeTests.flatMap((file) => ["--exclude", file.serverPath]);
+    const shardArgs =
+      shardIndex !== null ? [`--shard=${shardIndex + 1}/${shardCount}`] : [];
+    const label =
+      shardIndex !== null
+        ? `${groupName} shard ${shardIndex + 1}/${shardCount} excluding ${routeTests.length} serialized suites`
+        : `${groupName} server suites excluding ${routeTests.length} serialized suites`;
     runVitest(
-      ["--project", "@paperclipai/server", ...excludeRouteArgs],
-      `${groupName} server suites excluding ${routeTests.length} serialized suites`,
+      ["--project", "@paperclipai/server", ...excludeRouteArgs, ...shardArgs],
+      label,
     );
     return;
   }
@@ -350,7 +367,7 @@ if (options.dryRun) {
 
 if (options.mode === generalModeName || options.mode === allModeName) {
   if (options.group) {
-    runGeneralGroup(routeTests, options.group);
+    runGeneralGroup(routeTests, options.group, options.shardIndex, options.shardCount);
   } else {
     runGeneralSuites(routeTests);
   }

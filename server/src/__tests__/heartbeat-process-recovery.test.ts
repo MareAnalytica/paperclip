@@ -385,7 +385,18 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       }
     }
     for (let attempt = 0; attempt < 5; attempt += 1) {
+      // Re-delete every table that holds a (non-cascading) company_id FK before
+      // retrying `companies`. A continuation/recovery path under test can emit a
+      // late, fire-and-forget continuation-summary write (documents +
+      // document_revisions, see issue-continuation-summary.ts) that lands after
+      // the earlier child-table deletes above but before this final delete. Both
+      // documents.company_id and document_revisions.company_id reference
+      // companies.id WITHOUT `onDelete: cascade`, so such a straggler row would
+      // otherwise trip `document_revisions_company_id_companies_id_fk` and
+      // red-leg unrelated PRs in the serialized server shard (DEE-635).
       await db.delete(companySkills);
+      await db.delete(documentRevisions);
+      await db.delete(documents);
       try {
         await db.delete(companies);
         break;
