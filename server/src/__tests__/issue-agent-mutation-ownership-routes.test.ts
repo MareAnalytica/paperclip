@@ -196,7 +196,37 @@ function makeAgent(id: string, overrides: Record<string, unknown> = {}) {
 
 function createRunContextDb(contextSnapshot: Record<string, unknown> = {}) {
   return {
-    transaction: async (callback: (tx: Record<string, never>) => Promise<unknown>) => callback({}),
+    // The recovery-resolve route (issues.ts) runs inside `db.transaction(...)`
+    // and, since DEE-569, locks + re-reads the live issue row before deciding
+    // whether to apply the source-status restore. Provide a `tx` that supports
+    // those calls; an empty `{}` makes `tx.execute(...)` throw and the route
+    // 500s (regression surfaced as DEE-630).
+    transaction: async (callback: (tx: Record<string, unknown>) => Promise<unknown>) => {
+      const tx = {
+        // DEE-569 `select ... for update` row lock; return value is unused.
+        execute: vi.fn(async () => ({ rows: [] })),
+        // Locked-row status re-read; mirror the live status the test set up via
+        // mockIssueService.getById so terminal-suppression logic (and the
+        // blocked-outcome blocker probe) evaluate against the same issue.
+        select: vi.fn(() => ({
+          from: vi.fn(() => ({
+            where: vi.fn(() => ({
+              then: async (resolve: (rows: unknown[]) => unknown) => {
+                const locked = await mockIssueService.getById(issueId);
+                return resolve([{ status: (locked as { status?: unknown } | null)?.status ?? null }]);
+              },
+              limit: vi.fn(async () => []),
+            })),
+            innerJoin: vi.fn(() => ({
+              where: vi.fn(() => ({
+                limit: vi.fn(async () => []),
+              })),
+            })),
+          })),
+        })),
+      };
+      return callback(tx as unknown as Record<string, never>);
+    },
     select: vi.fn(() => ({
       from: vi.fn(() => ({
         innerJoin: vi.fn(() => ({
