@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
@@ -106,6 +107,7 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
     sourceStatus?: "in_progress" | "done" | "cancelled";
     sourceOriginKind?: string;
     sameRunTerminalEvidence?: "activity" | "comment";
+    watchdogPolicies?: Record<string, unknown>;
   }) {
     const companyId = randomUUID();
     const managerId = randomUUID();
@@ -123,6 +125,7 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
       name: "Watchdog Co",
       issuePrefix,
       requireBoardApprovalForNewAgents: false,
+      policies: opts.watchdogPolicies ? { watchdog: opts.watchdogPolicies } : null,
     });
     await db.insert(agents).values([
       {
@@ -605,6 +608,35 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
     });
   });
 
+  it("honors a company-configured re-arm window for continue decisions", async () => {
+    const now = new Date("2026-04-22T20:00:00.000Z");
+    const configuredReArmMs = 90 * 60 * 1000; // 90m — distinct from the 30m default
+    const { companyId, managerId, runId } = await seedRunningRun({
+      now,
+      ageMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000,
+      watchdogPolicies: { reArmWindow: configuredReArmMs },
+    });
+    const heartbeat = heartbeatService(db);
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn() });
+
+    const scan = await heartbeat.scanSilentActiveRuns({ now, companyId });
+    const evaluationIssueId = scan.evaluationIssueIds[0];
+    expect(evaluationIssueId).toBeTruthy();
+
+    const decision = await recovery.recordWatchdogDecision({
+      runId,
+      actor: { type: "agent", agentId: managerId },
+      decision: "continue",
+      evaluationIssueId,
+      reason: "Acceptable; re-check after the configured window.",
+      now,
+    });
+
+    // The configured 90m window must be applied, not the hard-coded 30m default.
+    const expectedRearmAt = new Date(now.getTime() + configuredReArmMs);
+    expect(decision.snoozedUntil?.toISOString()).toBe(expectedRearmAt.toISOString());
+  });
+
   it("re-arms continue decisions after the default quiet window", async () => {
     const now = new Date("2026-04-22T20:00:00.000Z");
     const { companyId, managerId, runId } = await seedRunningRun({
@@ -797,5 +829,601 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
       createdByRunId: randomUUID(),
     });
     expect(decision.createdByRunId).toBe(managerRunId);
+  });
+});
+
+// §11 bounded escalation horizon tests
+describeEmbeddedPostgres("watchdog escalation horizon (§11)", () => {
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+  let db: ReturnType<typeof createDb>;
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-watchdog-horizon-");
+    db = createDb(tempDb.connectionString);
+  }, 30_000);
+
+  afterEach(async () => {
+    await db.execute(sql.raw(`TRUNCATE TABLE "companies" CASCADE`));
+  });
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  });
+
+  // Seeds a critically-silent run and adds N prior re-arm decisions to simulate elapsed windows.
+  async function seedHorizonRun(opts: {
+    now: Date;
+    priorReArmWindows: number;
+    watchdogPolicies?: Record<string, unknown>;
+  }) {
+    const companyId = randomUUID();
+    const managerId = randomUUID();
+    const coderId = randomUUID();
+    const issueId = randomUUID();
+    const runId = randomUUID();
+    const issuePrefix = `H${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    // Silence must clear the critical threshold AND leave room for N post-critical
+    // re-arm windows: §11 counts re-arm windows acknowledged *after* critical onset,
+    // not from silence start. +60s nudges silenceAge just past the critical threshold.
+    const reArmWindows = Math.max(0, opts.priorReArmWindows);
+    const startedAt = new Date(
+      opts.now.getTime() -
+        ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS -
+        reArmWindows * 30 * 60 * 1000 -
+        60_000,
+    );
+    const criticalOnset = new Date(startedAt.getTime() + ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS);
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Horizon Co",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+      policies: opts.watchdogPolicies ? { watchdog: opts.watchdogPolicies } : null,
+    });
+    await db.insert(agents).values([
+      {
+        id: managerId,
+        companyId,
+        name: "CTO",
+        role: "cto",
+        status: "idle",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: coderId,
+        companyId,
+        name: "Coder",
+        role: "engineer",
+        status: "running",
+        reportsTo: managerId,
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+    ]);
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Long running horizon test",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: coderId,
+      issueNumber: 1,
+      identifier: `${issuePrefix}-1`,
+      originKind: "manual",
+      updatedAt: startedAt,
+      createdAt: startedAt,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId: coderId,
+      status: "running",
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      startedAt,
+      processStartedAt: startedAt,
+      lastOutputAt: null,
+      lastOutputSeq: 0,
+      lastOutputStream: null,
+      contextSnapshot: { issueId },
+      logBytes: 0,
+    });
+    await db.update(issues).set({ executionRunId: runId }).where(eq(issues.id, issueId));
+
+    // Insert N prior continue decisions to simulate elapsed re-arm windows, each
+    // acknowledged AFTER the critical-threshold onset so they count toward the §11 horizon.
+    for (let i = 0; i < reArmWindows; i++) {
+      const windowTime = new Date(criticalOnset.getTime() + i * 30 * 60 * 1000);
+      await db.insert(heartbeatRunWatchdogDecisions).values({
+        companyId,
+        runId,
+        decision: "continue",
+        snoozedUntil: new Date(windowTime.getTime() + 30 * 60 * 1000),
+        createdAt: windowTime,
+      });
+    }
+
+    return { companyId, runId, issueId, coderId, issuePrefix };
+  }
+
+  it("does NOT horizon-escalate before maxReArmWindows is reached", async () => {
+    const now = new Date();
+    const { companyId, runId } = await seedHorizonRun({
+      now,
+      priorReArmWindows: 3, // below default of 8
+    });
+
+    const recovery = recoveryService(db, {
+      enqueueWakeup: vi.fn(async () => null),
+    });
+    const result = await recovery.scanSilentActiveRuns({ now, companyId });
+
+    expect(result.horizonEscalated).toBe(0);
+    expect(result.created + result.existing + result.escalated).toBeGreaterThanOrEqual(1);
+  });
+
+  it("horizon-escalates when maxReArmWindows is reached (default 8)", async () => {
+    const now = new Date();
+    const { companyId, runId } = await seedHorizonRun({
+      now,
+      priorReArmWindows: 8, // exactly at default
+    });
+
+    const recovery = recoveryService(db, {
+      enqueueWakeup: vi.fn(async () => null),
+    });
+    const result = await recovery.scanSilentActiveRuns({ now, companyId });
+
+    expect(result.horizonEscalated).toBe(1);
+    expect(result.created).toBe(0);
+
+    // Verify the evaluation issue was created at critical priority and is not cancelled
+    const [evalIssue] = await db
+      .select()
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, companyId),
+          eq(issues.originId, runId),
+        ),
+      );
+    expect(evalIssue).toBeTruthy();
+    expect(evalIssue!.priority).toBe("critical");
+    expect(["cancelled", "done"]).not.toContain(evalIssue!.status);
+
+    // Verify the live run was NOT mutated (must still be running)
+    const [activeRun] = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId));
+    expect(activeRun!.status).toBe("running");
+  });
+
+  it("horizon-escalates using config-override maxReArmWindows", async () => {
+    const now = new Date();
+    const { companyId } = await seedHorizonRun({
+      now,
+      priorReArmWindows: 3, // 3 windows elapsed
+      // Contract shape (doc §11): policies.watchdog.escalationHorizon.maxReArmWindows
+      watchdogPolicies: { escalationHorizon: { maxReArmWindows: 3 } }, // override: trip at 3
+    });
+
+    const recovery = recoveryService(db, {
+      enqueueWakeup: vi.fn(async () => null),
+    });
+    const result = await recovery.scanSilentActiveRuns({ now, companyId });
+
+    expect(result.horizonEscalated).toBe(1);
+  });
+
+  it("horizon-escalates via maxSilentHours when configured", async () => {
+    // Silence age is CRITICAL_THRESHOLD_MS + 60s ≈ 4h 1m
+    // Set maxSilentHours=4 so it trips immediately.
+    const now = new Date();
+    const { companyId, runId } = await seedHorizonRun({
+      now,
+      priorReArmWindows: 0, // no prior decisions needed — maxSilentHours trips first
+      // Contract shape (doc §11): nested under escalationHorizon
+      watchdogPolicies: { escalationHorizon: { maxReArmWindows: null, maxSilentHours: 4 } },
+    });
+
+    const recovery = recoveryService(db, {
+      enqueueWakeup: vi.fn(async () => null),
+    });
+    const result = await recovery.scanSilentActiveRuns({ now, companyId });
+
+    expect(result.horizonEscalated).toBe(1);
+
+    // Verify run still running (not mutated)
+    const [activeRun] = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId));
+    expect(activeRun!.status).toBe("running");
+  });
+
+  it("does NOT horizon-escalate when maxReArmWindows is explicitly null (disabled), even past the default", async () => {
+    // Regression for DEE-583 F2: an explicit `maxReArmWindows: null` must DISABLE the
+    // re-arm-windows horizon, not coerce to the default (8). Here 8 elapsed windows would
+    // trip the default, and maxSilentHours is left absent (resolving to its null default,
+    // also disabled), so with the windows horizon disabled NO horizon should trip and the
+    // run must take the normal evaluation path without a horizon escalation.
+    const now = new Date();
+    const { companyId, runId } = await seedHorizonRun({
+      now,
+      priorReArmWindows: 8, // at/over the default horizon — would trip if null were coerced to 8
+      watchdogPolicies: { escalationHorizon: { maxReArmWindows: null } },
+    });
+
+    const recovery = recoveryService(db, {
+      enqueueWakeup: vi.fn(async () => null),
+    });
+    const result = await recovery.scanSilentActiveRuns({ now, companyId });
+
+    expect(result.horizonEscalated).toBe(0);
+
+    // Live run must remain untouched (the §11 no-mutation invariant holds on the non-horizon path too).
+    const [activeRun] = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId));
+    expect(activeRun!.status).toBe("running");
+  });
+
+  it("does NOT re-log horizon escalation on repeated scans (§11 idempotency)", async () => {
+    const now = new Date();
+    const { companyId, runId } = await seedHorizonRun({
+      now,
+      priorReArmWindows: 8, // at default horizon — escalates on first scan
+    });
+
+    const recovery = recoveryService(db, {
+      enqueueWakeup: vi.fn(async () => null),
+    });
+
+    // Three consecutive scans with the run still silent and still running.
+    await recovery.scanSilentActiveRuns({ now, companyId });
+    await recovery.scanSilentActiveRuns({ now, companyId });
+    await recovery.scanSilentActiveRuns({ now, companyId });
+
+    // The horizon escalation is a one-time terminal hand-off: exactly one activity entry,
+    // not one per scan. Without the idempotency guard this would be 3.
+    const escalationEvents = await db
+      .select({ id: activityLog.id })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.companyId, companyId),
+          eq(activityLog.runId, runId),
+          eq(activityLog.action, "heartbeat.output_stale_horizon_escalated"),
+        ),
+      );
+    expect(escalationEvents.length).toBe(1);
+
+    // Run still untouched.
+    const [activeRun] = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId));
+    expect(activeRun!.status).toBe("running");
+  });
+
+  it("does NOT re-escalate after the horizon evaluation is closed while the run stays silent (§11 one-time hand-off)", async () => {
+    // Codex P2 (DEE-583): the idempotency guard previously lived only inside the
+    // open-evaluation branch. If an operator closed/cancelled the [Horizon] evaluation
+    // while the run remained running and silent, the next scan found no open evaluation
+    // and the create branch manufactured a SECOND escalation + duplicate activity log.
+    const now = new Date();
+    const { companyId, runId } = await seedHorizonRun({
+      now,
+      priorReArmWindows: 8, // at default horizon — escalates on first scan
+    });
+
+    const recovery = recoveryService(db, {
+      enqueueWakeup: vi.fn(async () => null),
+    });
+
+    // First scan escalates and creates the [Horizon] evaluation issue.
+    const first = await recovery.scanSilentActiveRuns({ now, companyId });
+    expect(first.horizonEscalated).toBe(1);
+
+    // Operator closes the evaluation issue (cancel) WITHOUT stopping the live run.
+    await db
+      .update(issues)
+      .set({ status: "cancelled" })
+      .where(and(eq(issues.companyId, companyId), eq(issues.originId, runId)));
+
+    // Second scan: run still silent + still running, but the prior escalation already
+    // happened for this silence episode → must NOT create a second [Horizon] issue or
+    // log a second escalation.
+    await recovery.scanSilentActiveRuns({ now, companyId });
+
+    const escalationEvents = await db
+      .select({ id: activityLog.id })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.companyId, companyId),
+          eq(activityLog.runId, runId),
+          eq(activityLog.action, "heartbeat.output_stale_horizon_escalated"),
+        ),
+      );
+    expect(escalationEvents.length).toBe(1);
+
+    // Exactly one stale-run evaluation issue ever created for this run (no duplicate [Horizon]).
+    const evalIssues = await db
+      .select({ id: issues.id })
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.originId, runId)));
+    expect(evalIssues.length).toBe(1);
+
+    // Live run still untouched.
+    const [activeRun] = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId));
+    expect(activeRun!.status).toBe("running");
+  });
+
+  it("does NOT count pre-critical (suspicious-phase) re-arm windows toward the §11 horizon", async () => {
+    const now = new Date();
+    // No post-critical windows; the run is just past the critical threshold.
+    const { companyId, runId } = await seedHorizonRun({
+      now,
+      priorReArmWindows: 0,
+    });
+
+    // Seed 8 continue decisions during the SUSPICIOUS phase (2h ago — before critical onset
+    // at ~now-60s). Under a from-silence-start count these would trip the default-8 horizon;
+    // the contract measures the horizon only after the critical threshold, so they must NOT.
+    for (let i = 0; i < 8; i++) {
+      const preCriticalTime = new Date(now.getTime() - 2 * 60 * 60 * 1000 - i * 60_000);
+      await db.insert(heartbeatRunWatchdogDecisions).values({
+        companyId,
+        runId,
+        decision: "continue",
+        snoozedUntil: new Date(preCriticalTime.getTime() + 30 * 60 * 1000),
+        createdAt: preCriticalTime,
+      });
+    }
+
+    const recovery = recoveryService(db, {
+      enqueueWakeup: vi.fn(async () => null),
+    });
+    const result = await recovery.scanSilentActiveRuns({ now, companyId });
+
+    expect(result.horizonEscalated).toBe(0);
+  });
+
+  it("ignores legacy flat watchdog.maxReArmWindows — contract requires nested escalationHorizon", async () => {
+    const now = new Date();
+    const { companyId } = await seedHorizonRun({
+      now,
+      priorReArmWindows: 3,
+      // Legacy/incorrect flat shape: must be ignored so the default (8) applies, not 3.
+      watchdogPolicies: { maxReArmWindows: 3 },
+    });
+
+    const recovery = recoveryService(db, {
+      enqueueWakeup: vi.fn(async () => null),
+    });
+    const result = await recovery.scanSilentActiveRuns({ now, companyId });
+
+    // 3 < default 8, and the flat shape is not the contract key → no horizon escalation.
+    expect(result.horizonEscalated).toBe(0);
+  });
+
+  it("source-less run (no contextSnapshot issueId) is in scope for horizon", async () => {
+    const now = new Date();
+    const companyId = randomUUID();
+    const coderId = randomUUID();
+    const runId = randomUUID();
+    const issuePrefix = `S${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    // Silence long enough to fit 8 post-critical re-arm windows (§11 counts windows
+    // after critical onset, not from silence start).
+    const startedAt = new Date(
+      now.getTime() - ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS - 8 * 30 * 60 * 1000 - 60_000,
+    );
+    const criticalOnset = new Date(startedAt.getTime() + ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS);
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Sourceless Co",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: coderId,
+      companyId,
+      name: "Timer Agent",
+      role: "engineer",
+      status: "running",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId: coderId,
+      status: "running",
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      startedAt,
+      processStartedAt: startedAt,
+      lastOutputAt: null,
+      lastOutputSeq: 0,
+      lastOutputStream: null,
+      contextSnapshot: {}, // no issueId — source-less run
+      logBytes: 0,
+    });
+    // Add 8 continue decisions AFTER critical onset to trip the default horizon
+    for (let i = 0; i < 8; i++) {
+      const windowTime = new Date(criticalOnset.getTime() + i * 30 * 60 * 1000);
+      await db.insert(heartbeatRunWatchdogDecisions).values({
+        companyId,
+        runId,
+        decision: "continue",
+        snoozedUntil: new Date(windowTime.getTime() + 30 * 60 * 1000),
+        createdAt: windowTime,
+      });
+    }
+
+    const recovery = recoveryService(db, {
+      enqueueWakeup: vi.fn(async () => null),
+    });
+    const result = await recovery.scanSilentActiveRuns({ now, companyId });
+
+    expect(result.horizonEscalated).toBe(1);
+    // Run must not be mutated
+    const [activeRun] = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId));
+    expect(activeRun!.status).toBe("running");
+  });
+
+  // §9 step 1 reap-defer: a SESSIONED_LOCAL_ADAPTERS run whose recorded pid is
+  // positively dead and which holds no in-memory handle is orphaned dead work. The
+  // watchdog must NOT create/re-arm an evaluation or horizon-escalate it (that is the
+  // ELI-774 churn); it defers to the §9 `reapOrphanedRuns` pass. The run itself is left
+  // untouched (the reaper owns finalization), and an audit activity is recorded.
+  async function seedSilentLocalRun(opts: {
+    now: Date;
+    processPid: number | null;
+    processGroupId?: number | null;
+    priorReArmWindows: number;
+  }) {
+    const companyId = randomUUID();
+    const coderId = randomUUID();
+    const runId = randomUUID();
+    const issuePrefix = `O${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const startedAt = new Date(
+      opts.now.getTime() -
+        ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS -
+        opts.priorReArmWindows * 30 * 60 * 1000 -
+        60_000,
+    );
+    const criticalOnset = new Date(startedAt.getTime() + ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS);
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Orphan Co",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: coderId,
+      companyId,
+      name: "Local Coder",
+      role: "engineer",
+      status: "running",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId: coderId,
+      status: "running",
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      startedAt,
+      processStartedAt: startedAt,
+      processPid: opts.processPid,
+      processGroupId: opts.processGroupId ?? null,
+      lastOutputAt: null,
+      lastOutputSeq: 0,
+      lastOutputStream: null,
+      contextSnapshot: {},
+      logBytes: 0,
+    });
+    for (let i = 0; i < opts.priorReArmWindows; i++) {
+      const windowTime = new Date(criticalOnset.getTime() + i * 30 * 60 * 1000);
+      await db.insert(heartbeatRunWatchdogDecisions).values({
+        companyId,
+        runId,
+        decision: "continue",
+        snoozedUntil: new Date(windowTime.getTime() + 30 * 60 * 1000),
+        createdAt: windowTime,
+      });
+    }
+    return { companyId, runId, coderId };
+  }
+
+  it("reap-defers an orphaned local-child run (recorded pid dead, no handle) instead of escalating", async () => {
+    const now = new Date();
+    // A child that has already exited by the time spawnSync returns → its pid is dead.
+    const deadPid = spawnSync(process.execPath, ["-e", "process.exit(0)"]).pid!;
+    expect(typeof deadPid).toBe("number");
+    // 8 prior re-arm windows would ALSO trip the default horizon — proves reap-defer
+    // takes precedence over both evaluation creation and §11 horizon escalation.
+    const { companyId, runId } = await seedSilentLocalRun({
+      now,
+      processPid: deadPid,
+      priorReArmWindows: 8,
+    });
+
+    const recovery = recoveryService(db, {
+      enqueueWakeup: vi.fn(async () => null),
+    });
+    const result = await recovery.scanSilentActiveRuns({ now, companyId });
+
+    expect(result.reapDeferred).toBe(1);
+    expect(result.horizonEscalated).toBe(0);
+    expect(result.created).toBe(0);
+    expect(result.escalated).toBe(0);
+
+    // No evaluation issue was manufactured for the dead run.
+    const evalIssues = await db
+      .select({ id: issues.id })
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.originId, runId)));
+    expect(evalIssues).toHaveLength(0);
+
+    // The reaper (§9), not the watchdog, owns finalization — run is left running here.
+    const [activeRun] = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId));
+    expect(activeRun!.status).toBe("running");
+
+    // Audit trail preserved (ELI-776 constraint 3).
+    const audit = await db
+      .select({ action: activityLog.action })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.companyId, companyId),
+          eq(activityLog.action, "heartbeat.output_stale_orphan_reap_deferred"),
+        ),
+      );
+    expect(audit).toHaveLength(1);
+  });
+
+  it("does NOT reap-defer a live-but-silent local run (recorded pid alive) — stays on horizon", async () => {
+    const now = new Date();
+    // process.pid is this test process — definitively alive → not orphaned.
+    const { companyId } = await seedSilentLocalRun({
+      now,
+      processPid: process.pid,
+      priorReArmWindows: 8,
+    });
+
+    const recovery = recoveryService(db, {
+      enqueueWakeup: vi.fn(async () => null),
+    });
+    const result = await recovery.scanSilentActiveRuns({ now, companyId });
+
+    expect(result.reapDeferred).toBe(0);
+    expect(result.horizonEscalated).toBe(1);
   });
 });

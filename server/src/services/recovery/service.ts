@@ -69,6 +69,19 @@ const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = ["failed", "cancelled", "ti
 export const ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS = 60 * 60 * 1000;
 export const ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS = 4 * 60 * 60 * 1000;
 export const ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS = 30 * 60 * 1000;
+
+// §11 escalation horizon defaults: a critical-silent run that never recovers
+// must reach a terminal operator decision rather than looping in review forever.
+const DEFAULT_WATCHDOG_ESCALATION_MAX_REARM_WINDOWS = 8; // ~4h at default 30m reArm
+const DEFAULT_WATCHDOG_ESCALATION_MAX_SILENT_HOURS: number | null = null; // disabled by default
+
+export type WatchdogConfig = {
+  reArmWindowMs: number;
+  escalationHorizon: {
+    maxReArmWindows: number | null;
+    maxSilentHours: number | null;
+  };
+};
 const ACTIVE_RUN_OUTPUT_EVIDENCE_TAIL_BYTES = 8 * 1024;
 export const STRANDED_ASSIGNEE_COMMENT_LIVENESS_WINDOW_MS = 5 * 60 * 1000;
 const STRANDED_OPEN_CHILD_STATUSES = ["in_review", "in_progress"] as const;
@@ -730,6 +743,84 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return `stale_active_run:${companyId}:${runId}`;
   }
 
+  async function resolveWatchdogConfig(companyId: string): Promise<WatchdogConfig> {
+    const [row] = await db
+      .select({ policies: companies.policies })
+      .from(companies)
+      .where(eq(companies.id, companyId))
+      .limit(1);
+    const watchdog = parseObject(parseObject(row?.policies)["watchdog"]);
+    const reArmWindowMs = asNumber(watchdog["reArmWindow"], ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS);
+    // §11 horizon config is nested under `escalationHorizon` per the silence-watchdog
+    // contract (doc/execution-semantics.md §11): `watchdog.escalationHorizon.maxReArmWindows`
+    // and `watchdog.escalationHorizon.maxSilentHours`. Resolution semantics (DEE-583 F2):
+    //   - absent (key missing) OR a whole-policy-absent `watchdog`/`escalationHorizon`
+    //     (no `escalationHorizon` key) -> use the built-in DEFAULT. This is the back-compat
+    //     path: existing deployments with no watchdog policy keep the default horizon.
+    //   - explicit `null` -> DISABLE that horizon (propagates null, which
+    //     `isEscalationHorizonTripped` treats as "skip this check").
+    //   - explicit number -> override.
+    // The absent-vs-null distinction matters because the value `null` is the documented
+    // disable knob; coercing it to the default (8) made disable-by-null unreachable for the
+    // windows horizon (the maxSilentHours default already being null masked the asymmetry).
+    const horizon = parseObject(watchdog["escalationHorizon"]);
+    const rawMaxReArmWindows = "maxReArmWindows" in horizon ? horizon["maxReArmWindows"] : undefined;
+    const maxReArmWindows = rawMaxReArmWindows === null
+      ? null
+      : typeof rawMaxReArmWindows === "number"
+        ? rawMaxReArmWindows
+        : DEFAULT_WATCHDOG_ESCALATION_MAX_REARM_WINDOWS;
+    const rawMaxSilentHours = "maxSilentHours" in horizon ? horizon["maxSilentHours"] : undefined;
+    const maxSilentHours = rawMaxSilentHours === null
+      ? null
+      : typeof rawMaxSilentHours === "number"
+        ? rawMaxSilentHours
+        : DEFAULT_WATCHDOG_ESCALATION_MAX_SILENT_HOURS;
+    return {
+      reArmWindowMs,
+      escalationHorizon: { maxReArmWindows, maxSilentHours },
+    };
+  }
+
+  async function countCompletedReArmWindowsForRun(
+    companyId: string,
+    runId: string,
+    countedAfter: Date | null,
+  ): Promise<number> {
+    // Count distinct continue/snooze decisions recorded after `countedAfter`.
+    // Each one represents one completed re-arm window cycle. Per doc/execution-semantics.md
+    // §11 the horizon is measured *after the critical threshold* — callers pass the
+    // critical-threshold onset (not silence onset) so re-arm windows acknowledged during
+    // the merely-suspicious phase do not consume the post-critical escalation budget.
+    const after = countedAfter ?? new Date(0);
+    const decisions = await db
+      .select({ id: heartbeatRunWatchdogDecisions.id })
+      .from(heartbeatRunWatchdogDecisions)
+      .where(
+        and(
+          eq(heartbeatRunWatchdogDecisions.companyId, companyId),
+          eq(heartbeatRunWatchdogDecisions.runId, runId),
+          inArray(heartbeatRunWatchdogDecisions.decision, ["continue", "snooze"]),
+          gte(heartbeatRunWatchdogDecisions.createdAt, after),
+        ),
+      );
+    return decisions.length;
+  }
+
+  function isEscalationHorizonTripped(input: {
+    reArmWindowsElapsed: number;
+    silenceAgeMs: number | null;
+    config: WatchdogConfig;
+  }): boolean {
+    const { reArmWindowsElapsed, silenceAgeMs, config } = input;
+    const { maxReArmWindows, maxSilentHours } = config.escalationHorizon;
+    if (maxReArmWindows !== null && reArmWindowsElapsed >= maxReArmWindows) return true;
+    if (maxSilentHours !== null && silenceAgeMs !== null) {
+      if (silenceAgeMs >= maxSilentHours * 60 * 60 * 1000) return true;
+    }
+    return false;
+  }
+
   function isRecoveryOriginIssue(issue: typeof issues.$inferSelect) {
     return Object.values(RECOVERY_ORIGIN_KINDS).includes(
       issue.originKind as typeof RECOVERY_ORIGIN_KINDS[keyof typeof RECOVERY_ORIGIN_KINDS],
@@ -743,6 +834,39 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   function silenceAgeMsForRun(run: Pick<typeof heartbeatRuns.$inferSelect, "lastOutputAt" | "processStartedAt" | "startedAt" | "createdAt">, now = new Date()) {
     const startedAt = silenceStartedAtForRun(run);
     return startedAt ? Math.max(0, now.getTime() - startedAt.getTime()) : null;
+  }
+
+  // §9 step 1 vs §10 separation of concerns: a run whose process is gone is dead
+  // work owned by the startup/periodic reap pass (`reapOrphanedRuns`, §9 step 1),
+  // not by the silence watchdog. We can only *positively confirm* a run is orphaned
+  // for local-child-tracked adapters, whose liveness is fully observable from this
+  // service: the in-memory child handle (`runningProcesses`) plus the recorded OS
+  // pid / process group. Cloud and sessionless adapters track execution out of
+  // process (the heartbeat service's private `activeRunExecutions`), which is not
+  // visible here, so we never classify them as orphaned — they stay on the §11
+  // escalation-horizon path.
+  //
+  // "Positively confirm" is the binding bar (CTO verdict, ELI-776 constraint 2:
+  // never auto-cancel a run we cannot prove is dead). We therefore require POSITIVE
+  // evidence of a once-tracked process that is now gone: the run must have recorded a
+  // pid or process group, that recorded pid/group must be dead, and there must be no
+  // live in-memory handle. A run that never recorded any process metadata is treated
+  // as "not confirmable" (e.g. still mid-spawn, or out-of-process execution), NOT as
+  // orphaned, so it keeps its existing watchdog path rather than being short-circuited.
+  // A still-live detached child (pid or group alive) is likewise not orphaned and
+  // stays on the horizon path. This is intentionally stricter than `reapOrphanedRuns`,
+  // which can additionally consult `activeRunExecutions` to reap never-tracked runs.
+  function isOrphanedLocalChildRun(
+    run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "processPid" | "processGroupId">,
+    runningAgent: Pick<typeof agents.$inferSelect, "adapterType">,
+  ): boolean {
+    if (!SESSIONED_LOCAL_ADAPTERS.has(runningAgent.adapterType)) return false;
+    if (runningProcesses.has(run.id)) return false;
+    const hadTrackedProcess = run.processPid != null || run.processGroupId != null;
+    if (!hadTrackedProcess) return false;
+    if (run.processPid && isPidAlive(run.processPid)) return false;
+    if (isProcessGroupAlive(run.processGroupId)) return false;
+    return true;
   }
 
   async function latestActiveOutputQuietUntilDecision(companyId: string, runId: string, now = new Date()) {
@@ -1389,6 +1513,184 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return true;
   }
 
+  // §11 idempotency: a run that has already been horizon-escalated within the current
+  // silence episode must not be re-commented/re-logged on every subsequent scan. Returns
+  // true when a `heartbeat.output_stale_horizon_escalated` activity entry already exists
+  // for this run since silence onset.
+  async function hasHorizonEscalationRecorded(
+    companyId: string,
+    runId: string,
+    silenceStartedAt: Date | null,
+  ): Promise<boolean> {
+    const after = silenceStartedAt ?? new Date(0);
+    const [row] = await db
+      .select({ id: activityLog.id })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.companyId, companyId),
+          eq(activityLog.runId, runId),
+          eq(activityLog.action, "heartbeat.output_stale_horizon_escalated"),
+          gte(activityLog.createdAt, after),
+        ),
+      )
+      .limit(1);
+    return Boolean(row);
+  }
+
+  async function escalateToHorizonTerminalDecision(input: {
+    run: typeof heartbeatRuns.$inferSelect;
+    runningAgent: typeof agents.$inferSelect;
+    sourceIssue: typeof issues.$inferSelect | null;
+    existingEvaluation: Awaited<ReturnType<typeof findOpenStaleRunEvaluation>>;
+    reArmWindowsElapsed: number;
+    silenceAgeMs: number | null;
+    silenceStartedAt: Date | null;
+    now: Date;
+  }) {
+    // §11: a critical-silent run that has passed the escalation horizon must reach
+    // a terminal operator decision (cancel or snooze) rather than re-arming another
+    // evaluation cycle. This function converts the existing (or open) evaluation issue
+    // into a horizon-escalated state and records the activity. It MUST NOT auto-cancel
+    // or otherwise mutate the live run — only the operator can do that.
+    const target = input.existingEvaluation;
+
+    // §11: the horizon escalation is a one-time terminal hand-off, not a loop. If this run's
+    // current silence episode has ALREADY been horizon-escalated, never re-comment, re-log, or
+    // create a second [Horizon] issue — regardless of whether the prior evaluation issue is
+    // still open. This guard must precede the open-evaluation/create split: an operator who
+    // closed the evaluation without acting on the live run has still received the terminal
+    // hand-off, and `findOpenStaleRunEvaluation` returning null must NOT let the create branch
+    // manufacture a duplicate escalation for the same silence episode (DEE-583, Codex P2).
+    if (await hasHorizonEscalationRecorded(input.run.companyId, input.run.id, input.silenceStartedAt)) {
+      if (target && target.priority !== "critical") {
+        await issuesSvc.update(target.id, { priority: "critical" });
+      }
+      return { kind: "horizon_escalated" as const, evaluationIssueId: target?.id ?? null };
+    }
+
+    const body = [
+      "## Watchdog escalation horizon reached",
+      "",
+      `Run \`${input.run.id}\` for **${input.runningAgent.name}** has been critically silent past the escalation horizon.`,
+      "",
+      `- Re-arm windows elapsed: ${input.reArmWindowsElapsed}`,
+      `- Silent for: ${input.silenceAgeMs !== null ? formatDuration(input.silenceAgeMs) : "unknown"}`,
+      `- Last output: ${input.run.lastOutputAt?.toISOString() ?? "none recorded"}`,
+      "",
+      "A terminal operator decision is required — **cancel** or **snooze** this run.",
+      "The run has NOT been automatically cancelled; only the operator can mutate the live run.",
+    ].join("\n");
+
+    if (target) {
+      if (target.priority !== "critical") {
+        await issuesSvc.update(target.id, { priority: "critical" });
+      }
+      await issuesSvc.addComment(target.id, body, { runId: input.run.id });
+      await ensureSourceIssueBlockedByStaleEvaluation({
+        sourceIssue: input.sourceIssue,
+        evaluationIssue: target,
+        run: input.run,
+      });
+      await logActivity(db, {
+        companyId: input.run.companyId,
+        actorType: "system",
+        actorId: "system",
+        agentId: null,
+        runId: input.run.id,
+        action: "heartbeat.output_stale_horizon_escalated",
+        entityType: "issue",
+        entityId: target.id,
+        details: {
+          source: "recovery.scan_silent_active_runs",
+          reArmWindowsElapsed: input.reArmWindowsElapsed,
+          silenceAgeMs: input.silenceAgeMs,
+          evaluationIssueId: target.id,
+        },
+      });
+      return { kind: "horizon_escalated" as const, evaluationIssueId: target.id };
+    }
+
+    // No existing evaluation — create one at critical priority already marked horizon-escalated.
+    const prefix = await getCompanyIssuePrefix(input.run.companyId);
+    const ownerAgentId = await resolveStaleRunOwnerAgentId({
+      run: input.run,
+      runningAgent: input.runningAgent,
+      sourceIssue: input.sourceIssue,
+    });
+    let evaluation: Awaited<ReturnType<typeof issuesSvc.create>>;
+    try {
+      evaluation = await issuesSvc.create(input.run.companyId, {
+        title: `[Horizon] Terminal decision required: silent run for ${input.runningAgent.name}`,
+        description: body,
+        status: "todo",
+        priority: "critical",
+        parentId: input.sourceIssue && !["done", "cancelled"].includes(input.sourceIssue.status) ? input.sourceIssue.id : null,
+        projectId: input.sourceIssue?.projectId ?? null,
+        goalId: input.sourceIssue?.goalId ?? null,
+        billingCode: input.sourceIssue?.billingCode ?? null,
+        assigneeAgentId: ownerAgentId,
+        assigneeAdapterOverrides: recoveryAssigneeAdapterOverrides("status_only"),
+        originKind: STALE_ACTIVE_RUN_EVALUATION_ORIGIN_KIND,
+        originId: input.run.id,
+        originRunId: input.run.id,
+        originFingerprint: staleActiveRunOriginFingerprint(input.run.companyId, input.run.id),
+      });
+    } catch (error) {
+      if (!isUniqueStaleRunEvaluationConflict(error)) throw error;
+      const raced = await findOpenStaleRunEvaluation(input.run.companyId, input.run.id);
+      if (!raced) throw error;
+      return { kind: "horizon_escalated" as const, evaluationIssueId: raced.id };
+    }
+
+    await ensureSourceIssueBlockedByStaleEvaluation({
+      sourceIssue: input.sourceIssue,
+      evaluationIssue: evaluation,
+      run: input.run,
+    });
+    await logActivity(db, {
+      companyId: input.run.companyId,
+      actorType: "system",
+      actorId: "system",
+      agentId: ownerAgentId,
+      runId: input.run.id,
+      action: "heartbeat.output_stale_horizon_escalated",
+      entityType: "issue",
+      entityId: evaluation.id,
+      details: {
+        source: "recovery.scan_silent_active_runs",
+        reArmWindowsElapsed: input.reArmWindowsElapsed,
+        silenceAgeMs: input.silenceAgeMs,
+        evaluationIssueId: evaluation.id,
+      },
+    });
+    if (ownerAgentId) {
+      await deps.enqueueWakeup(ownerAgentId, {
+        source: "assignment",
+        triggerDetail: "system",
+        reason: "issue_assigned",
+        payload: withRecoveryModelProfileHint({
+          issueId: evaluation.id,
+          staleRunId: input.run.id,
+          sourceIssueId: input.sourceIssue?.id ?? null,
+          horizonEscalation: true,
+        }, "status_only"),
+        requestedByActorType: "system",
+        requestedByActorId: null,
+        contextSnapshot: withRecoveryModelProfileHint({
+          issueId: evaluation.id,
+          taskId: evaluation.id,
+          wakeReason: "issue_assigned",
+          source: STALE_ACTIVE_RUN_EVALUATION_ORIGIN_KIND,
+          staleRunId: input.run.id,
+          sourceIssueId: input.sourceIssue?.id ?? null,
+          horizonEscalation: true,
+        }, "status_only"),
+      });
+    }
+    return { kind: "horizon_escalated" as const, evaluationIssueId: evaluation.id };
+  }
+
   async function createOrUpdateStaleRunEvaluation(input: {
     run: typeof heartbeatRuns.$inferSelect;
     now: Date;
@@ -1437,6 +1739,67 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         });
       }
     }
+    // §9 step 1: a run whose local child process is positively gone (no in-memory
+    // handle, no live pid, no live process group) is dead work, not a silent-but-live
+    // run. The silence watchdog must NOT create or re-arm an evaluation for it — that
+    // is the churn the ELI-774 incident surfaced. Defer it to the periodic reap pass
+    // (`reapOrphanedRuns`, §9 step 1), which owns finalization (failed/process_lost),
+    // issue-execution release, and retry. We only short-circuit for adapters whose
+    // liveness is fully observable from this service (SESSIONED_LOCAL_ADAPTERS); cloud
+    // and sessionless runs stay on the §11 operator-decision horizon below so we never
+    // auto-cancel a run we cannot positively confirm dead.
+    if (isOrphanedLocalChildRun(input.run, runningAgent)) {
+      await logActivity(db, {
+        companyId: input.run.companyId,
+        actorType: "system",
+        actorId: "system",
+        agentId: input.run.agentId,
+        runId: input.run.id,
+        action: "heartbeat.output_stale_orphan_reap_deferred",
+        entityType: "heartbeat_run",
+        entityId: input.run.id,
+        details: {
+          source: "recovery.scan_silent_active_runs",
+          adapterType: runningAgent.adapterType,
+          processPid: input.run.processPid ?? null,
+          processGroupId: input.run.processGroupId ?? null,
+          inMemoryHandle: runningProcesses.has(input.run.id),
+          existingEvaluationIssueId: existing?.id ?? null,
+        },
+      });
+      return { kind: "reap_deferred" as const, evaluationIssueId: existing?.id ?? null };
+    }
+
+    const silenceAgeMs = silenceAgeMsForRun(input.run, input.now);
+
+    // §11: check escalation horizon before creating or re-arming another evaluation.
+    // Only applies to critical-silence (>= CRITICAL_THRESHOLD) — suspicious runs are
+    // not subject to the horizon since they haven't crossed the operator-decision threshold.
+    if ((silenceAgeMs ?? 0) >= ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS) {
+      // §11 horizon counts re-arm windows that elapsed *after* the run crossed the
+      // critical threshold, not from silence onset. Pre-critical (suspicious-phase)
+      // continue/snooze acknowledgements must not shorten the post-critical horizon.
+      const criticalOnsetAt = silenceStartedAt
+        ? new Date(silenceStartedAt.getTime() + ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS)
+        : null;
+      const [watchdogConfig, reArmWindowsElapsed] = await Promise.all([
+        resolveWatchdogConfig(input.run.companyId),
+        countCompletedReArmWindowsForRun(input.run.companyId, input.run.id, criticalOnsetAt),
+      ]);
+      if (isEscalationHorizonTripped({ reArmWindowsElapsed, silenceAgeMs, config: watchdogConfig })) {
+        return escalateToHorizonTerminalDecision({
+          run: input.run,
+          runningAgent,
+          sourceIssue,
+          existingEvaluation: existing,
+          reArmWindowsElapsed,
+          silenceAgeMs,
+          silenceStartedAt,
+          now: input.now,
+        });
+      }
+    }
+
     const prefix = await getCompanyIssuePrefix(input.run.companyId);
     const evidence = await collectStaleRunEvidence({
       run: input.run,
@@ -1583,6 +1946,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       folded: 0,
       snoozed: 0,
       skipped: 0,
+      horizonEscalated: 0,
+      reapDeferred: 0,
       evaluationIssueIds: [] as string[],
     };
 
@@ -1596,6 +1961,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       else if (outcome.kind === "existing") result.existing += 1;
       else if (outcome.kind === "escalated") result.escalated += 1;
       else if (outcome.kind === "folded") result.folded += 1;
+      else if (outcome.kind === "horizon_escalated") result.horizonEscalated += 1;
+      else if (outcome.kind === "reap_deferred") result.reapDeferred += 1;
       else result.skipped += 1;
       if ("evaluationIssueId" in outcome && outcome.evaluationIssueId) {
         result.evaluationIssueIds.push(outcome.evaluationIssueId);
@@ -1692,13 +2059,22 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     }
 
     const decisionNow = input.now ?? new Date();
-    const effectiveSnoozedUntil = input.decision === "snooze"
-      ? input.snoozedUntil ?? null
-      : input.decision === "continue"
-        ? input.snoozedUntil && input.snoozedUntil > decisionNow
-          ? input.snoozedUntil
-          : new Date(decisionNow.getTime() + ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS)
-        : null;
+    let effectiveSnoozedUntil: Date | null;
+    if (input.decision === "snooze") {
+      effectiveSnoozedUntil = input.snoozedUntil ?? null;
+    } else if (input.decision === "continue") {
+      if (input.snoozedUntil && input.snoozedUntil > decisionNow) {
+        effectiveSnoozedUntil = input.snoozedUntil;
+      } else {
+        // Honor the company-configured re-arm window (watchdog.reArmWindow) so the
+        // re-arm/horizon contract stays portable per doc/execution-semantics.md §11,
+        // falling back to the default when unset.
+        const { reArmWindowMs } = await resolveWatchdogConfig(run.companyId);
+        effectiveSnoozedUntil = new Date(decisionNow.getTime() + reArmWindowMs);
+      }
+    } else {
+      effectiveSnoozedUntil = null;
+    }
 
     const [row] = await db
       .insert(heartbeatRunWatchdogDecisions)
