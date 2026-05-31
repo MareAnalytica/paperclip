@@ -169,6 +169,26 @@ describeEmbeddedPostgres("DEE-586 generalized interaction-result repair migratio
     expect(sug?.unparseableResult).toBeFalsy();
   });
 
+  it("repairs a versioned suggest_tasks row with a structurally-invalid (non-array) field", async () => {
+    // Codex P2 regression: version:1 present but skippedClientKeys is not an array.
+    // A version-only predicate would treat this as healthy; the type-level guard catches it.
+    const { companyId, issueId } = await seedIssue();
+    const id = await insertRow({
+      companyId, issueId, kind: "suggest_tasks", status: "rejected",
+      payloadJson: '{"version":1,"tasks":[{"clientKey":"a","title":"t"}]}',
+      resultJson: '{"version":1,"skippedClientKeys":"oops","createdTasks":[]}',
+    });
+
+    const before = await interactionsSvc.getById(id);
+    expect(before?.unparseableResult).toBe(true);
+
+    await runRepair();
+
+    const repaired = await interactionsSvc.getById(id);
+    expect(repaired?.result).toMatchObject({ version: 1 });
+    expect(repaired?.unparseableResult).toBeFalsy();
+  });
+
   it("resets a pending row with a non-null malformed result back to NULL", async () => {
     const { companyId, issueId } = await seedIssue();
     const id = await insertRow({

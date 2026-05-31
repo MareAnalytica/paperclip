@@ -20,6 +20,16 @@
 --   askUserQuestionsResultSchema    (version literal 1 + answers array)
 --   suggestTasksResultSchema        (version literal 1)
 --
+-- Scope boundary (deliberate, narrow blast radius on the control plane): the predicates
+-- check the schema's REQUIRED + structural (type-level) shape — version literal, the
+-- request_confirmation outcome enum, and array-typedness of answers/createdTasks/skippedClientKeys.
+-- They do NOT mirror element-level/nested zod rules (e.g. a createdTasks entry missing a valid
+-- issueId uuid, a non-uuid commentId), which are not safely expressible in SQL and risk
+-- FALSE-POSITIVE repair (destroying real data) far more than the false-negative they'd prevent.
+-- Such a version-present-but-nested-invalid row has never been observed; if one ever is, it is
+-- already safe (the DEE-582 read-guard degrades it instead of 400-ing) and is a fresh finding,
+-- not a brick. This matches 0095's intentionally-narrow stance.
+--
 -- Pending rows normally carry result = NULL and self-heal on the terminal-expire overwrite
 -- (expirePendingForTerminalIssue). A pending row with a non-null malformed result is corrupt;
 -- we reset it to NULL (the valid pending shape) rather than fabricate a resolution.
@@ -81,6 +91,8 @@ WHERE "kind" = 'suggest_tasks'
   AND "result" IS NOT NULL
   AND (
     ("result" ->> 'version') = '1'
+    AND ("result" -> 'createdTasks' IS NULL OR jsonb_typeof("result" -> 'createdTasks') = 'array')
+    AND ("result" -> 'skippedClientKeys' IS NULL OR jsonb_typeof("result" -> 'skippedClientKeys') = 'array')
   ) IS NOT TRUE;
 
 -- 4) pending rows with a non-null malformed result -> reset to the valid pending shape (NULL)
@@ -98,5 +110,7 @@ WHERE "status" = 'pending'
        AND ("result" ->> 'version') = '1'
        AND jsonb_typeof("result" -> 'answers') = 'array')
     OR ("kind" = 'suggest_tasks'
-       AND ("result" ->> 'version') = '1')
+       AND ("result" ->> 'version') = '1'
+       AND ("result" -> 'createdTasks' IS NULL OR jsonb_typeof("result" -> 'createdTasks') = 'array')
+       AND ("result" -> 'skippedClientKeys' IS NULL OR jsonb_typeof("result" -> 'skippedClientKeys') = 'array'))
   ) IS NOT TRUE;
