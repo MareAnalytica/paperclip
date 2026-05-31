@@ -75,6 +75,16 @@ export const ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS = 30 * 60 * 1000;
 const DEFAULT_WATCHDOG_ESCALATION_MAX_REARM_WINDOWS = 8; // ~4h at default 30m reArm
 const DEFAULT_WATCHDOG_ESCALATION_MAX_SILENT_HOURS: number | null = null; // disabled by default
 
+// §10 re-arm window clamp (CTO verdict ELI-776): the configurable
+// `companies.policies.watchdog.reArmWindow` is clamped to a sane operational
+// range. A window at or below the ~60s scan cadence would re-create an
+// evaluation every scan — the exact churn this contract exists to stop — and an
+// absurdly large window would silently suppress watchdog review of a
+// critical-silent run, which §11 requires an operator to see. So a misconfigured
+// `0`/negative/tiny value is clamped up to the floor and an absurd value down to
+// the ceiling, with a warning, rather than being honored verbatim.
+export const ACTIVE_RUN_OUTPUT_REARM_MIN_MS = 5 * 60 * 1000;
+export const ACTIVE_RUN_OUTPUT_REARM_MAX_MS = 24 * 60 * 60 * 1000;
 export type WatchdogConfig = {
   reArmWindowMs: number;
   escalationHorizon: {
@@ -750,7 +760,27 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       .where(eq(companies.id, companyId))
       .limit(1);
     const watchdog = parseObject(parseObject(row?.policies)["watchdog"]);
-    const reArmWindowMs = asNumber(watchdog["reArmWindow"], ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS);
+    // §10 re-arm window: absent/non-numeric falls back to the default; an explicit
+    // finite number overrides but is clamped to [MIN, MAX] (ELI-776) so a
+    // misconfigured value can never disarm the watchdog (≤ scan cadence) or
+    // indefinitely suppress review of a critical-silent run (absurdly large).
+    const requestedReArmWindowMs = asNumber(watchdog["reArmWindow"], ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS);
+    const reArmWindowMs = Math.min(
+      ACTIVE_RUN_OUTPUT_REARM_MAX_MS,
+      Math.max(ACTIVE_RUN_OUTPUT_REARM_MIN_MS, requestedReArmWindowMs),
+    );
+    if (reArmWindowMs !== requestedReArmWindowMs) {
+      logger.warn(
+        {
+          companyId,
+          requestedReArmWindowMs,
+          clampedReArmWindowMs: reArmWindowMs,
+          minMs: ACTIVE_RUN_OUTPUT_REARM_MIN_MS,
+          maxMs: ACTIVE_RUN_OUTPUT_REARM_MAX_MS,
+        },
+        "watchdog reArmWindow out of range; clamped to operational bounds (§10/ELI-776)",
+      );
+    }
     // §11 horizon config is nested under `escalationHorizon` per the silence-watchdog
     // contract (doc/execution-semantics.md §11): `watchdog.escalationHorizon.maxReArmWindows`
     // and `watchdog.escalationHorizon.maxSilentHours`. Resolution semantics (DEE-583 F2):
@@ -908,6 +938,109 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       )
       .limit(1);
     return row ?? null;
+  }
+
+  // §10: the creation-side dedupe counts *recently-resolved* evaluation actions,
+  // not only currently-open ones, so a run whose evaluation was just auto-resolved
+  // is not immediately re-created. Returns the most-recently-resolved scan-created
+  // evaluation for the run (terminal status), retained rather than deleted so the
+  // audit trail survives.
+  async function findLatestResolvedStaleRunEvaluation(companyId: string, runId: string) {
+    const [row] = await db
+      .select({
+        id: issues.id,
+        identifier: issues.identifier,
+        status: issues.status,
+        createdAt: issues.createdAt,
+        updatedAt: issues.updatedAt,
+      })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, companyId),
+          eq(issues.originKind, STALE_ACTIVE_RUN_EVALUATION_ORIGIN_KIND),
+          eq(issues.originId, runId),
+          isNull(issues.hiddenAt),
+          inArray(issues.status, ["done", "cancelled"]),
+        ),
+      )
+      .orderBy(desc(issues.createdAt))
+      .limit(1);
+    return row ?? null;
+  }
+
+  // Whether a watchdog decision row already accounts for a specific resolved
+  // evaluation. Keyed on the evaluation issue id (not a timestamp) so each
+  // resolved evaluation is re-armed at most once, and a fold's explicit
+  // `dismissed_false_positive` decision is never overwritten.
+  async function hasWatchdogDecisionForEvaluation(companyId: string, runId: string, evaluationIssueId: string) {
+    const [row] = await db
+      .select({ id: heartbeatRunWatchdogDecisions.id })
+      .from(heartbeatRunWatchdogDecisions)
+      .where(
+        and(
+          eq(heartbeatRunWatchdogDecisions.companyId, companyId),
+          eq(heartbeatRunWatchdogDecisions.runId, runId),
+          eq(heartbeatRunWatchdogDecisions.evaluationIssueId, evaluationIssueId),
+        ),
+      )
+      .limit(1);
+    return Boolean(row);
+  }
+
+  // §10: when a scan-created evaluation was auto-resolved without an explicit
+  // operator decision, record a `continue` decision that arms the re-arm window,
+  // so auto-resolution is never silent — it always leaves an explicit decision
+  // row with its re-arm timestamp. This is what stops the per-scan re-creation
+  // churn for both source-linked and source-less (timer/system) runs. Returns
+  // true when the run was re-armed (and a fresh evaluation should be suppressed
+  // for this scan).
+  async function reArmFromResolvedEvaluationIfNeeded(input: {
+    run: typeof heartbeatRuns.$inferSelect;
+    now: Date;
+  }): Promise<boolean> {
+    // Open evaluations are handled by createOrUpdateStaleRunEvaluation; only the
+    // recently-resolved case needs back-filling here.
+    const open = await findOpenStaleRunEvaluation(input.run.companyId, input.run.id);
+    if (open) return false;
+    const resolved = await findLatestResolvedStaleRunEvaluation(input.run.companyId, input.run.id);
+    if (!resolved) return false;
+    if (await hasWatchdogDecisionForEvaluation(input.run.companyId, input.run.id, resolved.id)) {
+      // Already accounted for (operator decision or source-resolved fold). The
+      // window for that decision has elapsed by the time we reach here, so let
+      // createOrUpdateStaleRunEvaluation mint a fresh evaluation.
+      return false;
+    }
+    const config = await resolveWatchdogConfig(input.run.companyId);
+    const snoozedUntil = new Date(input.now.getTime() + config.reArmWindowMs);
+    await db.insert(heartbeatRunWatchdogDecisions).values({
+      companyId: input.run.companyId,
+      runId: input.run.id,
+      evaluationIssueId: resolved.id,
+      decision: "continue",
+      snoozedUntil,
+      reason:
+        "Auto-arm: scan-created evaluation was resolved without an explicit decision; arming the re-arm window so the still-silent run is not re-reviewed every scan (§10).",
+      createdByRunId: null,
+    });
+    await logActivity(db, {
+      companyId: input.run.companyId,
+      actorType: "system",
+      actorId: "system",
+      agentId: input.run.agentId,
+      runId: input.run.id,
+      action: "heartbeat.watchdog_rearmed",
+      entityType: "heartbeat_run",
+      entityId: input.run.id,
+      details: {
+        source: "recovery.scan_silent_active_runs",
+        resolvedEvaluationIssueId: resolved.id,
+        resolvedEvaluationStatus: resolved.status,
+        snoozedUntil: snoozedUntil.toISOString(),
+        reArmWindowMs: config.reArmWindowMs,
+      },
+    });
+    return true;
   }
 
   async function buildRunOutputSilence(
@@ -1945,6 +2078,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       escalated: 0,
       folded: 0,
       snoozed: 0,
+      rearmed: 0,
       skipped: 0,
       horizonEscalated: 0,
       reapDeferred: 0,
@@ -1954,6 +2088,14 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     for (const run of candidates) {
       if (await latestActiveOutputQuietUntilDecision(run.companyId, run.id, now)) {
         result.snoozed += 1;
+        continue;
+      }
+      // §10: count recently-resolved evaluation actions, not only open ones. If
+      // this run's last evaluation was auto-resolved without an explicit decision,
+      // back-fill a `continue` decision arming the re-arm window instead of
+      // re-creating an evaluation every scan.
+      if (await reArmFromResolvedEvaluationIfNeeded({ run, now })) {
+        result.rearmed += 1;
         continue;
       }
       const outcome = await createOrUpdateStaleRunEvaluation({ run, now });
