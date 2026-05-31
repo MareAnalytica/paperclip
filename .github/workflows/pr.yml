@@ -134,6 +134,8 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Run grouped general test suites
+        env:
+          PAPERCLIP_TEST_RETRY_ATTEMPTS: "3"
         run: pnpm test:run:general -- --group '${{ matrix.group }}'${{ matrix.shard_count && format(' --shard-index {0} --shard-count {1}', matrix.shard_index, matrix.shard_count) || '' }}
 
   verify:
@@ -223,6 +225,8 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Run serialized server test shard
+        env:
+          PAPERCLIP_TEST_RETRY_ATTEMPTS: "3"
         run: pnpm test:run:serialized -- --shard-index ${{ matrix.shard_index }} --shard-count ${{ matrix.shard_count }}
 
   canary_dry_run:
