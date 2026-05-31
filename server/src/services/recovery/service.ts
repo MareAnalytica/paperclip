@@ -753,17 +753,29 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     const reArmWindowMs = asNumber(watchdog["reArmWindow"], ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS);
     // §11 horizon config is nested under `escalationHorizon` per the silence-watchdog
     // contract (doc/execution-semantics.md §11): `watchdog.escalationHorizon.maxReArmWindows`
-    // and `watchdog.escalationHorizon.maxSilentHours`. null/undefined means "use default";
-    // an explicit number overrides.
+    // and `watchdog.escalationHorizon.maxSilentHours`. Resolution semantics (DEE-583 F2):
+    //   - absent (key missing) OR a whole-policy-absent `watchdog`/`escalationHorizon`
+    //     (no `escalationHorizon` key) -> use the built-in DEFAULT. This is the back-compat
+    //     path: existing deployments with no watchdog policy keep the default horizon.
+    //   - explicit `null` -> DISABLE that horizon (propagates null, which
+    //     `isEscalationHorizonTripped` treats as "skip this check").
+    //   - explicit number -> override.
+    // The absent-vs-null distinction matters because the value `null` is the documented
+    // disable knob; coercing it to the default (8) made disable-by-null unreachable for the
+    // windows horizon (the maxSilentHours default already being null masked the asymmetry).
     const horizon = parseObject(watchdog["escalationHorizon"]);
     const rawMaxReArmWindows = "maxReArmWindows" in horizon ? horizon["maxReArmWindows"] : undefined;
-    const maxReArmWindows = typeof rawMaxReArmWindows === "number"
-      ? rawMaxReArmWindows
-      : DEFAULT_WATCHDOG_ESCALATION_MAX_REARM_WINDOWS;
+    const maxReArmWindows = rawMaxReArmWindows === null
+      ? null
+      : typeof rawMaxReArmWindows === "number"
+        ? rawMaxReArmWindows
+        : DEFAULT_WATCHDOG_ESCALATION_MAX_REARM_WINDOWS;
     const rawMaxSilentHours = "maxSilentHours" in horizon ? horizon["maxSilentHours"] : undefined;
-    const maxSilentHours = typeof rawMaxSilentHours === "number"
-      ? rawMaxSilentHours
-      : DEFAULT_WATCHDOG_ESCALATION_MAX_SILENT_HOURS;
+    const maxSilentHours = rawMaxSilentHours === null
+      ? null
+      : typeof rawMaxSilentHours === "number"
+        ? rawMaxSilentHours
+        : DEFAULT_WATCHDOG_ESCALATION_MAX_SILENT_HOURS;
     return {
       reArmWindowMs,
       escalationHorizon: { maxReArmWindows, maxSilentHours },

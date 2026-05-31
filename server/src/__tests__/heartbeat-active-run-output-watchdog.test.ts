@@ -960,7 +960,6 @@ describeEmbeddedPostgres("watchdog escalation horizon (§11)", () => {
 
     const recovery = recoveryService(db, {
       enqueueWakeup: vi.fn(async () => null),
-      issueService: (await import("../services/issues.ts")).issueService(db),
     });
     const result = await recovery.scanSilentActiveRuns({ now, companyId });
 
@@ -977,7 +976,6 @@ describeEmbeddedPostgres("watchdog escalation horizon (§11)", () => {
 
     const recovery = recoveryService(db, {
       enqueueWakeup: vi.fn(async () => null),
-      issueService: (await import("../services/issues.ts")).issueService(db),
     });
     const result = await recovery.scanSilentActiveRuns({ now, companyId });
 
@@ -1017,7 +1015,6 @@ describeEmbeddedPostgres("watchdog escalation horizon (§11)", () => {
 
     const recovery = recoveryService(db, {
       enqueueWakeup: vi.fn(async () => null),
-      issueService: (await import("../services/issues.ts")).issueService(db),
     });
     const result = await recovery.scanSilentActiveRuns({ now, companyId });
 
@@ -1037,13 +1034,40 @@ describeEmbeddedPostgres("watchdog escalation horizon (§11)", () => {
 
     const recovery = recoveryService(db, {
       enqueueWakeup: vi.fn(async () => null),
-      issueService: (await import("../services/issues.ts")).issueService(db),
     });
     const result = await recovery.scanSilentActiveRuns({ now, companyId });
 
     expect(result.horizonEscalated).toBe(1);
 
     // Verify run still running (not mutated)
+    const [activeRun] = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId));
+    expect(activeRun!.status).toBe("running");
+  });
+
+  it("does NOT horizon-escalate when maxReArmWindows is explicitly null (disabled), even past the default", async () => {
+    // Regression for DEE-583 F2: an explicit `maxReArmWindows: null` must DISABLE the
+    // re-arm-windows horizon, not coerce to the default (8). Here 8 elapsed windows would
+    // trip the default, and maxSilentHours is left absent (resolving to its null default,
+    // also disabled), so with the windows horizon disabled NO horizon should trip and the
+    // run must take the normal evaluation path without a horizon escalation.
+    const now = new Date();
+    const { companyId, runId } = await seedHorizonRun({
+      now,
+      priorReArmWindows: 8, // at/over the default horizon — would trip if null were coerced to 8
+      watchdogPolicies: { escalationHorizon: { maxReArmWindows: null } },
+    });
+
+    const recovery = recoveryService(db, {
+      enqueueWakeup: vi.fn(async () => null),
+    });
+    const result = await recovery.scanSilentActiveRuns({ now, companyId });
+
+    expect(result.horizonEscalated).toBe(0);
+
+    // Live run must remain untouched (the §11 no-mutation invariant holds on the non-horizon path too).
     const [activeRun] = await db
       .select({ status: heartbeatRuns.status })
       .from(heartbeatRuns)
@@ -1060,7 +1084,6 @@ describeEmbeddedPostgres("watchdog escalation horizon (§11)", () => {
 
     const recovery = recoveryService(db, {
       enqueueWakeup: vi.fn(async () => null),
-      issueService: (await import("../services/issues.ts")).issueService(db),
     });
 
     // Three consecutive scans with the run still silent and still running.
@@ -1114,7 +1137,6 @@ describeEmbeddedPostgres("watchdog escalation horizon (§11)", () => {
 
     const recovery = recoveryService(db, {
       enqueueWakeup: vi.fn(async () => null),
-      issueService: (await import("../services/issues.ts")).issueService(db),
     });
     const result = await recovery.scanSilentActiveRuns({ now, companyId });
 
@@ -1132,7 +1154,6 @@ describeEmbeddedPostgres("watchdog escalation horizon (§11)", () => {
 
     const recovery = recoveryService(db, {
       enqueueWakeup: vi.fn(async () => null),
-      issueService: (await import("../services/issues.ts")).issueService(db),
     });
     const result = await recovery.scanSilentActiveRuns({ now, companyId });
 
@@ -1199,7 +1220,6 @@ describeEmbeddedPostgres("watchdog escalation horizon (§11)", () => {
 
     const recovery = recoveryService(db, {
       enqueueWakeup: vi.fn(async () => null),
-      issueService: (await import("../services/issues.ts")).issueService(db),
     });
     const result = await recovery.scanSilentActiveRuns({ now, companyId });
 
