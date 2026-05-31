@@ -1422,42 +1422,44 @@ export function mergeModelProfileAdapterConfig(input: {
   };
 }
 
-// DEE-659: a claude model id (e.g. claude-opus-4-8) must never reach a
-// non-claude failover adapter. The check is intentionally claude-family
-// specific so a provider-valid model that a non-claude adapter legitimately
-// wants (supplied by the fallback chain entry, the adapter model profile, or an
-// issue override) is preserved, while an inherited claude id from ANY of those
-// sources is removed.
-const CLAUDE_MODEL_ID_RE = /^claude[-_]/i;
-
 /**
- * Adapter-boundary guard (DEE-659): when a provider fallback engages a
- * non-claude adapter (grok_local / codex_local), the merged run config can
- * still carry a claude `model` id — from the agent's primary adapterConfig, or
- * from an issue-level custom model override that is merged after the base
- * config. grok-local then invokes `--model claude-opus-4-8` and the CLI rejects
- * it ("unknown model id"), so the run errors and the agent sticks in
- * status=error during claude-exhaustion windows (parent incident DEE-658).
+ * Adapter-boundary guard (DEE-659): a provider fallback that crosses adapter
+ * providers must never hand the engaged adapter a model id belonging to a
+ * different provider.
  *
- * Applied to the FINAL merged adapter config so it catches the claude id no
- * matter which layer supplied it. A provider-valid model the foreign adapter
- * legitimately wants (e.g. a grok/codex model from the chain entry or override)
- * is not claude-family and is left untouched; with no model the adapter uses
- * its own provider-valid default.
+ * During failover the merged run config can carry a model inherited from the
+ * agent's primary adapterConfig (e.g. `claude-opus-4-8`) or from an issue-level
+ * custom model override — both provider-specific to the PRIMARY adapter. The
+ * grok/codex CLI then runs `--model claude-opus-4-8` and rejects it ("unknown
+ * model id"), the run errors, and the agent sticks in status=error during
+ * exhaustion windows (parent incident DEE-658). The same hazard exists for
+ * non-claude -> non-claude hops (e.g. codex_local -> grok_local carrying a
+ * codex model id).
+ *
+ * When the engaged fallback adapter differs from the agent's primary adapter,
+ * force the model to come ONLY from the fallback adapter's own configuration —
+ * its chain entry or its adapter model profile, both already resolved for the
+ * fallback adapter (`fallbackAdapterModel`). With no such model, drop it so the
+ * adapter uses its own provider-valid default. A failover that stays on the
+ * agent's own adapter (e.g. a claude account rotation) is left untouched.
  */
-export function stripClaudeModelForNonClaudeFallback(input: {
+export function enforceFallbackAdapterModel(input: {
   config: Record<string, unknown>;
+  agentAdapterType: string;
   selectedFallbackAdapterType: ProviderFallbackAdapterType | null;
+  fallbackAdapterModel: string | null;
 }): Record<string, unknown> {
-  const adapterType = input.selectedFallbackAdapterType;
-  if (!adapterType || adapterType === "claude_local") return input.config;
-  const model = input.config.model;
-  if (typeof model === "string" && CLAUDE_MODEL_ID_RE.test(model.trim())) {
-    const next = { ...input.config };
+  const fallback = input.selectedFallbackAdapterType;
+  // No failover, or a failover that stays on the agent's own adapter, cannot
+  // cross a provider boundary: the inherited model is already valid.
+  if (!fallback || fallback === input.agentAdapterType) return input.config;
+  const next = { ...input.config };
+  if (input.fallbackAdapterModel) {
+    next.model = input.fallbackAdapterModel;
+  } else {
     delete next.model;
-    return next;
   }
-  return input.config;
+  return next;
 }
 
 function modelProfileRunMetadata(
@@ -8026,7 +8028,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     } else {
       delete context.paperclipModelProfile;
     }
-    const mergedConfig = stripClaudeModelForNonClaudeFallback({
+    // DEE-659: the only model valid for an engaged cross-provider fallback is
+    // one resolved for the fallback adapter itself — its chain entry model, or
+    // its adapter model profile (already resolved for executionAdapterType).
+    const fallbackAdapterModel = selectedFallbackAdapterType
+      ? readNonEmptyString(parseObject(providerFallbackSelection.adapterConfig).model) ??
+        readNonEmptyString(parseObject(modelProfileApplication.adapterConfig).model)
+      : null;
+    const mergedConfig = enforceFallbackAdapterModel({
       config: mergeModelProfileAdapterConfig({
         baseConfig: persistedWorkspaceManagedConfig,
         modelProfile: modelProfileApplication,
@@ -8040,7 +8049,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             }
           : issueAssigneeOverrides?.adapterConfig ?? null,
       }),
+      agentAdapterType: agent.adapterType,
       selectedFallbackAdapterType,
+      fallbackAdapterModel: fallbackAdapterModel ?? null,
     });
     const configSnapshot = buildExecutionWorkspaceConfigSnapshot(mergedConfig, selectedEnvironmentId);
     const executionRunConfig = stripWorkspaceRuntimeFromExecutionRunConfig(mergedConfig);
