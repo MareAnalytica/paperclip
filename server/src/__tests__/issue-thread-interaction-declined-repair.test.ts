@@ -9,8 +9,8 @@ import {
   instanceSettings,
   issueThreadInteractions,
   issues,
-  sql,
 } from "@paperclipai/db";
+import { sql } from "drizzle-orm";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
