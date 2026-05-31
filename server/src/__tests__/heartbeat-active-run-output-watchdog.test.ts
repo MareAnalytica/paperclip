@@ -830,8 +830,17 @@ describeEmbeddedPostgres("watchdog escalation horizon (§11)", () => {
     const issueId = randomUUID();
     const runId = randomUUID();
     const issuePrefix = `H${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
-    // Started well past critical threshold so the horizon check applies
-    const startedAt = new Date(opts.now.getTime() - ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS - 60_000);
+    // Silence must clear the critical threshold AND leave room for N post-critical
+    // re-arm windows: §11 counts re-arm windows acknowledged *after* critical onset,
+    // not from silence start. +60s nudges silenceAge just past the critical threshold.
+    const reArmWindows = Math.max(0, opts.priorReArmWindows);
+    const startedAt = new Date(
+      opts.now.getTime() -
+        ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS -
+        reArmWindows * 30 * 60 * 1000 -
+        60_000,
+    );
+    const criticalOnset = new Date(startedAt.getTime() + ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS);
 
     await db.insert(companies).values({
       id: companyId,
@@ -895,9 +904,10 @@ describeEmbeddedPostgres("watchdog escalation horizon (§11)", () => {
     });
     await db.update(issues).set({ executionRunId: runId }).where(eq(issues.id, issueId));
 
-    // Insert N prior continue decisions to simulate elapsed re-arm windows
-    for (let i = 0; i < opts.priorReArmWindows; i++) {
-      const windowTime = new Date(startedAt.getTime() + i * 30 * 60 * 1000);
+    // Insert N prior continue decisions to simulate elapsed re-arm windows, each
+    // acknowledged AFTER the critical-threshold onset so they count toward the §11 horizon.
+    for (let i = 0; i < reArmWindows; i++) {
+      const windowTime = new Date(criticalOnset.getTime() + i * 30 * 60 * 1000);
       await db.insert(heartbeatRunWatchdogDecisions).values({
         companyId,
         runId,
@@ -1049,6 +1059,37 @@ describeEmbeddedPostgres("watchdog escalation horizon (§11)", () => {
     expect(activeRun!.status).toBe("running");
   });
 
+  it("does NOT count pre-critical (suspicious-phase) re-arm windows toward the §11 horizon", async () => {
+    const now = new Date();
+    // No post-critical windows; the run is just past the critical threshold.
+    const { companyId, runId } = await seedHorizonRun({
+      now,
+      priorReArmWindows: 0,
+    });
+
+    // Seed 8 continue decisions during the SUSPICIOUS phase (2h ago — before critical onset
+    // at ~now-60s). Under a from-silence-start count these would trip the default-8 horizon;
+    // the contract measures the horizon only after the critical threshold, so they must NOT.
+    for (let i = 0; i < 8; i++) {
+      const preCriticalTime = new Date(now.getTime() - 2 * 60 * 60 * 1000 - i * 60_000);
+      await db.insert(heartbeatRunWatchdogDecisions).values({
+        companyId,
+        runId,
+        decision: "continue",
+        snoozedUntil: new Date(preCriticalTime.getTime() + 30 * 60 * 1000),
+        createdAt: preCriticalTime,
+      });
+    }
+
+    const recovery = recoveryService(db, {
+      enqueueWakeup: vi.fn(async () => null),
+      issueService: (await import("../services/issues.ts")).issueService(db),
+    });
+    const result = await recovery.scanSilentActiveRuns({ now, companyId });
+
+    expect(result.horizonEscalated).toBe(0);
+  });
+
   it("ignores legacy flat watchdog.maxReArmWindows — contract requires nested escalationHorizon", async () => {
     const now = new Date();
     const { companyId } = await seedHorizonRun({
@@ -1074,7 +1115,12 @@ describeEmbeddedPostgres("watchdog escalation horizon (§11)", () => {
     const coderId = randomUUID();
     const runId = randomUUID();
     const issuePrefix = `S${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
-    const startedAt = new Date(now.getTime() - ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS - 60_000);
+    // Silence long enough to fit 8 post-critical re-arm windows (§11 counts windows
+    // after critical onset, not from silence start).
+    const startedAt = new Date(
+      now.getTime() - ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS - 8 * 30 * 60 * 1000 - 60_000,
+    );
+    const criticalOnset = new Date(startedAt.getTime() + ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS);
 
     await db.insert(companies).values({
       id: companyId,
@@ -1108,14 +1154,15 @@ describeEmbeddedPostgres("watchdog escalation horizon (§11)", () => {
       contextSnapshot: {}, // no issueId — source-less run
       logBytes: 0,
     });
-    // Add 8 continue decisions to trip default horizon
+    // Add 8 continue decisions AFTER critical onset to trip the default horizon
     for (let i = 0; i < 8; i++) {
+      const windowTime = new Date(criticalOnset.getTime() + i * 30 * 60 * 1000);
       await db.insert(heartbeatRunWatchdogDecisions).values({
         companyId,
         runId,
         decision: "continue",
-        snoozedUntil: new Date(startedAt.getTime() + (i + 1) * 30 * 60 * 1000),
-        createdAt: new Date(startedAt.getTime() + i * 30 * 60 * 1000),
+        snoozedUntil: new Date(windowTime.getTime() + 30 * 60 * 1000),
+        createdAt: windowTime,
       });
     }
 

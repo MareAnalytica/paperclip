@@ -773,13 +773,14 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   async function countCompletedReArmWindowsForRun(
     companyId: string,
     runId: string,
-    silenceStartedAt: Date | null,
+    countedAfter: Date | null,
   ): Promise<number> {
-    // Count distinct continue/snooze decisions recorded after silence started.
-    // Each one represents one completed re-arm window cycle. This is the basis
-    // for the §11 horizon check: if enough windows have passed without recovery,
-    // the watchdog escalates to a terminal operator decision instead of re-arming.
-    const after = silenceStartedAt ?? new Date(0);
+    // Count distinct continue/snooze decisions recorded after `countedAfter`.
+    // Each one represents one completed re-arm window cycle. Per doc/execution-semantics.md
+    // §11 the horizon is measured *after the critical threshold* — callers pass the
+    // critical-threshold onset (not silence onset) so re-arm windows acknowledged during
+    // the merely-suspicious phase do not consume the post-critical escalation budget.
+    const after = countedAfter ?? new Date(0);
     const decisions = await db
       .select({ id: heartbeatRunWatchdogDecisions.id })
       .from(heartbeatRunWatchdogDecisions)
@@ -1693,9 +1694,15 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     // Only applies to critical-silence (>= CRITICAL_THRESHOLD) — suspicious runs are
     // not subject to the horizon since they haven't crossed the operator-decision threshold.
     if ((silenceAgeMs ?? 0) >= ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS) {
+      // §11 horizon counts re-arm windows that elapsed *after* the run crossed the
+      // critical threshold, not from silence onset. Pre-critical (suspicious-phase)
+      // continue/snooze acknowledgements must not shorten the post-critical horizon.
+      const criticalOnsetAt = silenceStartedAt
+        ? new Date(silenceStartedAt.getTime() + ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS)
+        : null;
       const [watchdogConfig, reArmWindowsElapsed] = await Promise.all([
         resolveWatchdogConfig(input.run.companyId),
-        countCompletedReArmWindowsForRun(input.run.companyId, input.run.id, silenceStartedAt),
+        countCompletedReArmWindowsForRun(input.run.companyId, input.run.id, criticalOnsetAt),
       ]);
       if (isEscalationHorizonTripped({ reArmWindowsElapsed, silenceAgeMs, config: watchdogConfig })) {
         return escalateToHorizonTerminalDecision({
