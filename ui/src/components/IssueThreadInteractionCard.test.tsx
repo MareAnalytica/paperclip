@@ -274,4 +274,50 @@ describe("IssueThreadInteractionCard", () => {
       "This request could not be resolved. Try again or create a new request.",
     );
   });
+
+  it("renders a degraded (unparseable payload) interaction as a non-actionable needs-repair state", () => {
+    const onAcceptInteraction = vi.fn();
+    const onRejectInteraction = vi.fn();
+    const host = renderCard({
+      interaction: {
+        ...pendingRequestConfirmationInteraction,
+        unparseablePayload: true,
+      },
+      onAcceptInteraction,
+      onRejectInteraction,
+    });
+
+    expect(host.textContent).toContain("Needs repair");
+    expect(host.textContent).toContain("This interaction is corrupted and can't be acted on");
+    // The normal decision controls must not render for a degraded row.
+    const buttonLabels = Array.from(host.querySelectorAll("button")).map(
+      (button) => button.textContent ?? "",
+    );
+    expect(buttonLabels.some((label) => label.includes("Approve plan"))).toBe(false);
+    expect(buttonLabels.some((label) => label.includes("Request revisions"))).toBe(false);
+  });
+
+  it("offers cancel as the escape hatch on a pending degraded interaction", async () => {
+    const onCancelInteraction = vi.fn(async () => undefined);
+    const host = renderCard({
+      interaction: {
+        ...pendingRequestConfirmationInteraction,
+        unparseableResult: true,
+      },
+      onCancelInteraction,
+    });
+
+    const cancelButton = Array.from(host.querySelectorAll("button")).find((button) =>
+      button.textContent?.includes("Cancel interaction"),
+    );
+    expect(cancelButton).toBeTruthy();
+
+    await act(async () => {
+      cancelButton?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+
+    expect(onCancelInteraction).toHaveBeenCalledWith(
+      expect.objectContaining({ kind: "request_confirmation", unparseableResult: true }),
+    );
+  });
 });

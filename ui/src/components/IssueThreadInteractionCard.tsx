@@ -44,7 +44,7 @@ interface IssueThreadInteractionCardProps {
     answers: AskUserQuestionsAnswer[],
   ) => Promise<void> | void;
   onCancelInteraction?: (
-    interaction: AskUserQuestionsInteraction,
+    interaction: IssueThreadInteraction,
   ) => Promise<void> | void;
 }
 
@@ -1204,6 +1204,78 @@ function RequestConfirmationCard({
   );
 }
 
+/**
+ * DEE-636: a degraded interaction (`unparseablePayload` / `unparseableResult`, see
+ * DEE-582) carries only an inert placeholder payload, so its real prompt/tasks/questions
+ * are unknown and unrecoverable from the read path. The server bars accept/reject/answer
+ * with a clean 422 and allows only cancel. Render a flagged, non-actionable "needs repair"
+ * body instead of empty decision controls that would just fail, and surface the
+ * server-allowed cancel as the operator escape hatch.
+ */
+function DegradedInteractionBody({
+  interaction,
+  onCancelInteraction,
+}: {
+  interaction: IssueThreadInteraction;
+  onCancelInteraction?: (interaction: IssueThreadInteraction) => Promise<void> | void;
+}) {
+  const [cancelling, setCancelling] = useState(false);
+  const isPending = interaction.status === "pending";
+  const degradedParts: string[] = [];
+  if (interaction.unparseablePayload) degradedParts.push("payload");
+  if (interaction.unparseableResult) degradedParts.push("result");
+  const partsLabel =
+    degradedParts.length === 2
+      ? "payload and result"
+      : degradedParts[0] ?? "stored data";
+
+  async function handleCancel() {
+    if (!onCancelInteraction) return;
+    setCancelling(true);
+    try {
+      await onCancelInteraction(interaction);
+    } finally {
+      setCancelling(false);
+    }
+  }
+
+  return (
+    <div className="space-y-3">
+      <div className="flex items-start gap-3 rounded-sm border border-amber-500/60 bg-amber-500/10 px-4 py-3 text-sm leading-6 text-amber-900 dark:text-amber-100">
+        <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+        <div className="space-y-1">
+          <div className="font-semibold">This interaction is corrupted and can't be acted on</div>
+          <p>
+            Its stored {partsLabel} could not be parsed, so the original request can no longer be
+            shown or trusted. Confirm, decline, submit, and reject are disabled. Contact an operator
+            to repair the stored row.
+          </p>
+        </div>
+      </div>
+
+      {isPending && onCancelInteraction ? (
+        <div className="flex flex-wrap items-center justify-end gap-2">
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={cancelling}
+            onClick={() => void handleCancel()}
+          >
+            {cancelling ? (
+              <>
+                <Loader2 className="mr-2 h-3.5 w-3.5 animate-spin" />
+                Cancelling...
+              </>
+            ) : (
+              "Cancel interaction"
+            )}
+          </Button>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 export function IssueThreadInteractionCard({
   interaction,
   agentMap,
@@ -1214,8 +1286,16 @@ export function IssueThreadInteractionCard({
   onSubmitInteractionAnswers,
   onCancelInteraction,
 }: IssueThreadInteractionCardProps) {
-  const StatusIcon = statusIcon(interaction.status);
-  const styles = statusClasses(interaction.status);
+  const isDegraded =
+    interaction.unparseablePayload === true || interaction.unparseableResult === true;
+  const StatusIcon = isDegraded ? AlertTriangle : statusIcon(interaction.status);
+  const styles = isDegraded
+    ? {
+        shell: "border-amber-400/70 bg-transparent",
+        badge:
+          "border-amber-500/60 bg-amber-500/10 text-amber-900 dark:bg-amber-500/15 dark:text-amber-100",
+      }
+    : statusClasses(interaction.status);
   const createdByLabel = resolveActorLabel({
     agentId: interaction.createdByAgentId,
     userId: interaction.createdByUserId,
@@ -1254,6 +1334,12 @@ export function IssueThreadInteractionCard({
                   : "Wakes assignee"}
               </span>
             ) : null}
+            {isDegraded ? (
+              <span className="inline-flex items-center gap-1 rounded-sm border border-amber-500/60 bg-amber-500/10 px-2.5 py-1 text-[11px] font-semibold uppercase tracking-[0.16em] text-amber-900 dark:text-amber-100">
+                <AlertTriangle className="h-3.5 w-3.5" />
+                Needs repair
+              </span>
+            ) : null}
           </div>
 
           <div className="mt-3 text-lg font-bold text-foreground">
@@ -1285,7 +1371,12 @@ export function IssueThreadInteractionCard({
       </div>
 
       <div className="mt-5">
-        {interaction.kind === "suggest_tasks" ? (
+        {isDegraded ? (
+          <DegradedInteractionBody
+            interaction={interaction}
+            onCancelInteraction={onCancelInteraction}
+          />
+        ) : interaction.kind === "suggest_tasks" ? (
           <SuggestTasksCard
             interaction={interaction}
             agentMap={agentMap}

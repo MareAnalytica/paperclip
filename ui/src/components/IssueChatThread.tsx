@@ -170,7 +170,7 @@ interface IssueChatMessageContext {
     answers: AskUserQuestionsAnswer[],
   ) => Promise<void> | void;
   onCancelInteraction?: (
-    interaction: AskUserQuestionsInteraction,
+    interaction: IssueThreadInteraction,
   ) => Promise<void> | void;
   issueStatus?: string;
   successfulRunHandoff?: SuccessfulRunHandoffState | null;
@@ -369,7 +369,7 @@ interface IssueChatThreadProps {
     answers: AskUserQuestionsAnswer[],
   ) => Promise<void> | void;
   onCancelInteraction?: (
-    interaction: AskUserQuestionsInteraction,
+    interaction: IssueThreadInteraction,
   ) => Promise<void> | void;
   composerRef?: Ref<IssueChatComposerHandle>;
   issueWorkMode?: IssueWorkMode;
