@@ -1,0 +1,102 @@
+# ──────────────────────────────────────────────────────────────────────────
+# Build & publish the custom ARC runner image with Playwright pre-baked.
+# (DEE-641, durable follow-up to DEE-640.)
+#
+# - PRs touching the image run the version-pin guard only (no build/push).
+# - Pushes to main and manual dispatch build the image and push it to the
+#   in-cluster registry the ARC set already pulls from.
+# - The image is tagged both with the pinned Playwright version and `latest`.
+# ──────────────────────────────────────────────────────────────────────────
+name: ARC Runner Image
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docker/arc-runner/Dockerfile"
+      - ".github/workflows/arc-runner-image.yml"
+      - "pnpm-lock.yaml"
+  pull_request:
+    paths:
+      - "docker/arc-runner/Dockerfile"
+      - ".github/workflows/arc-runner-image.yml"
+      - "pnpm-lock.yaml"
+  workflow_dispatch: {}
+
+concurrency:
+  group: arc-runner-image-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: arc-runner-set
+    timeout-minutes: 30
+    env:
+      REGISTRY: ${{ vars.DOCKER_REGISTRY_HOST || 'registry.mareanalytica.com' }}
+      IMAGE: arc-runner-playwright
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # CI guard (DEE-641 acceptance): the Dockerfile's pinned Playwright version
+      # MUST equal the version CI actually resolves, else the baked chromium
+      # revision won't match the one the e2e tests launch. The resolved version is
+      # read from pnpm-lock.yaml (not node_modules — this runs before any install,
+      # and @playwright/test is a range in package.json so the lockfile is the
+      # source of truth; the workflow also re-runs on lockfile refresh).
+      - name: Verify Playwright pin tracks the lockfile
+        id: pin
+        run: |
+          set -euo pipefail
+          repo_ver="$(grep -oP "^\s*'@playwright/test@\K[0-9][0-9.]*" pnpm-lock.yaml | head -1)"
+          file_ver="$(grep -oP 'ARG PLAYWRIGHT_VERSION=\K[0-9][0-9.]*' docker/arc-runner/Dockerfile)"
+          echo "lockfile @playwright/test = ${repo_ver}"
+          echo "Dockerfile pin            = ${file_ver}"
+          if [ -z "${repo_ver}" ]; then
+            echo "::error::could not resolve @playwright/test version from pnpm-lock.yaml"; exit 1
+          fi
+          if [ "${repo_ver}" != "${file_ver}" ]; then
+            echo "::error file=docker/arc-runner/Dockerfile::PLAYWRIGHT_VERSION (${file_ver}) != lockfile @playwright/test (${repo_ver}); bump the Dockerfile pin."
+            exit 1
+          fi
+          echo "version=${repo_ver}" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for Docker (DinD)
+        if: github.event_name != 'pull_request'
+        run: |
+          for i in $(seq 1 30); do
+            docker info >/dev/null 2>&1 && break
+            echo "waiting for docker ${i}/30..."; sleep 2
+          done
+          docker info >/dev/null 2>&1 || { echo "Docker not ready after 60s"; exit 1; }
+
+      - name: Verify registry connectivity
+        if: github.event_name != 'pull_request'
+        run: |
+          set -euo pipefail
+          # The ARC runners mount the in-cluster registry CA here; fall back to
+          # the system trust store if it is absent (e.g. a public registry via
+          # vars.DOCKER_REGISTRY_HOST).
+          ca=""
+          [ -f /etc/ssl/certs/registry-ca.crt ] && ca="--cacert /etc/ssl/certs/registry-ca.crt"
+          curl -sf ${ca} "https://${REGISTRY}/v2/" >/dev/null
+          echo "registry ${REGISTRY} reachable"
+
+      - name: Build and push
+        if: github.event_name != 'pull_request'
+        env:
+          PW: ${{ steps.pin.outputs.version }}
+        run: |
+          set -euo pipefail
+          ver_tag="${REGISTRY}/${IMAGE}:${PW}"
+          latest_tag="${REGISTRY}/${IMAGE}:latest"
+          docker build \
+            --build-arg PLAYWRIGHT_VERSION="${PW}" \
+            -t "${ver_tag}" -t "${latest_tag}" \
+            -f docker/arc-runner/Dockerfile docker/arc-runner
+          docker push "${ver_tag}"
+          docker push "${latest_tag}"
+          echo "pushed ${ver_tag} and ${latest_tag}"
