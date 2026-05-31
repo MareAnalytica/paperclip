@@ -36,6 +36,7 @@ import {
   suggestTasksResultSchema,
 } from "@paperclipai/shared";
 import { conflict, notFound, unprocessable } from "../errors.js";
+import { logger } from "../middleware/logger.js";
 import { issueService } from "./issues.js";
 
 type InteractionActor = {
@@ -186,6 +187,44 @@ function assertHumanBoardPrReviewEscalationAllowed(input: CreateIssueThreadInter
   );
 }
 
+type InteractionFieldSchema<T> = {
+  safeParse: (value: unknown) => { success: true; data: T } | { success: false; error: unknown };
+};
+
+/**
+ * Defense-in-depth read-path guard (DEE-582). A single forward-incompatible or
+ * operator-corrupted `payload`/`result` row must NOT 400 the whole
+ * `GET /interactions` collection (or block terminal auto-resolve) the way a
+ * hard `.parse()` did — the DEE-441 poison-row failure mode. On parse failure
+ * we log a structured warning carrying the interaction id and signal the caller
+ * to degrade the field while keeping the row visible (flagged) for repair.
+ */
+function safeParseInteractionField<T>(
+  schema: InteractionFieldSchema<T>,
+  value: unknown,
+  ctx: { interactionId: string; kind: string; field: "payload" | "result" },
+): { ok: true; value: T } | { ok: false } {
+  const parsed = schema.safeParse(value);
+  if (parsed.success) return { ok: true, value: parsed.data };
+  // Log only sanitized issue metadata (code + path). Never log `parsed.error`
+  // wholesale: a ZodError's `received`/`message` can echo the corrupt stored
+  // value (potentially secrets/PII for operator-written rows) into server logs.
+  const zodError = parsed.error as { issues?: Array<{ code?: unknown; path?: unknown }> };
+  const parseIssues = Array.isArray(zodError?.issues)
+    ? zodError.issues.map((issue) => ({ code: issue.code, path: issue.path }))
+    : undefined;
+  logger.warn(
+    {
+      interactionId: ctx.interactionId,
+      kind: ctx.kind,
+      field: ctx.field,
+      parseIssues,
+    },
+    `issue thread interaction row has unparseable ${ctx.field}; returning degraded interaction (DEE-582)`,
+  );
+  return { ok: false };
+}
+
 function hydrateInteraction(
   row: IssueThreadInteractionRow,
 ): IssueThreadInteraction {
@@ -195,31 +234,73 @@ function hydrateInteraction(
     status: row.status as IssueThreadInteraction["status"],
     continuationPolicy: row.continuationPolicy as IssueThreadInteraction["continuationPolicy"],
   };
+  const ctx = { interactionId: row.id, kind: row.kind };
 
+  // DEE-582: parse defensively. A single forward-incompatible / corrupted row
+  // must not 400 GET /interactions (or block terminal auto-resolve). On failure
+  // we degrade the field — `result` to null, `payload` to a minimal inert
+  // placeholder — flag the row, and log; we never throw or return a raw,
+  // untyped payload that downstream consumers would NPE on.
   switch (row.kind) {
-    case "suggest_tasks":
+    case "suggest_tasks": {
+      const payload = safeParseInteractionField(suggestTasksPayloadSchema, row.payload, { ...ctx, field: "payload" });
+      const result = row.result == null
+        ? ({ ok: true, value: null } as const)
+        : safeParseInteractionField(suggestTasksResultSchema, row.result, { ...ctx, field: "result" });
       return {
         ...base,
         kind: "suggest_tasks",
-        payload: suggestTasksPayloadSchema.parse(row.payload),
-        result: row.result ? suggestTasksResultSchema.parse(row.result) : null,
+        payload: payload.ok ? payload.value : ({ version: 1, tasks: [] } satisfies SuggestTasksInteraction["payload"]),
+        result: result.ok ? result.value : null,
+        ...(payload.ok ? {} : { unparseablePayload: true }),
+        ...(result.ok ? {} : { unparseableResult: true }),
       } satisfies SuggestTasksInteraction;
-    case "ask_user_questions":
+    }
+    case "ask_user_questions": {
+      const payload = safeParseInteractionField(askUserQuestionsPayloadSchema, row.payload, { ...ctx, field: "payload" });
+      const result = row.result == null
+        ? ({ ok: true, value: null } as const)
+        : safeParseInteractionField(askUserQuestionsResultSchema, row.result, { ...ctx, field: "result" });
       return {
         ...base,
         kind: "ask_user_questions",
-        payload: askUserQuestionsPayloadSchema.parse(row.payload),
-        result: row.result ? askUserQuestionsResultSchema.parse(row.result) : null,
+        payload: payload.ok ? payload.value : ({ version: 1, questions: [] } satisfies AskUserQuestionsInteraction["payload"]),
+        result: result.ok ? result.value : null,
+        ...(payload.ok ? {} : { unparseablePayload: true }),
+        ...(result.ok ? {} : { unparseableResult: true }),
       } satisfies AskUserQuestionsInteraction;
-    case "request_confirmation":
+    }
+    case "request_confirmation": {
+      const payload = safeParseInteractionField(requestConfirmationPayloadSchema, row.payload, { ...ctx, field: "payload" });
+      const result = row.result == null
+        ? ({ ok: true, value: null } as const)
+        : safeParseInteractionField(requestConfirmationResultSchema, row.result, { ...ctx, field: "result" });
       return {
         ...base,
         kind: "request_confirmation",
-        payload: requestConfirmationPayloadSchema.parse(row.payload),
-        result: row.result ? requestConfirmationResultSchema.parse(row.result) : null,
+        payload: payload.ok ? payload.value : ({ version: 1, prompt: "" } satisfies RequestConfirmationInteraction["payload"]),
+        result: result.ok ? result.value : null,
+        ...(payload.ok ? {} : { unparseablePayload: true }),
+        ...(result.ok ? {} : { unparseableResult: true }),
       } satisfies RequestConfirmationInteraction;
+    }
     default:
       throw unprocessable(`Unknown interaction kind: ${row.kind}`);
+  }
+}
+
+/**
+ * DEE-582: a degraded row (unparseable payload/result) must stay visible on the
+ * read path but must NOT be accepted/rejected/answered — resolving a decision
+ * whose real prompt/target/questions are unknown would propagate a phantom
+ * approval/answer and wake the creator as if it were genuine. Cancel (pure
+ * dismissal, no payload deref) remains allowed as the API repair/escape hatch.
+ */
+function assertInteractionIsResolvable(interaction: IssueThreadInteraction) {
+  if (interaction.unparseablePayload || interaction.unparseableResult) {
+    throw unprocessable(
+      "This interaction has an unparseable payload or result and cannot be accepted, rejected, or answered until the stored row is repaired. It can still be listed and cancelled (DEE-582).",
+    );
   }
 }
 
@@ -263,6 +344,11 @@ function shouldReturnAcceptedConfirmationToCreatorAgent(args: {
 }
 
 function shouldSupersedeRequestConfirmationOnUserComment(interaction: RequestConfirmationInteraction) {
+  // A degraded row (DEE-582) carries a placeholder `payload`, not the real one —
+  // never treat it as a supersede candidate. Leave it pending and visible for
+  // repair instead of acting on (or NPE-ing in) the pre-list expiry sweep that
+  // the GET /interactions route runs (issues.ts: expire-then-list).
+  if (interaction.unparseablePayload) return false;
   return interaction.payload.supersedeOnUserComment === true;
 }
 
@@ -491,6 +577,9 @@ async function expireStaleRequestConfirmationTarget(db: Db | any, args: {
 }): Promise<IssueThreadInteraction | null> {
   if (args.row.kind !== "request_confirmation" || args.row.status !== "pending") return null;
   const interaction = hydrateInteraction(args.row) as RequestConfirmationInteraction;
+  // Degraded row (DEE-582): payload could not be parsed (placeholder returned) —
+  // never treat it as a stale-target candidate. Skip rather than act/NPE.
+  if (interaction.unparseablePayload) return null;
   const target = interaction.payload.target ?? null;
   if (!target) return null;
   if (target.type !== "issue_document") return null;
@@ -589,6 +678,7 @@ export function issueThreadInteractionService(db: Db) {
     interaction: IssueThreadInteraction;
     continuationIssue: IssueWakeTarget | null;
   }> {
+    assertInteractionIsResolvable(hydrateInteraction(args.current));
     const expired = await expireStaleRequestConfirmationTarget(db, {
       row: args.current,
       actor: args.actor,
@@ -938,6 +1028,7 @@ export function issueThreadInteractionService(db: Db) {
       }
 
       const interaction = hydrateInteraction(current) as SuggestTasksInteraction;
+      assertInteractionIsResolvable(interaction);
       const { selectedTasks, skippedClientKeys } = resolveSelectedSuggestedTasks({
         interaction,
         selectedClientKeys: input.selectedClientKeys,
@@ -1069,6 +1160,7 @@ export function issueThreadInteractionService(db: Db) {
     ) => {
       const data = rejectIssueThreadInteractionSchema.parse(input);
       const current = await getPendingInteractionForResolution({ issue, interactionId });
+      assertInteractionIsResolvable(hydrateInteraction(current));
       switch (current.kind) {
         case "suggest_tasks":
           return issueThreadInteractionService(db).rejectSuggestedTasks(issue, interactionId, data, actor, current);
@@ -1291,6 +1383,9 @@ export function issueThreadInteractionService(db: Db) {
 
       const staleRows = rows.filter((row) => {
         const interaction = hydrateInteraction(row) as RequestConfirmationInteraction;
+        // Degraded row (DEE-582): raw, unparseable payload — never a stale-target
+        // candidate. One poison row must not NPE this doc-update-triggered sweep.
+        if (interaction.unparseablePayload) return false;
         const target = interaction.payload.target;
         if (!target || target.type !== "issue_document") return false;
         const targetIssueId = target.issueId ?? issue.id;
@@ -1373,6 +1468,7 @@ export function issueThreadInteractionService(db: Db) {
       }
 
       const interaction = hydrateInteraction(current) as AskUserQuestionsInteraction;
+      assertInteractionIsResolvable(interaction);
       const normalizedAnswers = normalizeQuestionAnswers({
         questions: interaction.payload.questions,
         answers: input.answers,

@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   agents,
@@ -1211,5 +1211,177 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
         },
       },
     });
+  });
+
+  it("degrades one unparseable interaction row instead of failing the whole collection (DEE-582)", async () => {
+    const { companyId, issueId } = await seedConfirmationIssue("Read-path hardening");
+
+    const validId = randomUUID();
+    const poisonResultId = randomUUID();
+    const poisonPayloadId = randomUUID();
+
+    const validPayload = { version: 1 as const, prompt: "Confirm the plan?" };
+
+    // Valid row — must hydrate untouched, with no degraded flags.
+    await db.insert(issueThreadInteractions).values({
+      id: validId,
+      companyId,
+      issueId,
+      kind: "request_confirmation",
+      status: "accepted",
+      continuationPolicy: "none",
+      payload: validPayload,
+      result: { version: 1, outcome: "accepted" } as never,
+      createdAt: new Date("2026-05-31T00:00:00.000Z"),
+    });
+
+    // Poison `result` — the exact DEE-441 corruption: a legacy/operator-written
+    // `outcome` value that is not in the current enum. A hard `.parse()` here
+    // 400'd `GET /interactions` collection-wide.
+    await db.insert(issueThreadInteractions).values({
+      id: poisonResultId,
+      companyId,
+      issueId,
+      kind: "request_confirmation",
+      status: "accepted",
+      continuationPolicy: "none",
+      payload: validPayload,
+      result: { version: 1, outcome: "declined" } as never,
+      createdAt: new Date("2026-05-31T00:00:01.000Z"),
+    });
+
+    // Poison `payload` — forward-incompatible schema drift on the request def.
+    await db.insert(issueThreadInteractions).values({
+      id: poisonPayloadId,
+      companyId,
+      issueId,
+      kind: "request_confirmation",
+      status: "pending",
+      continuationPolicy: "none",
+      payload: { version: 2, prompt: "" } as never,
+      result: null,
+      createdAt: new Date("2026-05-31T00:00:02.000Z"),
+    });
+
+    // The whole point: the read path survives and returns every row.
+    const listed = await interactionsSvc.listForIssue(issueId);
+    expect(listed).toHaveLength(3);
+
+    const byId = new Map(listed.map((row) => [row.id, row]));
+
+    const valid = byId.get(validId)!;
+    expect(valid.unparseableResult).toBeUndefined();
+    expect(valid.unparseablePayload).toBeUndefined();
+    expect(valid.payload).toMatchObject(validPayload);
+    expect(valid.result).toMatchObject({ version: 1, outcome: "accepted" });
+
+    const poisonResult = byId.get(poisonResultId)!;
+    expect(poisonResult.unparseableResult).toBe(true);
+    expect(poisonResult.result).toBeNull();
+    // Valid payload on the same poison row is still parsed normally.
+    expect(poisonResult.unparseablePayload).toBeUndefined();
+    expect(poisonResult.payload).toMatchObject(validPayload);
+
+    const poisonPayload = byId.get(poisonPayloadId)!;
+    expect(poisonPayload.unparseablePayload).toBe(true);
+    // Payload is replaced with an inert kind-typed placeholder (NOT the raw
+    // corrupt value), so no consumer can NPE; the row stays listed + flagged.
+    expect(poisonPayload.payload).toEqual({ version: 1, prompt: "" });
+
+    // getById on the poison row must also survive (terminal auto-resolve path).
+    const fetched = await interactionsSvc.getById(poisonResultId);
+    expect(fetched?.unparseableResult).toBe(true);
+    expect(fetched?.result).toBeNull();
+  });
+
+  it("does not crash the supersede-then-list GET path on a pending row with a JSON-null payload (DEE-582)", async () => {
+    const { companyId, issueId } = await seedConfirmationIssue("Poison payload supersede guard");
+
+    const poisonId = randomUUID();
+    // The crash vector Codex flagged: a pending request_confirmation whose payload
+    // is JSON `null` (not SQL NULL). The pre-list supersede sweep hydrates it and
+    // would dereference `payload.supersedeOnUserComment` → TypeError → 500 if the
+    // raw payload were trusted. `'null'::jsonb` satisfies the NOT NULL column.
+    await db.insert(issueThreadInteractions).values({
+      id: poisonId,
+      companyId,
+      issueId,
+      kind: "request_confirmation",
+      status: "pending",
+      continuationPolicy: "none",
+      payload: sql`'null'::jsonb` as never,
+      result: null,
+      createdAt: new Date("2026-05-31T00:00:00.000Z"),
+    });
+
+    // A user/board comment AFTER the interaction would normally trigger supersede.
+    await db.insert(issueComments).values({
+      id: randomUUID(),
+      companyId,
+      issueId,
+      authorUserId: "local-board",
+      body: "Board weighs in after the interaction was opened.",
+      createdAt: new Date("2026-05-31T00:05:00.000Z"),
+    });
+
+    // This is exactly what GET /interactions runs: expire-then-list. Must not throw.
+    const expired = await interactionsSvc.expireRequestConfirmationsSupersededByHistoricalComments({
+      id: issueId,
+      companyId,
+    });
+    // The degraded row is never auto-superseded — left pending, visible for repair.
+    expect(expired).toHaveLength(0);
+
+    // The document-update-triggered stale-target sweep must also survive the row.
+    const expiredStale = await interactionsSvc.expireStaleRequestConfirmationsForIssueDocument(
+      { id: issueId, companyId },
+      { id: randomUUID(), key: "plan", latestRevisionId: randomUUID(), latestRevisionNumber: 2 },
+      { userId: "local-board" },
+    );
+    expect(expiredStale).toHaveLength(0);
+
+    const listed = await interactionsSvc.listForIssue(issueId);
+    expect(listed).toHaveLength(1);
+    expect(listed[0]?.id).toBe(poisonId);
+    expect(listed[0]?.status).toBe("pending");
+    expect(listed[0]?.unparseablePayload).toBe(true);
+  });
+
+  it("bars resolving a degraded interaction but still allows cancel (DEE-582)", async () => {
+    const { companyId, issueId, goalId } = await seedConfirmationIssue("Degraded resolution guard");
+
+    const poisonId = randomUUID();
+    await db.insert(issueThreadInteractions).values({
+      id: poisonId,
+      companyId,
+      issueId,
+      kind: "request_confirmation",
+      status: "pending",
+      continuationPolicy: "none",
+      payload: sql`'null'::jsonb` as never,
+      result: null,
+      createdAt: new Date("2026-05-31T00:00:00.000Z"),
+    });
+
+    // A corrupt confirmation must NOT be acceptable — accepting a decision whose
+    // real prompt/target is unknown would propagate a phantom approval.
+    await expect(interactionsSvc.acceptInteraction({
+      id: issueId,
+      companyId,
+      goalId,
+      projectId: null,
+    }, poisonId, {}, { userId: "local-board" })).rejects.toMatchObject({ status: 422 });
+
+    // Still pending and visible after the rejected accept.
+    const stillPending = await interactionsSvc.getById(poisonId);
+    expect(stillPending?.status).toBe("pending");
+    expect(stillPending?.unparseablePayload).toBe(true);
+
+    // Cancel is the allowed repair/escape hatch (no payload deref).
+    const cancelled = await interactionsSvc.cancelInteraction({
+      id: issueId,
+      companyId,
+    }, poisonId, {}, { userId: "local-board" });
+    expect(cancelled.status).toBe("cancelled");
   });
 });
