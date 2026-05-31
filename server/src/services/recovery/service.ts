@@ -62,7 +62,7 @@ import {
   withRecoveryModelProfileHint,
 } from "./model-profile-hint.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "./pause-hold-guard.js";
-import { isAuditSinkIssue } from "./audit-sink-guard.js";
+import { isPermanentSinkIssue } from "./audit-sink-guard.js";
 
 const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = ["failed", "cancelled", "timed_out"] as const;
@@ -167,13 +167,6 @@ function didAutomaticRecoveryFail(
     );
 }
 
-
-function isChiefExecutiveOfficerSweepLogIssue(issue: Pick<typeof issues.$inferSelect, "title" | "description" | "identifier">) {
-  const title = readNonEmptyString(issue.title)?.toUpperCase() ?? "";
-  const description = readNonEmptyString(issue.description)?.toLowerCase() ?? "";
-  return title.endsWith("-CEO-SWEEP-LOG") ||
-    (title.includes("CEO-SWEEP-LOG") && description.includes("heartbeat audit sink"));
-}
 
 function successfulRunHandoffRecoveryEvidence(latestRun: LatestIssueRun): SuccessfulRunHandoffRecoveryEvidence | null {
   if (!latestRun) return null;
@@ -2291,6 +2284,14 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     recoveryCause?: StrandedRecoveryCause;
     successfulRunHandoffEvidence?: SuccessfulRunHandoffRecoveryEvidence | null;
   }) {
+    // Defense in depth: even if a future caller reaches this chokepoint without
+    // the top-of-loop permanent-sink guard, never block / create a
+    // `source_scoped_recovery_action` / wake for an append-only sink. Returning
+    // null is treated as a skip by every caller (DEE-631).
+    if (await isPermanentSinkIssue(db, input.issue.companyId, input.issue)) {
+      return null;
+    }
+
     if (isStrandedIssueRecoveryIssue(input.issue)) {
       return escalateStrandedRecoveryIssueInPlace({
         issue: input.issue,
@@ -2845,7 +2846,11 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     };
 
     for (const issue of candidates) {
-      if (await isAuditSinkIssue(db, issue.companyId, issue.id)) {
+      // Permanent audit-sink / sweep-log issues are append-only logs with no
+      // forward work by design. Skip them before any escalation branch so the
+      // `source_scoped_recovery_action` sweep never flips them
+      // `in_progress -> blocked` or queues an owner wake (DEE-631 / DEE-569).
+      if (await isPermanentSinkIssue(db, issue.companyId, issue)) {
         result.skipped += 1;
         continue;
       }
@@ -2862,11 +2867,6 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         continue;
       }
 
-
-      if (isChiefExecutiveOfficerSweepLogIssue(issue)) {
-        result.skipped += 1;
-        continue;
-      }
 
       if (await hasActiveExecutionPath(issue.companyId, issue.id)) {
         result.skipped += 1;
