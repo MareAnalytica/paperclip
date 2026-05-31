@@ -8028,12 +8028,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     } else {
       delete context.paperclipModelProfile;
     }
-    // DEE-659: the only model valid for an engaged cross-provider fallback is
-    // one resolved for the fallback adapter itself — its chain entry model, or
-    // its adapter model profile (already resolved for executionAdapterType).
+    // DEE-659: the only model id that is safe for an engaged cross-provider
+    // fallback is one the fallback provider's OWN chain entry declares. Every
+    // other source folded into the merged config — the agent's primary
+    // adapterConfig, an issue-level model override, and the agent's runtime
+    // model-profile override (which resolveModelProfileApplication merges into
+    // modelProfileApplication.adapterConfig) — is keyed to the PRIMARY adapter
+    // and may carry a provider-specific model id the fallback adapter rejects.
+    // With no chain-entry model the fallback adapter uses its own provider-valid
+    // CLI default.
     const fallbackAdapterModel = selectedFallbackAdapterType
-      ? readNonEmptyString(parseObject(providerFallbackSelection.adapterConfig).model) ??
-        readNonEmptyString(parseObject(modelProfileApplication.adapterConfig).model)
+      ? readNonEmptyString(parseObject(providerFallbackSelection.adapterConfig).model)
       : null;
     const mergedConfig = enforceFallbackAdapterModel({
       config: mergeModelProfileAdapterConfig({

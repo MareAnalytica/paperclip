@@ -216,8 +216,8 @@ describe("enforceFallbackAdapterModel", () => {
 });
 
 describe("provider fallback model boundary (merge integration)", () => {
-  // Mirror the production call site: the valid fallback model is the chain
-  // entry model, else the fallback adapter's model profile model.
+  // Mirror the production call site: the only valid fallback model is the
+  // engaged provider's own chain-entry model (primary-keyed sources are unsafe).
   const integrate = (opts: {
     baseConfig: Record<string, unknown>;
     issueAdapterConfig: Record<string, unknown>;
