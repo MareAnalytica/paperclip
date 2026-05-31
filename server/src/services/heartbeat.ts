@@ -1422,27 +1422,42 @@ export function mergeModelProfileAdapterConfig(input: {
   };
 }
 
+// DEE-659: a claude model id (e.g. claude-opus-4-8) must never reach a
+// non-claude failover adapter. The check is intentionally claude-family
+// specific so a provider-valid model that a non-claude adapter legitimately
+// wants (supplied by the fallback chain entry, the adapter model profile, or an
+// issue override) is preserved, while an inherited claude id from ANY of those
+// sources is removed.
+const CLAUDE_MODEL_ID_RE = /^claude[-_]/i;
+
 /**
  * Adapter-boundary guard (DEE-659): when a provider fallback engages a
- * non-claude adapter (grok_local / codex_local), the agent's primary
- * adapterConfig still carries its claude `model` id (e.g. claude-opus-4-8).
- * grok-local then invokes `--model claude-opus-4-8` and the CLI rejects it
- * ("unknown model id"), so the run errors and the agent sticks in
- * status=error during claude-exhaustion windows. Strip the inherited claude
- * model from the base config for non-claude fallback adapters so the engaged
- * adapter uses its own provider-valid default. An explicit provider-appropriate
- * model supplied by the fallback chain entry, the adapter model profile, or an
- * issue override still layers on top via the normal merge order.
+ * non-claude adapter (grok_local / codex_local), the merged run config can
+ * still carry a claude `model` id — from the agent's primary adapterConfig, or
+ * from an issue-level custom model override that is merged after the base
+ * config. grok-local then invokes `--model claude-opus-4-8` and the CLI rejects
+ * it ("unknown model id"), so the run errors and the agent sticks in
+ * status=error during claude-exhaustion windows (parent incident DEE-658).
+ *
+ * Applied to the FINAL merged adapter config so it catches the claude id no
+ * matter which layer supplied it. A provider-valid model the foreign adapter
+ * legitimately wants (e.g. a grok/codex model from the chain entry or override)
+ * is not claude-family and is left untouched; with no model the adapter uses
+ * its own provider-valid default.
  */
-export function stripInheritedModelForNonClaudeFallback(input: {
-  baseConfig: Record<string, unknown>;
-  selectedFallbackAdapterType: string | null;
+export function stripClaudeModelForNonClaudeFallback(input: {
+  config: Record<string, unknown>;
+  selectedFallbackAdapterType: ProviderFallbackAdapterType | null;
 }): Record<string, unknown> {
   const adapterType = input.selectedFallbackAdapterType;
-  if (!adapterType || adapterType === "claude_local") return input.baseConfig;
-  if (!("model" in input.baseConfig)) return input.baseConfig;
-  const { model: _inheritedModel, ...rest } = input.baseConfig;
-  return rest;
+  if (!adapterType || adapterType === "claude_local") return input.config;
+  const model = input.config.model;
+  if (typeof model === "string" && CLAUDE_MODEL_ID_RE.test(model.trim())) {
+    const next = { ...input.config };
+    delete next.model;
+    return next;
+  }
+  return input.config;
 }
 
 function modelProfileRunMetadata(
@@ -8011,21 +8026,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     } else {
       delete context.paperclipModelProfile;
     }
-    const mergedConfig = mergeModelProfileAdapterConfig({
-      baseConfig: stripInheritedModelForNonClaudeFallback({
+    const mergedConfig = stripClaudeModelForNonClaudeFallback({
+      config: mergeModelProfileAdapterConfig({
         baseConfig: persistedWorkspaceManagedConfig,
-        selectedFallbackAdapterType,
+        modelProfile: modelProfileApplication,
+        issueAdapterConfig: selectedFallbackAdapterType
+          ? {
+              ...parseObject(providerFallbackSelection.adapterConfig),
+              ...(issueAssigneeOverrides?.adapterConfig ?? null),
+              ...(readNonEmptyString(providerFallbackSelection.account)
+                ? { account: readNonEmptyString(providerFallbackSelection.account) }
+                : {}),
+            }
+          : issueAssigneeOverrides?.adapterConfig ?? null,
       }),
-      modelProfile: modelProfileApplication,
-      issueAdapterConfig: selectedFallbackAdapterType
-        ? {
-            ...parseObject(providerFallbackSelection.adapterConfig),
-            ...(issueAssigneeOverrides?.adapterConfig ?? null),
-            ...(readNonEmptyString(providerFallbackSelection.account)
-              ? { account: readNonEmptyString(providerFallbackSelection.account) }
-              : {}),
-          }
-        : issueAssigneeOverrides?.adapterConfig ?? null,
+      selectedFallbackAdapterType,
     });
     const configSnapshot = buildExecutionWorkspaceConfigSnapshot(mergedConfig, selectedEnvironmentId);
     const executionRunConfig = stripWorkspaceRuntimeFromExecutionRunConfig(mergedConfig);
