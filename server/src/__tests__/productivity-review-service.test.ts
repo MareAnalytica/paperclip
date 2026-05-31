@@ -563,4 +563,89 @@ describeEmbeddedPostgres("productivity review service", () => {
     const [review] = await listProductivityReviews(seeded.companyId);
     expect(review?.requestDepth).toBe(MAX_ISSUE_REQUEST_DEPTH);
   });
+
+  it("does not flag a no-comment streak for untagged author comments in the run window (DEE-432)", async () => {
+    const base = new Date("2026-04-28T12:00:00.000Z").getTime();
+    const now = new Date(base + 60_000);
+    const seeded = await seedAssignedIssue();
+    // 10 terminal runs spaced 10 min apart so the rolling-window high_churn trigger
+    // stays off and we isolate the no_comment_streak path.
+    const runRows: Array<typeof heartbeatRuns.$inferInsert> = [];
+    for (let i = 0; i < DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS; i += 1) {
+      const createdAt = new Date(base - i * 10 * 60_000);
+      runRows.push({
+        id: randomUUID(),
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        status: "succeeded",
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        startedAt: createdAt,
+        finishedAt: new Date(createdAt.getTime() + 30_000),
+        contextSnapshot: { issueId: seeded.issueId, taskId: seeded.issueId },
+        livenessState: "advanced",
+        nextAction: "Continue processing the next batch.",
+        createdAt,
+        updatedAt: createdAt,
+      });
+    }
+    await db.insert(heartbeatRuns).values(runRows);
+    // Productive comment authored by the assignee but WITHOUT createdByRunId
+    // (X-Paperclip-Run-Id not propagated), inside the newest run's window.
+    await db.insert(issueComments).values({
+      companyId: seeded.companyId,
+      issueId: seeded.issueId,
+      authorAgentId: seeded.coderId,
+      createdByRunId: null,
+      body: "Substantive progress (untagged comment)",
+      createdAt: new Date(base + 15_000),
+      updatedAt: new Date(base + 15_000),
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(0);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
+  it("snoozes new reviews after a recent cancelled review for the same source (DEE-432)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now,
+    });
+    // A prior review for this source auto-closed as a false positive (cancelled),
+    // resolved 1h ago — inside the resolved-snooze window.
+    const cancelledAt = new Date(now.getTime() - 60 * 60 * 1000);
+    await db.insert(issues).values({
+      id: randomUUID(),
+      companyId: seeded.companyId,
+      title: "Cancelled productivity review (recent)",
+      status: "cancelled",
+      priority: "high",
+      originKind: PRODUCTIVITY_REVIEW_ORIGIN_KIND,
+      originId: seeded.issueId,
+      originFingerprint: `productivity-review:${seeded.issueId}`,
+      parentId: seeded.issueId,
+      issueNumber: 2,
+      identifier: `${seeded.issuePrefix}-2`,
+      createdAt: cancelledAt,
+      updatedAt: cancelledAt,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.snoozed).toBe(1);
+    expect(result.created).toBe(0);
+  });
 });
