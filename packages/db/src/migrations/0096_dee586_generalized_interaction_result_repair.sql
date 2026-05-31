@@ -71,6 +71,7 @@ WHERE "kind" = 'request_confirmation'
     AND "result" ->> 'outcome' IN
       ('accepted','rejected','cancelled','superseded_by_comment','stale_target','issue_terminal_status')
   ) IS NOT TRUE;
+--> statement-breakpoint
 
 -- 2) ask_user_questions: backfill version; reset only a non-array answers field
 UPDATE "issue_thread_interactions"
@@ -97,6 +98,7 @@ WHERE "kind" = 'ask_user_questions'
     ("result" ->> 'version') = '1'
     AND jsonb_typeof("result" -> 'answers') = 'array'
   ) IS NOT TRUE;
+--> statement-breakpoint
 
 -- 3) suggest_tasks: backfill version; coerce only a non-array createdTasks/skippedClientKeys
 UPDATE "issue_thread_interactions"
@@ -119,6 +121,7 @@ WHERE "kind" = 'suggest_tasks'
     AND ("result" -> 'createdTasks' IS NULL OR jsonb_typeof("result" -> 'createdTasks') = 'array')
     AND ("result" -> 'skippedClientKeys' IS NULL OR jsonb_typeof("result" -> 'skippedClientKeys') = 'array')
   ) IS NOT TRUE;
+--> statement-breakpoint
 
 -- 4) pending rows with a non-null malformed result -> reset to the valid pending shape (NULL)
 UPDATE "issue_thread_interactions"

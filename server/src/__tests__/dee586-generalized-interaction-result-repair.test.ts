@@ -109,7 +109,14 @@ describeEmbeddedPostgres("DEE-586 generalized interaction-result repair migratio
     return id;
   }
 
-  const runRepair = () => db.execute(sql.raw(MIGRATION_SQL));
+  // Mirror drizzle's migrator (readMigrationFiles): split on the statement-breakpoint
+  // markers and run each statement separately, exactly as migratePg() does in production.
+  async function runRepair() {
+    for (const statement of MIGRATION_SQL.split("--> statement-breakpoint")) {
+      if (statement.trim().length === 0) continue;
+      await db.execute(sql.raw(statement));
+    }
+  }
 
   async function rawResult(id: string): Promise<unknown> {
     const rows = await db.execute(sql`SELECT "result" FROM "issue_thread_interactions" WHERE "id" = ${id}`);
