@@ -1,6 +1,6 @@
 import { and, eq } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { issueLabels, labels } from "@paperclipai/db";
+import { issueLabels, issues, labels } from "@paperclipai/db";
 import { AUDIT_SINK_LABEL_NAME } from "@paperclipai/shared";
 
 /**
@@ -94,4 +94,36 @@ export async function isPermanentSinkIssue(
 ): Promise<boolean> {
   if (matchesPermanentSinkTitle(issue.title, issue.description)) return true;
   return isAuditSinkIssue(db, companyId, issue.id);
+}
+
+/**
+ * Durable permanent-sink predicate for callers that only hold an issue id (e.g.
+ * the heartbeat run-completion handlers `handleRunLivenessContinuation` and
+ * `handleSuccessfulRunHandoff`, which guard before loading the full issue row).
+ *
+ * Fetches the issue's title/description once and defers to
+ * {@link isPermanentSinkIssue}. Returns `false` when the issue no longer exists
+ * for the company. This is the by-id complement that lets every
+ * `source_scoped_recovery_action` path — stranded (service.ts) and
+ * `successful_run_missing_state` (heartbeat.ts) — consult the SAME predicate
+ * (audit-sink label OR reserved sweep-log title shape) rather than the
+ * label-only {@link isAuditSinkIssue}. See DEE-655 (follow-up to DEE-631).
+ */
+export async function isPermanentSinkIssueById(
+  db: Db,
+  companyId: string,
+  issueId: string,
+): Promise<boolean> {
+  const row = await db
+    .select({
+      id: issues.id,
+      title: issues.title,
+      description: issues.description,
+    })
+    .from(issues)
+    .where(and(eq(issues.id, issueId), eq(issues.companyId, companyId)))
+    .limit(1)
+    .then((rows) => rows[0] ?? null);
+  if (!row) return false;
+  return isPermanentSinkIssue(db, companyId, row);
 }
