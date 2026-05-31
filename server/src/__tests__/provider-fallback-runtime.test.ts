@@ -216,12 +216,14 @@ describe("enforceFallbackAdapterModel", () => {
 });
 
 describe("provider fallback model boundary (merge integration)", () => {
-  // Mirror the production call site: the only valid fallback model is the
-  // engaged provider's own chain-entry model (primary-keyed sources are unsafe).
+  // Mirror the production call site: a valid fallback model is the engaged
+  // provider's chain-entry model, else the fallback adapter's own profile
+  // default; primary-keyed sources are unsafe and excluded.
   const integrate = (opts: {
     baseConfig: Record<string, unknown>;
     issueAdapterConfig: Record<string, unknown>;
     chainEntryModel?: string;
+    profileDefaultModel?: string;
     agentAdapterType: string;
     selectedFallbackAdapterType: "claude_local" | "codex_local" | "grok_local" | null;
   }) =>
@@ -233,7 +235,7 @@ describe("provider fallback model boundary (merge integration)", () => {
       }),
       agentAdapterType: opts.agentAdapterType,
       selectedFallbackAdapterType: opts.selectedFallbackAdapterType,
-      fallbackAdapterModel: opts.chainEntryModel ?? null,
+      fallbackAdapterModel: opts.chainEntryModel ?? opts.profileDefaultModel ?? null,
     });
 
   it("grok fallback receives no claude model id so the adapter uses its own default", () => {
@@ -266,6 +268,20 @@ describe("provider fallback model boundary (merge integration)", () => {
       selectedFallbackAdapterType: "codex_local",
     });
     expect(merged.model).toBe("gpt-5.3-codex");
+  });
+
+  it("uses the fallback adapter's own profile default when the chain entry omits a model", () => {
+    // DEE-659 round-4 regression: a requested model profile must still resolve
+    // to the FALLBACK adapter's own profile model (not the primary model, not
+    // dropped) on a cross-provider failover.
+    const merged = integrate({
+      baseConfig: { model: "claude-opus-4-8" },
+      issueAdapterConfig: { command: "/paperclip/.grok/bin/grok" },
+      profileDefaultModel: "grok-code-fast",
+      agentAdapterType: "claude_local",
+      selectedFallbackAdapterType: "grok_local",
+    });
+    expect(merged.model).toBe("grok-code-fast");
   });
 
   it("claude account-rotation fallback keeps the inherited claude model", () => {

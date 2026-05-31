@@ -8028,17 +8028,29 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     } else {
       delete context.paperclipModelProfile;
     }
-    // DEE-659: the only model id that is safe for an engaged cross-provider
-    // fallback is one the fallback provider's OWN chain entry declares. Every
-    // other source folded into the merged config — the agent's primary
-    // adapterConfig, an issue-level model override, and the agent's runtime
-    // model-profile override (which resolveModelProfileApplication merges into
-    // modelProfileApplication.adapterConfig) — is keyed to the PRIMARY adapter
-    // and may carry a provider-specific model id the fallback adapter rejects.
-    // With no chain-entry model the fallback adapter uses its own provider-valid
-    // CLI default.
+    // DEE-659: pick a model that is genuinely valid for the engaged
+    // cross-provider fallback adapter. Two sources are safe because both are
+    // resolved FOR the fallback adapter: (1) its own chain-entry model, then
+    // (2) its own adapter model-profile default (from adapterModelProfiles,
+    // which was resolved for executionAdapterType). Everything else folded into
+    // the merged config — the agent's primary adapterConfig, an issue-level
+    // model override, and the agent's runtime model-profile override (merged
+    // into modelProfileApplication.adapterConfig) — is keyed to the PRIMARY
+    // adapter and may carry a model id the fallback adapter rejects. With
+    // neither safe source present the fallback adapter uses its own
+    // provider-valid CLI default.
+    const fallbackAdapterProfileModel = modelProfileApplication.applied
+      ? readNonEmptyString(
+          parseObject(
+            adapterModelProfiles.find(
+              (profile) => profile.key === modelProfileApplication.applied,
+            )?.adapterConfig,
+          ).model,
+        )
+      : null;
     const fallbackAdapterModel = selectedFallbackAdapterType
-      ? readNonEmptyString(parseObject(providerFallbackSelection.adapterConfig).model)
+      ? readNonEmptyString(parseObject(providerFallbackSelection.adapterConfig).model) ??
+        fallbackAdapterProfileModel
       : null;
     const mergedConfig = enforceFallbackAdapterModel({
       config: mergeModelProfileAdapterConfig({
