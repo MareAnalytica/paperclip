@@ -142,7 +142,6 @@ import {
   isClosedIsolatedExecutionWorkspace,
   ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY,
   type AskUserQuestionsAnswer,
-  type AskUserQuestionsInteraction,
   type ActivityEvent,
   type Agent,
   type FeedbackVote,
@@ -674,7 +673,7 @@ type IssueDetailChatTabProps = {
     interaction: IssueThreadInteraction,
     answers: AskUserQuestionsAnswer[],
   ) => Promise<void>;
-  onCancelInteraction: (interaction: AskUserQuestionsInteraction) => Promise<void>;
+  onCancelInteraction: (interaction: IssueThreadInteraction) => Promise<void>;
   assigneeUserId: string | null;
   onResumeFromBacklog?: () => Promise<void> | void;
   resumeFromBacklogPending?: boolean;
@@ -2183,7 +2182,7 @@ export function IssueDetail() {
   });
 
   const cancelInteraction = useMutation({
-    mutationFn: ({ interaction }: { interaction: AskUserQuestionsInteraction }) =>
+    mutationFn: ({ interaction }: { interaction: IssueThreadInteraction }) =>
       issuesApi.cancelInteraction(issueId!, interaction.id),
     onSuccess: (interaction) => {
       upsertInteractionInCache(interaction);
@@ -2991,7 +2990,7 @@ export function IssueDetail() {
   ) => {
     await answerInteraction.mutateAsync({ interaction, answers });
   }, [answerInteraction]);
-  const handleCancelInteraction = useCallback(async (interaction: AskUserQuestionsInteraction) => {
+  const handleCancelInteraction = useCallback(async (interaction: IssueThreadInteraction) => {
     await cancelInteraction.mutateAsync({ interaction });
   }, [cancelInteraction]);
   const canResumeFromBacklog = issue?.status === "backlog" && Boolean(issue.assigneeAgentId || issue.assigneeUserId);
