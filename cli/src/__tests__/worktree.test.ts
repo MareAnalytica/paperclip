@@ -55,6 +55,11 @@ const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const itEmbeddedPostgres = embeddedPostgresSupport.supported ? it : it.skip;
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
 
+// Embedded-postgres cold start (plus an occasional first-run binary fetch) can
+// exceed a tight per-test budget under CI load — the DEE-637 flake. Give every
+// embedded-pg test a single realistic ceiling instead of per-test guesses.
+const EMBEDDED_PG_TEST_TIMEOUT_MS = 60_000;
+
 if (!embeddedPostgresSupport.supported) {
   console.warn(
     `Skipping embedded Postgres worktree CLI tests on this host: ${embeddedPostgresSupport.reason ?? "unsupported environment"}`,
@@ -417,7 +422,7 @@ describe("worktree helpers", () => {
       await db.$client?.end?.({ timeout: 5 }).catch(() => undefined);
       await tempDb.cleanup();
     }
-  }, 20_000);
+  }, EMBEDDED_PG_TEST_TIMEOUT_MS);
 
   it("copies the source local_encrypted secrets key into the seeded worktree instance", () => {
     const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-worktree-secrets-"));
@@ -639,7 +644,7 @@ describe("worktree helpers", () => {
         fs.rmSync(tempRoot, { recursive: true, force: true });
       }
     },
-    30000,
+    EMBEDDED_PG_TEST_TIMEOUT_MS,
   );
 
   it("avoids ports already claimed by sibling worktree instance configs", async () => {
@@ -843,7 +848,7 @@ describe("worktree helpers", () => {
     }
   });
 
-  it("reseed preserves the current worktree ports, instance id, and branding", async () => {
+  itEmbeddedPostgres("reseed preserves the current worktree ports, instance id, and branding", async () => {
     const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-worktree-reseed-"));
     const repoRoot = path.join(tempRoot, "repo");
     const sourceRoot = path.join(tempRoot, "source");
@@ -921,7 +926,7 @@ describe("worktree helpers", () => {
       }
       fs.rmSync(tempRoot, { recursive: true, force: true });
     }
-  }, 30_000);
+  }, EMBEDDED_PG_TEST_TIMEOUT_MS);
 
   it("restores the current worktree config and instance data if reseed fails", async () => {
     const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-worktree-reseed-rollback-"));
@@ -1355,5 +1360,5 @@ describeEmbeddedPostgres("pauseSeededScheduledRoutines", () => {
       await db.$client?.end?.({ timeout: 5 }).catch(() => undefined);
       await tempDb.cleanup();
     }
-  }, 20_000);
+  }, EMBEDDED_PG_TEST_TIMEOUT_MS);
 });

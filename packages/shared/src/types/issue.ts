@@ -769,6 +769,25 @@ export interface IssueThreadInteractionBase extends IssueThreadInteractionActorF
   createdAt: Date | string;
   updatedAt: Date | string;
   resolvedAt?: Date | string | null;
+  /**
+   * Set true when the stored `payload` JSON could not be parsed against its
+   * schema (forward-incompatible schema drift or operator corruption). In that
+   * case `payload` is replaced with a minimal, inert kind-typed placeholder so
+   * neither the read path nor any payload consumer (server sweeps or the UI)
+   * can NPE on a poison row; the row stays listed and flagged for targeted
+   * repair instead of 400/500-ing the whole interaction collection. Consumers
+   * MUST NOT trust `payload` fields when this is true. The corrupt original is
+   * preserved only in storage (the read-path warning log carries the
+   * interaction id). Absent on valid rows. See DEE-582 (read-path hardening for
+   * DEE-441-class poison rows).
+   */
+  unparseablePayload?: boolean;
+  /**
+   * Set true when the stored `result` JSON could not be parsed against its
+   * schema; `result` is degraded to `null` in that case so the read path
+   * survives. Absent on valid rows. See DEE-582.
+   */
+  unparseableResult?: boolean;
 }
 
 export interface SuggestTasksInteraction extends IssueThreadInteractionBase {
