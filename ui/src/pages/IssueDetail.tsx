@@ -1269,7 +1269,7 @@ export function IssueDetail() {
     [location.state, resolvedIssueDetailState],
   );
 
-  const { data: issue, isLoading, error } = useQuery({
+  const { data: issue, isLoading, error, refetch: refetchIssue } = useQuery({
     ...getIssueDetailQueryOptions(queryClient, issueId!, {
       placeholderIssue: issueHeaderSeed ? {
         id: issueHeaderSeed.id,
@@ -3079,7 +3079,28 @@ export function IssueDetail() {
 
   if (isLoading) return <IssueDetailLoadingState headerSeed={issueHeaderSeed} />;
   if (error) return <p className="text-sm text-destructive">{error.message}</p>;
-  if (!issue) return null;
+  if (!issue) {
+    // Defensive fallback: a successful query normally yields an issue (issuesApi.get
+    // throws on error), but the issue-detail `main` must never render fully blank.
+    // Show a recoverable state with a refetch affordance instead of nothing (DEE-673).
+    return (
+      <div
+        data-testid="issue-detail-unavailable"
+        className="flex flex-col items-start gap-2 p-6 text-sm text-muted-foreground"
+      >
+        <p>This issue couldn’t be loaded.</p>
+        <button
+          type="button"
+          className="text-foreground underline underline-offset-2"
+          onClick={() => {
+            void refetchIssue();
+          }}
+        >
+          Try again
+        </button>
+      </div>
+    );
+  }
 
   // Ancestors are returned oldest-first from the server (root at end, immediate parent at start)
   const ancestors = issue.ancestors ?? [];

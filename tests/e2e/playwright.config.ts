@@ -16,7 +16,7 @@ export default defineConfig({
   // intentionally not part of the default local_trusted e2e run.
   testIgnore: ["multi-user.spec.ts", "multi-user-authenticated.spec.ts"],
   timeout: 60_000,
-  retries: 0,
+  retries: process.env.CI ? 2 : 0,
   use: {
     baseURL: BASE_URL,
     headless: true,

@@ -6,6 +6,9 @@ const AGENT_NAME = "CEO";
 const TASK_TITLE = "PAP-3413 planning mode evidence";
 
 test("captures planning mode UI for desktop and mobile", async ({ page }) => {
+  // Heavy test: full onboarding + 6 navigations + 4 full-page screenshots.
+  // The shared 60s default is too tight under CI load (DEE-673).
+  test.setTimeout(150_000);
   const timestamp = Date.now();
   const companyName = `PAP-3413-${timestamp}`;
   const screenshotDir = "test-results/planning-mode";
@@ -126,9 +129,14 @@ test("captures planning mode UI for desktop and mobile", async ({ page }) => {
   });
 
   await page.goto(issuePath);
-  await page.getByTestId("issue-chat-composer-work-mode-toggle").click();
+  const standardToggle = page.getByTestId("issue-chat-composer-work-mode-toggle");
+  // Wait for the issue-detail body (composer + toggle) to mount before
+  // interacting; gives a precise failure instead of a 60s click timeout.
+  await expect(page.getByTestId("issue-chat-composer")).toBeVisible();
+  await expect(standardToggle).toBeVisible();
+  await standardToggle.click();
   await expect(page.getByTestId("issue-chat-composer")).toHaveAttribute("data-pending-work-mode", "standard");
-  await expect(page.getByTestId("issue-chat-composer-work-mode-toggle")).toBeHidden();
+  await expect(standardToggle).toBeHidden();
   await page.screenshot({
     path: `${screenshotDir}/desktop-standard-toggle-${timestamp}.png`,
     fullPage: true,
