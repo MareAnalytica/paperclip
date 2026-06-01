@@ -796,6 +796,12 @@ export async function startServer(): Promise<StartedServer> {
         }
       })
       .then(async () => {
+        const recovered = await heartbeat.reconcileAgentLatchRecovery();
+        if (recovered.wakesEmitted > 0 || recovered.escalated > 0) {
+          logger.warn({ ...recovered }, "startup agent-latch recovery emitted wakes");
+        }
+      })
+      .then(async () => {
         const reviewed = await heartbeat.reconcileProductivityReviews();
         if (reviewed.created > 0 || reviewed.updated > 0 || reviewed.failed > 0) {
           logger.warn({ ...reviewed }, "startup productivity reconciliation created or updated review work");
@@ -883,6 +889,12 @@ export async function startServer(): Promise<StartedServer> {
           const scanned = await heartbeat.scanSilentActiveRuns();
           if (scanned.created > 0 || scanned.escalated > 0) {
             logger.warn({ ...scanned }, "periodic active-run output watchdog created review work");
+          }
+        })
+        .then(async () => {
+          const recovered = await heartbeat.reconcileAgentLatchRecovery();
+          if (recovered.wakesEmitted > 0 || recovered.escalated > 0) {
+            logger.warn({ ...recovered }, "periodic agent-latch recovery emitted wakes");
           }
         })
         .then(async () => {

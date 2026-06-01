@@ -62,6 +62,11 @@ import type {
 } from "../adapters/index.js";
 import { createLocalAgentJwt } from "../agent-auth-jwt.js";
 import { parseObject, asBoolean, asNumber, appendWithByteCap, MAX_EXCERPT_BYTES } from "../adapters/utils.js";
+import {
+  readHeartbeatRunErrorFamily,
+  readTransientRecoveryContractFromRun,
+  readTransientRetryNotBeforeFromRun,
+} from "./recovery/heartbeat-run-error-family.js";
 import { costService } from "./costs.js";
 import { trackAgentFirstHeartbeat } from "@paperclipai/shared/telemetry";
 import { getTelemetryClient } from "../telemetry.js";
@@ -307,19 +312,6 @@ function resolveCodexTransientFallbackMode(attempt: number): CodexTransientFallb
   return "fresh_session_safer_invocation";
 }
 
-function readHeartbeatRunErrorFamily(
-  run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode" | "resultJson">,
-) {
-  const resultJson = parseObject(run.resultJson);
-  const persistedFamily = readNonEmptyString(resultJson.errorFamily);
-  if (persistedFamily) return persistedFamily;
-
-  if (run.errorCode === "codex_transient_upstream" || run.errorCode === "claude_transient_upstream") {
-    return "transient_upstream";
-  }
-  return null;
-}
-
 function isMaxTurnExhaustionRun(
   run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode" | "resultJson">,
 ) {
@@ -328,27 +320,6 @@ function isMaxTurnExhaustionRun(
     normalizeMaxTurnStopReason(resultJson.stopReason) ??
       normalizeMaxTurnStopReason(run.errorCode),
   );
-}
-
-function readTransientRetryNotBeforeFromRun(run: Pick<typeof heartbeatRuns.$inferSelect, "resultJson">) {
-  const resultJson = parseObject(run.resultJson);
-  const value = resultJson.retryNotBefore ?? resultJson.transientRetryNotBefore;
-  if (!(typeof value === "string" || typeof value === "number" || value instanceof Date)) {
-    return null;
-  }
-  const parsed = new Date(value);
-  return Number.isNaN(parsed.getTime()) ? null : parsed;
-}
-
-function readTransientRecoveryContractFromRun(
-  run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode" | "resultJson">,
-) {
-  return readHeartbeatRunErrorFamily(run) === "transient_upstream"
-    ? {
-        errorFamily: "transient_upstream" as const,
-        retryNotBefore: readTransientRetryNotBeforeFromRun(run),
-      }
-    : null;
 }
 
 function isProviderFallbackEligibleError(run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode" | "resultJson">) {
@@ -7665,6 +7636,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return recovery.scanSilentActiveRuns(opts);
   }
 
+  async function reconcileAgentLatchRecovery(opts?: { now?: Date; companyId?: string }) {
+    return recovery.reconcileAgentLatchRecovery(opts);
+  }
+
   async function reconcileProductivityReviews(opts?: { now?: Date; companyId?: string }) {
     return productivityReviews.reconcileProductivityReviews(opts);
   }
@@ -10940,6 +10915,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     reconcileIssueGraphLiveness,
 
     scanSilentActiveRuns,
+    reconcileAgentLatchRecovery,
 
     reconcileProductivityReviews,
 
