@@ -30,6 +30,7 @@ import { runningProcesses } from "../../adapters/index.js";
 import { forbidden, notFound } from "../../errors.js";
 import { logger } from "../../middleware/logger.js";
 import { isPidAlive, isProcessGroupAlive, terminateLocalService } from "../local-service-supervisor.js";
+import { isRecordedChildAlive, isRecordedGroupTerminable } from "../process-identity.js";
 import { redactCurrentUserText } from "../../log-redaction.js";
 import { redactSensitiveText } from "../../redaction.js";
 import { logActivity } from "../activity-log.js";
@@ -887,14 +888,21 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   // stays on the horizon path. This is intentionally stricter than `reapOrphanedRuns`,
   // which can additionally consult `activeRunExecutions` to reap never-tracked runs.
   function isOrphanedLocalChildRun(
-    run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "processPid" | "processGroupId">,
+    run: Pick<
+      typeof heartbeatRuns.$inferSelect,
+      "id" | "processPid" | "processGroupId" | "processStartedAt"
+    >,
     runningAgent: Pick<typeof agents.$inferSelect, "adapterType">,
   ): boolean {
     if (!SESSIONED_LOCAL_ADAPTERS.has(runningAgent.adapterType)) return false;
     if (runningProcesses.has(run.id)) return false;
     const hadTrackedProcess = run.processPid != null || run.processGroupId != null;
     if (!hadTrackedProcess) return false;
-    if (run.processPid && isPidAlive(run.processPid)) return false;
+    // DEE-662 M2: use PID-identity (not bare liveness) for path consistency with
+    // reapOrphanedRuns — a recycled low PID after a pod restart must not mask an
+    // orphaned run as "still alive". The group path keeps bare liveness: a live
+    // group with a dead leader is a legitimate not-yet-orphaned descendant set.
+    if (run.processPid && isRecordedChildAlive(run.processPid, run.processStartedAt)) return false;
     if (isProcessGroupAlive(run.processGroupId)) return false;
     return true;
   }
@@ -1212,9 +1220,27 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       };
     }
 
+    // DEE-662 H2: with no live in-memory handle we are working purely from the
+    // recorded PID / process-group. After a restart (or, for a PID, within the
+    // same incarnation) those numbers can be recycled by unrelated processes
+    // (DEE-660: pid/pgid 58 -> esbuild), so signalling them would SIGKILL an
+    // innocent process. The PID is alive (probeable), so gate it on full
+    // /proc identity (isRecordedChildAlive catches both prior-boot and
+    // same-incarnation start-time reuse). The group leader may already be dead
+    // so a /proc probe is unavailable; gate it on the boot epoch only, which is
+    // the pod-restart reuse class — same-incarnation/unknown-start groups keep
+    // the existing best-effort descendant cleanup. A live in-memory handle is
+    // inherently our child and is always trusted.
+    const pidTerminable =
+      typeof pid === "number" &&
+      (running != null || isRecordedChildAlive(pid, input.run.processStartedAt));
+    const groupTerminable =
+      typeof processGroupId === "number" &&
+      (running != null || isRecordedGroupTerminable(processGroupId, input.run.processStartedAt));
+
     const wasAlive =
-      (typeof pid === "number" && isPidAlive(pid)) ||
-      (typeof processGroupId === "number" && isProcessGroupAlive(processGroupId));
+      (pidTerminable && isPidAlive(pid as number)) ||
+      (groupTerminable && isProcessGroupAlive(processGroupId as number));
     if (!wasAlive) {
       runningProcesses.delete(input.run.id);
       return {
@@ -1229,10 +1255,10 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     try {
       await terminateLocalService(
         {
-          pid: typeof pid === "number" && Number.isInteger(pid) && pid > 0
+          pid: pidTerminable && typeof pid === "number" && Number.isInteger(pid) && pid > 0
             ? pid
-            : (processGroupId ?? 0),
-          processGroupId: typeof processGroupId === "number" && Number.isInteger(processGroupId) && processGroupId > 0
+            : (groupTerminable ? (processGroupId ?? 0) : 0),
+          processGroupId: groupTerminable && typeof processGroupId === "number" && Number.isInteger(processGroupId) && processGroupId > 0
             ? processGroupId
             : null,
         },
@@ -1240,8 +1266,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       );
       runningProcesses.delete(input.run.id);
       const stillAlive =
-        (typeof pid === "number" && isPidAlive(pid)) ||
-        (typeof processGroupId === "number" && isProcessGroupAlive(processGroupId));
+        (pidTerminable && isPidAlive(pid as number)) ||
+        (groupTerminable && isProcessGroupAlive(processGroupId as number));
       return {
         attempted: true,
         outcome: stillAlive ? "termination_sent_still_running" : "terminated",

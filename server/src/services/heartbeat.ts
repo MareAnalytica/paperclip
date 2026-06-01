@@ -214,6 +214,11 @@ const WAKE_COMMENT_IDS_KEY = "wakeCommentIds";
 const PAPERCLIP_WAKE_PAYLOAD_KEY = "paperclipWake";
 const PAPERCLIP_HARNESS_CHECKOUT_KEY = "paperclipHarnessCheckedOut";
 const DETACHED_PROCESS_ERROR_CODE = "process_detached";
+// Bounded forward-progress backstop (DEE-662): a run already flagged
+// `process_detached` whose output has been silent for longer than this horizon
+// is force-finalized regardless of bare PID liveness, so a reused/uninspectable
+// PID can never keep a lost-handle run immortal.
+const DETACHED_RUN_FINALIZE_HORIZON_MS = 60 * 60 * 1000;
 const REPO_ONLY_CWD_SENTINEL = "/__paperclip_repo_only__";
 const MANAGED_WORKSPACE_GIT_CLONE_TIMEOUT_MS = 10 * 60 * 1000;
 const MAX_INLINE_WAKE_COMMENTS = 8;
@@ -2623,21 +2628,11 @@ export function buildPaperclipTaskMarkdown(input: {
   return lines.join("\n");
 }
 
-// A positive liveness check means some process currently owns the PID.
-// On Linux, PIDs can be recycled, so this is a best-effort signal rather
-// than proof that the original child is still alive.
-function isProcessAlive(pid: number | null | undefined) {
-  if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException | undefined)?.code;
-    if (code === "EPERM") return true;
-    if (code === "ESRCH") return false;
-    return false;
-  }
-}
+// DEE-662 process-identity helpers (PID-reuse-safe liveness, /proc start-time
+// gate, CLK_TCK derivation) live in a leaf module to avoid a heartbeat <-> recovery
+// import cycle. Re-exported here for existing consumers/tests.
+import { isRecordedChildAlive, isRecordedGroupTerminable } from "./process-identity.js";
+export { isRecordedChildAlive };
 
 async function terminateHeartbeatRunProcess(input: {
   pid: number | null | undefined;
@@ -7399,8 +7394,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .then((rows) => rows[0] ?? null);
   }
 
-  async function reapOrphanedRuns(opts?: { staleThresholdMs?: number }) {
+  async function reapOrphanedRuns(opts?: {
+    staleThresholdMs?: number;
+    detachedFinalizeHorizonMs?: number;
+    // Test-only seam: override the observed /proc start-time lookup so the
+    // identity start-time gate (DEE-662 gate 2) can be exercised end-to-end
+    // deterministically without depending on wall-clock process age.
+    identityProcStartMs?: (pid: number) => number | null;
+  }) {
     const staleThresholdMs = opts?.staleThresholdMs ?? 0;
+    const detachedFinalizeHorizonMs = opts?.detachedFinalizeHorizonMs ?? DETACHED_RUN_FINALIZE_HORIZON_MS;
     const now = new Date();
 
     // Find all runs stuck in "running" state (queued runs are legitimately waiting; resumeQueuedRuns handles them)
@@ -7426,35 +7429,69 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
 
       const tracksLocalChild = isTrackedLocalChildProcessAdapter(adapterType);
-      const processPidAlive = tracksLocalChild && run.processPid && isProcessAlive(run.processPid);
+      // DEE-662: verify the recorded PID is plausibly STILL our child, not a
+      // reused PID, instead of trusting bare liveness (which kept lost-handle
+      // runs immortal after a pod restart recycled a low PID).
+      const processPidAlive =
+        tracksLocalChild &&
+        !!run.processPid &&
+        isRecordedChildAlive(
+          run.processPid,
+          run.processStartedAt,
+          opts?.identityProcStartMs ? { procStartMs: opts.identityProcStartMs } : {},
+        );
       const processGroupAlive = tracksLocalChild && run.processGroupId && isProcessGroupAlive(run.processGroupId);
       if (processPidAlive) {
-        if (run.errorCode !== DETACHED_PROCESS_ERROR_CODE) {
-          const detachedMessage = `Lost in-memory process handle, but child pid ${run.processPid} is still alive`;
-          const detachedRun = await setRunStatus(run.id, "running", {
-            error: detachedMessage,
-            errorCode: DETACHED_PROCESS_ERROR_CODE,
-          });
-          if (detachedRun) {
-            await appendRunEvent(detachedRun, await nextRunEventSeq(detachedRun.id), {
-              eventType: "lifecycle",
-              stream: "system",
-              level: "warn",
-              message: detachedMessage,
-              payload: {
-                processPid: run.processPid,
-              },
+        // Bounded forward-progress backstop: even when the PID looks like our
+        // child, a run that has been silently `process_detached` past the
+        // horizon is force-finalized rather than skipped forever.
+        const detachedSilenceRef =
+          run.lastOutputAt ?? run.processStartedAt ?? run.startedAt ?? run.createdAt ?? now;
+        const detachedSilenceRefMs = new Date(detachedSilenceRef).getTime();
+        const detachedBeyondHorizon =
+          run.errorCode === DETACHED_PROCESS_ERROR_CODE &&
+          Number.isFinite(detachedSilenceRefMs) &&
+          now.getTime() - detachedSilenceRefMs >= detachedFinalizeHorizonMs;
+
+        if (!detachedBeyondHorizon) {
+          if (run.errorCode !== DETACHED_PROCESS_ERROR_CODE) {
+            const detachedMessage = `Lost in-memory process handle, but child pid ${run.processPid} is still alive`;
+            const detachedRun = await setRunStatus(run.id, "running", {
+              error: detachedMessage,
+              errorCode: DETACHED_PROCESS_ERROR_CODE,
             });
+            if (detachedRun) {
+              await appendRunEvent(detachedRun, await nextRunEventSeq(detachedRun.id), {
+                eventType: "lifecycle",
+                stream: "system",
+                level: "warn",
+                message: detachedMessage,
+                payload: {
+                  processPid: run.processPid,
+                },
+              });
+            }
           }
+          continue;
         }
-        continue;
+        // Fall through to finalize: detached + silent beyond horizon.
       }
 
+      // DEE-662: never signal a recorded PID/PGID that identity says is not ours
+      // (a reused number after a pod restart, or a same-incarnation recycled
+      // leader PID — DEE-660: pgid 58 -> esbuild). Only clean a live group we can
+      // still attribute to this run, and only pass the recorded PID when its
+      // /proc identity still matches the recorded child.
+      const groupTerminable =
+        !!run.processGroupId && isRecordedGroupTerminable(run.processGroupId, run.processStartedAt);
       let descendantOnlyCleanup = false;
-      if (processGroupAlive) {
+      if (processGroupAlive && groupTerminable) {
         descendantOnlyCleanup = true;
         await terminateHeartbeatRunProcess({
-          pid: run.processPid,
+          pid:
+            !!run.processPid && isRecordedChildAlive(run.processPid, run.processStartedAt)
+              ? run.processPid
+              : null,
           processGroupId: run.processGroupId,
         });
       }

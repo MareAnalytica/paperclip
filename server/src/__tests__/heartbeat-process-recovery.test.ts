@@ -80,8 +80,14 @@ vi.mock("../adapters/index.ts", async () => {
 
 import {
   heartbeatService,
+  isRecordedChildAlive,
   redactDetectedSuccessfulRunProgressSummaryForBoard,
 } from "../services/heartbeat.ts";
+import {
+  isRecordedFromPriorBootEpoch,
+  isRecordedGroupTerminable,
+  snapToCanonicalClockTicks,
+} from "../services/process-identity.ts";
 import {
   SUCCESSFUL_RUN_HANDOFF_EXHAUSTED_NOTICE_BODY,
   SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_BODY,
@@ -465,6 +471,8 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     runStatus?: "running" | "queued" | "failed";
     processPid?: number | null;
     processGroupId?: number | null;
+    processStartedAt?: Date | null;
+    lastOutputAt?: Date | null;
     processLossRetryCount?: number;
     includeIssue?: boolean;
     runErrorCode?: string | null;
@@ -524,6 +532,8 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         : { ...(input?.contextSnapshot ?? {}), issueId },
       processPid: input?.processPid ?? null,
       processGroupId: input?.processGroupId ?? null,
+      processStartedAt: input?.processStartedAt ?? null,
+      lastOutputAt: input?.lastOutputAt ?? null,
       processLossRetryCount: input?.processLossRetryCount ?? 0,
       errorCode: input?.runErrorCode ?? null,
       error: input?.runError ?? null,
@@ -991,6 +1001,166 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .where(eq(agentWakeupRequests.id, wakeupRequestId))
       .then((rows) => rows[0] ?? null);
     expect(wakeup?.status).toBe("claimed");
+  });
+
+  it("finalizes a run whose recorded pid was reused after a restart (DEE-662)", async () => {
+    // A live process holds the recorded pid, but the run recorded its child
+    // start in a previous incarnation (before this process booted), so the live
+    // pid must be a reused/unrelated process — the original child is gone.
+    const child = spawnAliveProcess();
+    childProcesses.add(child);
+    expect(child.pid).toBeTypeOf("number");
+
+    const { runId, agentId, issueId } = await seedRunFixture({
+      processPid: child.pid ?? null,
+      processStartedAt: new Date("2020-01-01T00:00:00.000Z"),
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reapOrphanedRuns();
+    expect(result.reaped).toBe(1);
+    expect(result.runIds).toEqual([runId]);
+
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    const failedRun = runs.find((row) => row.id === runId);
+    expect(failedRun?.status).toBe("failed");
+    expect(failedRun?.errorCode).toBe("process_lost");
+
+    // DEE-662 M3: a reused-pid reap must not just finalize — it must re-queue a
+    // retry and rewire the issue's executionRunId so work resumes (mirrors the
+    // dead-pid path), not strand the issue on the dead run.
+    const retryRun = runs.find((row) => row.id !== runId);
+    expect(retryRun?.status).toBe("queued");
+    expect(retryRun?.retryOfRunId).toBe(runId);
+    expect(retryRun?.processLossRetryCount).toBe(1);
+
+    const issue = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(issue?.executionRunId).toBe(retryRun?.id ?? null);
+    expect(issue?.checkoutRunId).toBe(runId);
+  });
+
+  it("finalizes a run whose live pid started after the recorded child via the /proc start-time gate (DEE-662 gate 2)", async () => {
+    // Recorded child start is recent (AFTER this process booted, so the
+    // boot-epoch gate cannot fire), but the live pid's observed /proc start
+    // post-dates it by more than the skew tolerance — so the start-time gate
+    // (gate 2) is the deciding signal. Driven deterministically via the
+    // identityProcStartMs seam rather than wall-clock process age.
+    const child = spawnAliveProcess();
+    childProcesses.add(child);
+    expect(child.pid).toBeTypeOf("number");
+
+    const recordedMs = Date.now();
+    const { runId, agentId, issueId } = await seedRunFixture({
+      processPid: child.pid ?? null,
+      processStartedAt: new Date(recordedMs),
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reapOrphanedRuns({
+      // Live pid appears to have started 60s after the recorded child -> reused.
+      identityProcStartMs: () => recordedMs + 60_000,
+    });
+    expect(result.reaped).toBe(1);
+    expect(result.runIds).toEqual([runId]);
+
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    const failedRun = runs.find((row) => row.id === runId);
+    expect(failedRun?.status).toBe("failed");
+    expect(failedRun?.errorCode).toBe("process_lost");
+
+    const issue = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    const retryRun = runs.find((row) => row.id !== runId);
+    expect(issue?.executionRunId).toBe(retryRun?.id ?? null);
+  });
+
+  it("keeps a genuinely-alive child whose /proc start matches the recorded child (DEE-662 gate 2 no-regression)", async () => {
+    // Same recent recorded start, but the live pid's observed start is within
+    // tolerance of it -> identity-consistent -> must NOT be finalized.
+    const child = spawnAliveProcess();
+    childProcesses.add(child);
+    expect(child.pid).toBeTypeOf("number");
+
+    const recordedMs = Date.now();
+    const { runId } = await seedRunFixture({
+      processPid: child.pid ?? null,
+      processStartedAt: new Date(recordedMs),
+      includeIssue: false,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reapOrphanedRuns({
+      identityProcStartMs: () => recordedMs + 500, // within the 30s skew tolerance
+      detachedFinalizeHorizonMs: 60 * 60 * 1000,
+    });
+    expect(result.reaped).toBe(0);
+
+    const run = await heartbeat.getRun(runId);
+    expect(run?.status).toBe("running");
+  });
+
+  it("force-finalizes a detached run silent beyond the horizon despite a live pid (DEE-662)", async () => {
+    // The recorded pid is genuinely alive and identity-consistent, but the run
+    // has been silently `process_detached` past the horizon — forward progress
+    // must win over bare liveness.
+    const child = spawnAliveProcess();
+    childProcesses.add(child);
+    expect(child.pid).toBeTypeOf("number");
+
+    const { runId, agentId } = await seedRunFixture({
+      processPid: child.pid ?? null,
+      processStartedAt: new Date(),
+      lastOutputAt: new Date(Date.now() - 60_000),
+      runErrorCode: "process_detached",
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reapOrphanedRuns({ detachedFinalizeHorizonMs: 1_000 });
+    expect(result.reaped).toBe(1);
+    expect(result.runIds).toEqual([runId]);
+
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    const failedRun = runs.find((row) => row.id === runId);
+    expect(failedRun?.status).toBe("failed");
+    expect(failedRun?.errorCode).toBe("process_lost");
+  });
+
+  it("keeps a detached run with a live, identity-consistent pid within the horizon (DEE-662 no-regression)", async () => {
+    const child = spawnAliveProcess();
+    childProcesses.add(child);
+    expect(child.pid).toBeTypeOf("number");
+
+    const { runId } = await seedRunFixture({
+      processPid: child.pid ?? null,
+      processStartedAt: new Date(),
+      lastOutputAt: new Date(),
+      runErrorCode: "process_detached",
+      includeIssue: false,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reapOrphanedRuns({ detachedFinalizeHorizonMs: 60 * 60 * 1000 });
+    expect(result.reaped).toBe(0);
+
+    const run = await heartbeat.getRun(runId);
+    expect(run?.status).toBe("running");
+    expect(run?.errorCode).toBe("process_detached");
   });
 
   it("queues exactly one retry when the recorded local pid is dead", async () => {
@@ -3603,5 +3773,158 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
     const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
     expect(runs).toHaveLength(1);
+  });
+});
+
+describe("isRecordedChildAlive (DEE-662 pid-identity)", () => {
+  const NOW = Date.UTC(2026, 5, 1, 12, 0, 0);
+  const recorded = new Date(NOW - 60_000); // child recorded 60s before "now"
+  const selfStartMs = () => NOW - 5 * 60_000; // this process booted 5m ago
+
+  it("returns false for an invalid or dead pid", () => {
+    expect(isRecordedChildAlive(0, recorded)).toBe(false);
+    expect(isRecordedChildAlive(123, recorded, { isAlive: () => false })).toBe(false);
+  });
+
+  it("cannot judge identity without a recorded start, so reports alive", () => {
+    expect(isRecordedChildAlive(123, null, { isAlive: () => true })).toBe(true);
+  });
+
+  it("flags a reused pid via the boot-epoch gate (recorded child predates this process)", () => {
+    const preBoot = new Date(NOW - 10 * 60_000); // older than selfStart (5m)
+    expect(
+      isRecordedChildAlive(58, preBoot, {
+        isAlive: () => true,
+        selfStartMs,
+        procStartMs: () => null,
+      }),
+    ).toBe(false);
+  });
+
+  it("flags a reused pid via the /proc start-time gate (live pid started after the child was recorded)", () => {
+    expect(
+      isRecordedChildAlive(58, recorded, {
+        isAlive: () => true,
+        selfStartMs,
+        procStartMs: () => NOW, // started 60s after `recorded`
+      }),
+    ).toBe(false);
+  });
+
+  it("reports a genuinely-alive, identity-consistent child as alive", () => {
+    expect(
+      isRecordedChildAlive(58, recorded, {
+        isAlive: () => true,
+        selfStartMs,
+        procStartMs: () => recorded.getTime() + 500, // within tolerance
+      }),
+    ).toBe(true);
+  });
+
+  it("absorbs small clock skew within tolerance", () => {
+    expect(
+      isRecordedChildAlive(58, recorded, {
+        isAlive: () => true,
+        selfStartMs: () => recorded.getTime() + 1_000, // recorded ~1s before boot
+        procStartMs: () => recorded.getTime() + 1_000,
+        toleranceMs: 30_000,
+      }),
+    ).toBe(true);
+  });
+});
+
+describe("isRecordedFromPriorBootEpoch (DEE-662 H2 — termination reuse guard)", () => {
+  const NOW = Date.UTC(2026, 5, 1, 12, 0, 0);
+  const selfStartMs = () => NOW - 5 * 60_000; // this process booted 5m ago
+
+  it("flags a recorded child that predates this boot (pod-restart PID/PGID reuse — suppress signalling)", () => {
+    expect(
+      isRecordedFromPriorBootEpoch(new Date(NOW - 10 * 60_000), { selfStartMs }),
+    ).toBe(true);
+  });
+
+  it("does NOT flag a same-incarnation start (preserve descendant cleanup)", () => {
+    expect(
+      isRecordedFromPriorBootEpoch(new Date(NOW - 60_000), { selfStartMs }),
+    ).toBe(false);
+  });
+
+  it("does NOT flag inconclusive input (no recorded start) — keep existing cleanup", () => {
+    expect(isRecordedFromPriorBootEpoch(null, { selfStartMs })).toBe(false);
+    expect(isRecordedFromPriorBootEpoch(new Date(NOW), { selfStartMs: () => Number.NaN })).toBe(false);
+  });
+});
+
+describe("isRecordedGroupTerminable (DEE-662 H2 — group reuse guard)", () => {
+  const NOW = Date.UTC(2026, 5, 1, 12, 0, 0);
+  const recorded = new Date(NOW - 60_000);
+  const selfStartMs = () => NOW - 5 * 60_000;
+
+  it("rejects a group whose recorded start is from a prior boot (pod-restart PGID reuse)", () => {
+    expect(
+      isRecordedGroupTerminable(58, new Date(NOW - 10 * 60_000), {
+        isAlive: () => true,
+        selfStartMs,
+        procStartMs: () => NOW,
+      }),
+    ).toBe(false);
+  });
+
+  it("rejects a same-incarnation group whose live leader pid was reused (started after recorded)", () => {
+    expect(
+      isRecordedGroupTerminable(58, recorded, {
+        isAlive: () => true,
+        selfStartMs,
+        procStartMs: () => recorded.getTime() + 5 * 60_000, // leader started well after recorded
+      }),
+    ).toBe(false);
+  });
+
+  it("allows a group whose live leader pid matches the recorded child", () => {
+    expect(
+      isRecordedGroupTerminable(58, recorded, {
+        isAlive: () => true,
+        selfStartMs,
+        procStartMs: () => recorded.getTime() + 500, // within tolerance
+      }),
+    ).toBe(true);
+  });
+
+  it("allows a descendant-only group whose leader pid is already dead (legit cleanup)", () => {
+    expect(
+      isRecordedGroupTerminable(58, recorded, {
+        isAlive: () => false, // leader gone, but the group itself is still alive
+        selfStartMs,
+        procStartMs: () => null,
+      }),
+    ).toBe(true);
+  });
+
+  it("rejects an invalid process group id", () => {
+    expect(isRecordedGroupTerminable(0, recorded, { isAlive: () => true })).toBe(false);
+  });
+});
+
+describe("snapToCanonicalClockTicks (DEE-662 H1)", () => {
+  it("returns the exact canonical value for near-canonical derived rates", () => {
+    expect(snapToCanonicalClockTicks(100)).toBe(100);
+    expect(snapToCanonicalClockTicks(99)).toBe(100); // within 10%
+    expect(snapToCanonicalClockTicks(108)).toBe(100);
+    expect(snapToCanonicalClockTicks(250)).toBe(250);
+    expect(snapToCanonicalClockTicks(1000)).toBe(1000);
+    expect(snapToCanonicalClockTicks(940)).toBe(1000);
+  });
+
+  it("refuses to resolve a non-canonical / noisy derived rate (skip gate 2 -> horizon)", () => {
+    // The dangerous case: a noisy startup derivation that is NOT close to any
+    // real CLK_TCK must return null rather than be trusted verbatim (which would
+    // scale absolute start times by hours and false-finalize a live child).
+    expect(snapToCanonicalClockTicks(150)).toBeNull();
+    expect(snapToCanonicalClockTicks(200)).toBeNull();
+    expect(snapToCanonicalClockTicks(60)).toBeNull();
+    expect(snapToCanonicalClockTicks(500)).toBeNull();
+    expect(snapToCanonicalClockTicks(0)).toBeNull();
+    expect(snapToCanonicalClockTicks(-100)).toBeNull();
+    expect(snapToCanonicalClockTicks(Number.NaN)).toBeNull();
   });
 });
