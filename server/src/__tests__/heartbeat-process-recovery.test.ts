@@ -80,6 +80,7 @@ vi.mock("../adapters/index.ts", async () => {
 
 import {
   heartbeatService,
+  isRecordedChildAlive,
   redactDetectedSuccessfulRunProgressSummaryForBoard,
 } from "../services/heartbeat.ts";
 import {
@@ -430,9 +431,9 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     runStatus?: "running" | "queued" | "failed";
     processPid?: number | null;
     processGroupId?: number | null;
-    processLossRetryCount?: number;
     processStartedAt?: Date | null;
     lastOutputAt?: Date | null;
+    processLossRetryCount?: number;
     includeIssue?: boolean;
     runErrorCode?: string | null;
     runError?: string | null;
@@ -491,9 +492,9 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         : { ...(input?.contextSnapshot ?? {}), issueId },
       processPid: input?.processPid ?? null,
       processGroupId: input?.processGroupId ?? null,
-      processLossRetryCount: input?.processLossRetryCount ?? 0,
       processStartedAt: input?.processStartedAt ?? null,
       lastOutputAt: input?.lastOutputAt ?? null,
+      processLossRetryCount: input?.processLossRetryCount ?? 0,
       errorCode: input?.runErrorCode ?? null,
       error: input?.runError ?? null,
       startedAt: now,
@@ -962,19 +963,17 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(wakeup?.status).toBe("claimed");
   });
 
-  it("finalizes an orphaned run whose recorded pid was recycled by an unrelated process", async () => {
-    // Stand-in for the unrelated process that recycled the run's low pid after a
-    // control-plane restart (DEE-660: pid 58 became an esbuild helper). It is alive
-    // now, but started long after the run recorded its child start-time, so PID
-    // identity must reject it instead of treating the lost-handle run as live.
-    const recycler = spawnAliveProcess();
-    childProcesses.add(recycler);
-    expect(recycler.pid).toBeTypeOf("number");
+  it("finalizes a run whose recorded pid was reused after a restart (DEE-662)", async () => {
+    // A live process holds the recorded pid, but the run recorded its child
+    // start in a previous incarnation (before this process booted), so the live
+    // pid must be a reused/unrelated process — the original child is gone.
+    const child = spawnAliveProcess();
+    childProcesses.add(child);
+    expect(child.pid).toBeTypeOf("number");
 
-    const { agentId, runId } = await seedRunFixture({
-      processPid: recycler.pid ?? null,
-      processStartedAt: new Date("2026-03-19T00:00:00.000Z"),
-      runErrorCode: "process_detached",
+    const { runId, agentId } = await seedRunFixture({
+      processPid: child.pid ?? null,
+      processStartedAt: new Date("2020-01-01T00:00:00.000Z"),
     });
     const heartbeat = heartbeatService(db);
 
@@ -989,34 +988,57 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const failedRun = runs.find((row) => row.id === runId);
     expect(failedRun?.status).toBe("failed");
     expect(failedRun?.errorCode).toBe("process_lost");
-
-    // The innocent recycler process must NOT have been signalled by the reaper.
-    expect(isPidAlive(recycler.pid)).toBe(true);
   });
 
-  it("force-finalizes a process_detached run silent beyond the horizon even when the pid is alive", async () => {
-    // A genuinely-alive pid whose identity we cannot disprove (no recorded
-    // processStartedAt), already detached, but silent far past the horizon. Guard 2
-    // must finalize it regardless of liveness so the issue makes forward progress.
+  it("force-finalizes a detached run silent beyond the horizon despite a live pid (DEE-662)", async () => {
+    // The recorded pid is genuinely alive and identity-consistent, but the run
+    // has been silently `process_detached` past the horizon — forward progress
+    // must win over bare liveness.
+    const child = spawnAliveProcess();
+    childProcesses.add(child);
+    expect(child.pid).toBeTypeOf("number");
+
+    const { runId, agentId } = await seedRunFixture({
+      processPid: child.pid ?? null,
+      processStartedAt: new Date(),
+      lastOutputAt: new Date(Date.now() - 60_000),
+      runErrorCode: "process_detached",
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reapOrphanedRuns({ detachedFinalizeHorizonMs: 1_000 });
+    expect(result.reaped).toBe(1);
+    expect(result.runIds).toEqual([runId]);
+
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    const failedRun = runs.find((row) => row.id === runId);
+    expect(failedRun?.status).toBe("failed");
+    expect(failedRun?.errorCode).toBe("process_lost");
+  });
+
+  it("keeps a detached run with a live, identity-consistent pid within the horizon (DEE-662 no-regression)", async () => {
     const child = spawnAliveProcess();
     childProcesses.add(child);
     expect(child.pid).toBeTypeOf("number");
 
     const { runId } = await seedRunFixture({
       processPid: child.pid ?? null,
+      processStartedAt: new Date(),
+      lastOutputAt: new Date(),
       runErrorCode: "process_detached",
-      lastOutputAt: new Date("2026-03-19T00:00:00.000Z"),
-      processLossRetryCount: 1,
       includeIssue: false,
     });
     const heartbeat = heartbeatService(db);
 
-    const result = await heartbeat.reapOrphanedRuns();
-    expect(result.reaped).toBe(1);
+    const result = await heartbeat.reapOrphanedRuns({ detachedFinalizeHorizonMs: 60 * 60 * 1000 });
+    expect(result.reaped).toBe(0);
 
     const run = await heartbeat.getRun(runId);
-    expect(run?.status).toBe("failed");
-    expect(run?.errorCode).toBe("process_lost");
+    expect(run?.status).toBe("running");
+    expect(run?.errorCode).toBe("process_detached");
   });
 
   it("queues exactly one retry when the recorded local pid is dead", async () => {
@@ -3628,5 +3650,62 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
     const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
     expect(runs).toHaveLength(1);
+  });
+});
+
+describe("isRecordedChildAlive (DEE-662 pid-identity)", () => {
+  const NOW = Date.UTC(2026, 5, 1, 12, 0, 0);
+  const recorded = new Date(NOW - 60_000); // child recorded 60s before "now"
+  const selfStartMs = () => NOW - 5 * 60_000; // this process booted 5m ago
+
+  it("returns false for an invalid or dead pid", () => {
+    expect(isRecordedChildAlive(0, recorded)).toBe(false);
+    expect(isRecordedChildAlive(123, recorded, { isAlive: () => false })).toBe(false);
+  });
+
+  it("cannot judge identity without a recorded start, so reports alive", () => {
+    expect(isRecordedChildAlive(123, null, { isAlive: () => true })).toBe(true);
+  });
+
+  it("flags a reused pid via the boot-epoch gate (recorded child predates this process)", () => {
+    const preBoot = new Date(NOW - 10 * 60_000); // older than selfStart (5m)
+    expect(
+      isRecordedChildAlive(58, preBoot, {
+        isAlive: () => true,
+        selfStartMs,
+        procStartMs: () => null,
+      }),
+    ).toBe(false);
+  });
+
+  it("flags a reused pid via the /proc start-time gate (live pid started after the child was recorded)", () => {
+    expect(
+      isRecordedChildAlive(58, recorded, {
+        isAlive: () => true,
+        selfStartMs,
+        procStartMs: () => NOW, // started 60s after `recorded`
+      }),
+    ).toBe(false);
+  });
+
+  it("reports a genuinely-alive, identity-consistent child as alive", () => {
+    expect(
+      isRecordedChildAlive(58, recorded, {
+        isAlive: () => true,
+        selfStartMs,
+        procStartMs: () => recorded.getTime() + 500, // within tolerance
+      }),
+    ).toBe(true);
+  });
+
+  it("absorbs small clock skew within tolerance", () => {
+    expect(
+      isRecordedChildAlive(58, recorded, {
+        isAlive: () => true,
+        selfStartMs: () => recorded.getTime() + 1_000, // recorded ~1s before boot
+        procStartMs: () => recorded.getTime() + 1_000,
+        toleranceMs: 30_000,
+      }),
+    ).toBe(true);
   });
 });

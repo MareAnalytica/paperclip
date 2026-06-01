@@ -215,6 +215,14 @@ const WAKE_COMMENT_IDS_KEY = "wakeCommentIds";
 const PAPERCLIP_WAKE_PAYLOAD_KEY = "paperclipWake";
 const PAPERCLIP_HARNESS_CHECKOUT_KEY = "paperclipHarnessCheckedOut";
 const DETACHED_PROCESS_ERROR_CODE = "process_detached";
+// Tolerance absorbing clock skew, spawn latency, and CLK_TCK rounding when
+// comparing a live PID's start time against the run's recorded child start.
+const PROCESS_IDENTITY_SKEW_TOLERANCE_MS = 30 * 1000;
+// Bounded forward-progress backstop (DEE-662): a run already flagged
+// `process_detached` whose output has been silent for longer than this horizon
+// is force-finalized regardless of bare PID liveness, so a reused/uninspectable
+// PID can never keep a lost-handle run immortal.
+const DETACHED_RUN_FINALIZE_HORIZON_MS = 60 * 60 * 1000;
 const REPO_ONLY_CWD_SENTINEL = "/__paperclip_repo_only__";
 const MANAGED_WORKSPACE_GIT_CLONE_TIMEOUT_MS = 10 * 60 * 1000;
 const MAX_INLINE_WAKE_COMMENTS = 8;
@@ -2640,77 +2648,123 @@ function isProcessAlive(pid: number | null | undefined) {
   }
 }
 
-// Linux clock ticks per second; glibc reports 100 on every Paperclip control-plane
-// host. We avoid a native sysconf() and treat a non-Linux/unknown host as "identity
-// unverifiable" (readProcessStartTimeMs returns null), falling back to the silence
-// horizon rather than guessing. (DEE-662)
-const LINUX_CLOCK_TICKS_PER_SEC = 100;
+// Wall-clock time (ms) at which THIS control-plane process started. Any agent
+// child we genuinely spawned was forked during our lifetime, so its recorded
+// start cannot predate this. Used as a boot-epoch gate: a run whose recorded
+// child start predates our boot belonged to a previous pod incarnation, so a
+// still-"alive" PID at that number must have been reused (DEE-660).
+function selfProcessStartWallMs(): number {
+  return Date.now() - process.uptime() * 1000;
+}
 
-// A genuine child's /proc start-time matches the start-time we recorded at spawn to
-// within sub-second jitter (btime is whole seconds, starttime rounds to a clock tick)
-// plus clock skew, comfortably under this bound. A PID recycled by an unrelated
-// process after a control-plane restart starts seconds-to-hours later, so it always
-// exceeds the tolerance. (DEE-662)
-const PID_REUSE_IDENTITY_TOLERANCE_MS = 10_000;
-
-// A run already re-marked process_detached that produces no output for longer than
-// this horizon is force-finalized regardless of PID liveness, guaranteeing forward
-// progress even when PID identity is inconclusive (non-Linux host, unreadable procfs).
-// Conservatively long: guard 1 (PID identity) handles the common reused-PID case
-// immediately, so this is only the backstop. (DEE-662 guard 2)
-const LOST_HANDLE_SILENCE_HORIZON_MS = 2 * 60 * 60 * 1000;
-
-// Wall-clock start time of the process that currently owns `pid`, derived from
-// /proc/<pid>/stat field 22 (starttime, in clock ticks since boot) and /proc/stat
-// `btime` (boot epoch seconds). Returns null when it cannot be determined (non-Linux,
-// procfs unreadable, or a malformed stat line) so callers treat identity as
-// unverifiable rather than guessing. (DEE-662)
-function readProcessStartTimeMs(pid: number): number | null {
-  if (process.platform !== "linux") return null;
-  if (!Number.isInteger(pid) || pid <= 0) return null;
+let cachedClockTicksPerSecond: number | null = null;
+// Derive CLK_TCK at runtime (almost always 100 on Linux) without sysconf, by
+// anchoring our own /proc start ticks to our known wall-clock start. Snapped to
+// the nearest 10 to absorb measurement noise; falls back to the Linux default.
+function clockTicksPerSecond(): number {
+  if (cachedClockTicksPerSecond != null) return cachedClockTicksPerSecond;
+  let resolved = 100;
   try {
-    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
-    // Field 2 (comm) may contain spaces/parens; everything after the final ')' is
-    // space-delimited, with starttime at index 19 of that tail (stat field 22).
-    const rparen = stat.lastIndexOf(")");
-    if (rparen < 0) return null;
-    const tail = stat.slice(rparen + 2).trim().split(/\s+/);
-    const starttimeTicks = Number(tail[19]);
-    if (!Number.isFinite(starttimeTicks)) return null;
-    const procStat = readFileSync("/proc/stat", "utf8");
-    const btimeMatch = procStat.match(/^btime\s+(\d+)/m);
-    if (!btimeMatch) return null;
-    const btimeSec = Number(btimeMatch[1]);
-    if (!Number.isFinite(btimeSec)) return null;
-    return btimeSec * 1000 + (starttimeTicks / LINUX_CLOCK_TICKS_PER_SEC) * 1000;
+    const selfTicks = readProcStartTicks(process.pid);
+    const btime = readBootTimeSeconds();
+    if (selfTicks != null && btime != null) {
+      const elapsedSec = selfProcessStartWallMs() / 1000 - btime;
+      if (elapsedSec > 0) {
+        const derived = Math.round(selfTicks / elapsedSec / 10) * 10;
+        if (derived >= 10 && derived <= 1000) resolved = derived;
+      }
+    }
+  } catch {
+    // keep default
+  }
+  cachedClockTicksPerSecond = resolved;
+  return resolved;
+}
+
+function readBootTimeSeconds(): number | null {
+  try {
+    const stat = readFileSync("/proc/stat", "utf8");
+    const match = stat.match(/^btime\s+(\d+)/m);
+    return match ? Number.parseInt(match[1], 10) : null;
   } catch {
     return null;
   }
 }
 
-// True only when we can POSITIVELY prove the PID was recycled: the process that
-// currently owns it started materially later (or earlier) than the child start-time
-// recorded for this run. When identity cannot be established (no recorded
-// processStartedAt, or procfs unreadable) returns false — we never finalize a run on
-// a guess; the lost-handle silence horizon is the backstop for those cases. (DEE-662)
-function isReusedPid(pid: number, processStartedAt: Date | null | undefined): boolean {
-  if (!processStartedAt) return false;
-  const recordedMs = new Date(processStartedAt).getTime();
-  if (!Number.isFinite(recordedMs)) return false;
-  const procStartMs = readProcessStartTimeMs(pid);
-  if (procStartMs == null) return false;
-  return Math.abs(procStartMs - recordedMs) > PID_REUSE_IDENTITY_TOLERANCE_MS;
+// /proc/<pid>/stat field 22 (1-indexed) is starttime in clock ticks since boot.
+// The process name (field 2) may contain spaces/parens, so parse from the last
+// ")" rather than naive whitespace splitting.
+function readProcStartTicks(pid: number): number | null {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    const rparen = stat.lastIndexOf(")");
+    if (rparen < 0) return null;
+    const rest = stat.slice(rparen + 2).trim().split(/\s+/);
+    // After "(comm)" the remaining fields start at field 3 (state). starttime is
+    // field 22, i.e. index 19 of this post-comm slice.
+    const ticks = rest[19];
+    if (ticks == null) return null;
+    const parsed = Number.parseInt(ticks, 10);
+    return Number.isFinite(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
 }
 
-// Time since a lost-handle run last showed signs of life, mirroring the recovery
-// service's silence-start fallback chain. Used to bound how long a process_detached
-// run may stay immortal. (DEE-662 guard 2)
-function lostHandleSilenceAgeMs(
-  run: Pick<typeof heartbeatRuns.$inferSelect, "lastOutputAt" | "processStartedAt" | "startedAt" | "createdAt">,
-  now: Date,
-): number | null {
-  const startedAt = run.lastOutputAt ?? run.processStartedAt ?? run.startedAt ?? run.createdAt ?? null;
-  return startedAt ? Math.max(0, now.getTime() - new Date(startedAt).getTime()) : null;
+// Wall-clock start (ms) of the live process currently at `pid`, or null if it
+// cannot be determined (non-Linux, procfs unreadable, race).
+function procStartWallMs(pid: number): number | null {
+  const ticks = readProcStartTicks(pid);
+  const btime = readBootTimeSeconds();
+  if (ticks == null || btime == null) return null;
+  return (btime + ticks / clockTicksPerSecond()) * 1000;
+}
+
+// Decide whether the PID recorded for an orphaned run is plausibly STILL the
+// original agent child, as opposed to a reused PID now held by an unrelated
+// process. Bare liveness (`isProcessAlive`) is insufficient on Linux because
+// low PIDs are recycled after a pod restart (DEE-660: pid 58 -> esbuild helper).
+// Returns false (treat as gone -> finalize) when the PID is dead OR when its
+// observed start time post-dates the recorded child start, via two independent
+// signals:
+//   1. boot-epoch gate  — recorded child predates this process incarnation
+//   2. /proc start-time — live PID started after we recorded the child
+// When the recorded start is unknown or procfs is unreadable, identity is
+// inconclusive and we conservatively report alive; the bounded detached horizon
+// in reapOrphanedRuns guarantees forward progress in that case.
+export function isRecordedChildAlive(
+  pid: number | null | undefined,
+  recordedStartedAt: Date | string | null | undefined,
+  deps: {
+    isAlive?: (pid: number) => boolean;
+    selfStartMs?: () => number;
+    procStartMs?: (pid: number) => number | null;
+    toleranceMs?: number;
+  } = {},
+): boolean {
+  if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) return false;
+  const isAlive = deps.isAlive ?? isProcessAlive;
+  if (!isAlive(pid)) return false;
+
+  const recordedMs =
+    recordedStartedAt == null ? NaN : new Date(recordedStartedAt).getTime();
+  if (!Number.isFinite(recordedMs)) return true; // no recorded start -> cannot judge identity
+
+  const tolerance = deps.toleranceMs ?? PROCESS_IDENTITY_SKEW_TOLERANCE_MS;
+
+  // (1) Boot-epoch gate: the recorded child cannot belong to this incarnation.
+  const selfStartMs = (deps.selfStartMs ?? selfProcessStartWallMs)();
+  if (Number.isFinite(selfStartMs) && recordedMs < selfStartMs - tolerance) {
+    return false;
+  }
+
+  // (2) /proc start-time gate: live PID started after we recorded the child.
+  const observedStartMs = (deps.procStartMs ?? procStartWallMs)(pid);
+  if (observedStartMs != null && observedStartMs > recordedMs + tolerance) {
+    return false;
+  }
+
+  return true;
 }
 
 async function terminateHeartbeatRunProcess(input: {
@@ -7473,8 +7527,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .then((rows) => rows[0] ?? null);
   }
 
-  async function reapOrphanedRuns(opts?: { staleThresholdMs?: number }) {
+  async function reapOrphanedRuns(opts?: { staleThresholdMs?: number; detachedFinalizeHorizonMs?: number }) {
     const staleThresholdMs = opts?.staleThresholdMs ?? 0;
+    const detachedFinalizeHorizonMs = opts?.detachedFinalizeHorizonMs ?? DETACHED_RUN_FINALIZE_HORIZON_MS;
     const now = new Date();
 
     // Find all runs stuck in "running" state (queued runs are legitimately waiting; resumeQueuedRuns handles them)
@@ -7500,26 +7555,25 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
 
       const tracksLocalChild = isTrackedLocalChildProcessAdapter(adapterType);
-      // Bare liveness only proves *some* process owns the PID. After a control-plane
-      // restart the original child dies and a low PID can be recycled by an unrelated
-      // process, so a positive isProcessAlive() is cross-checked against the recorded
-      // child start-time before we trust it as "our child is still running" (DEE-662).
-      const processPidLive = !!(tracksLocalChild && run.processPid && isProcessAlive(run.processPid));
-      const processPidReused = processPidLive && isReusedPid(run.processPid!, run.processStartedAt);
-      const processPidAlive = processPidLive && !processPidReused;
-      const processGroupAlive = !!(tracksLocalChild && run.processGroupId && isProcessGroupAlive(run.processGroupId));
+      // DEE-662: verify the recorded PID is plausibly STILL our child, not a
+      // reused PID, instead of trusting bare liveness (which kept lost-handle
+      // runs immortal after a pod restart recycled a low PID).
+      const processPidAlive =
+        tracksLocalChild && !!run.processPid && isRecordedChildAlive(run.processPid, run.processStartedAt);
+      const processGroupAlive = tracksLocalChild && run.processGroupId && isProcessGroupAlive(run.processGroupId);
       if (processPidAlive) {
-        // Even a genuinely-alive detached child must not keep a lost-handle run
-        // immortal: a run already re-marked process_detached that has produced no
-        // output past the bounded horizon is force-finalized so the issue can make
-        // forward progress (DEE-662 guard 2). Identity-confirmed live children inside
-        // the horizon keep their existing detached-skip behavior.
-        const silenceAgeMs = lostHandleSilenceAgeMs(run, now);
-        const lostHandleHorizonTripped =
+        // Bounded forward-progress backstop: even when the PID looks like our
+        // child, a run that has been silently `process_detached` past the
+        // horizon is force-finalized rather than skipped forever.
+        const detachedSilenceRef =
+          run.lastOutputAt ?? run.processStartedAt ?? run.startedAt ?? run.createdAt ?? now;
+        const detachedSilenceRefMs = new Date(detachedSilenceRef).getTime();
+        const detachedBeyondHorizon =
           run.errorCode === DETACHED_PROCESS_ERROR_CODE &&
-          silenceAgeMs != null &&
-          silenceAgeMs >= LOST_HANDLE_SILENCE_HORIZON_MS;
-        if (!lostHandleHorizonTripped) {
+          Number.isFinite(detachedSilenceRefMs) &&
+          now.getTime() - detachedSilenceRefMs >= detachedFinalizeHorizonMs;
+
+        if (!detachedBeyondHorizon) {
           if (run.errorCode !== DETACHED_PROCESS_ERROR_CODE) {
             const detachedMessage = `Lost in-memory process handle, but child pid ${run.processPid} is still alive`;
             const detachedRun = await setRunStatus(run.id, "running", {
@@ -7540,23 +7594,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           }
           continue;
         }
+        // Fall through to finalize: detached + silent beyond horizon.
       }
 
       let descendantOnlyCleanup = false;
       if (processGroupAlive) {
         descendantOnlyCleanup = true;
         await terminateHeartbeatRunProcess({
-          // Never signal a recycled PID — it now belongs to an unrelated process.
-          pid: processPidReused ? null : run.processPid,
-          processGroupId: run.processGroupId,
-        });
-      } else if (processPidAlive) {
-        // Reached only when the lost-handle horizon tripped on a still-alive,
-        // identity-confirmed child with no surviving process group: reap the stuck
-        // child directly so it does not outlive its finalized run. (DEE-662 guard 2)
-        await terminateHeartbeatRunProcess({
           pid: run.processPid,
-          processGroupId: null,
+          processGroupId: run.processGroupId,
         });
       }
 
