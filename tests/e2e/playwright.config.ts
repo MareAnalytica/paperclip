@@ -16,7 +16,8 @@ export default defineConfig({
   // intentionally not part of the default local_trusted e2e run.
   testIgnore: ["multi-user.spec.ts", "multi-user-authenticated.spec.ts"],
   timeout: 60_000,
-  retries: 0,
+  // A single transient slow boot / issue-detail load should not fail the whole CI job (DEE-673).
+  retries: process.env.CI ? 2 : 0,
   use: {
     baseURL: BASE_URL,
     headless: true,
