@@ -431,6 +431,8 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     processPid?: number | null;
     processGroupId?: number | null;
     processLossRetryCount?: number;
+    processStartedAt?: Date | null;
+    lastOutputAt?: Date | null;
     includeIssue?: boolean;
     runErrorCode?: string | null;
     runError?: string | null;
@@ -490,6 +492,8 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       processPid: input?.processPid ?? null,
       processGroupId: input?.processGroupId ?? null,
       processLossRetryCount: input?.processLossRetryCount ?? 0,
+      processStartedAt: input?.processStartedAt ?? null,
+      lastOutputAt: input?.lastOutputAt ?? null,
       errorCode: input?.runErrorCode ?? null,
       error: input?.runError ?? null,
       startedAt: now,
@@ -956,6 +960,63 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .where(eq(agentWakeupRequests.id, wakeupRequestId))
       .then((rows) => rows[0] ?? null);
     expect(wakeup?.status).toBe("claimed");
+  });
+
+  it("finalizes an orphaned run whose recorded pid was recycled by an unrelated process", async () => {
+    // Stand-in for the unrelated process that recycled the run's low pid after a
+    // control-plane restart (DEE-660: pid 58 became an esbuild helper). It is alive
+    // now, but started long after the run recorded its child start-time, so PID
+    // identity must reject it instead of treating the lost-handle run as live.
+    const recycler = spawnAliveProcess();
+    childProcesses.add(recycler);
+    expect(recycler.pid).toBeTypeOf("number");
+
+    const { agentId, runId } = await seedRunFixture({
+      processPid: recycler.pid ?? null,
+      processStartedAt: new Date("2026-03-19T00:00:00.000Z"),
+      runErrorCode: "process_detached",
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reapOrphanedRuns();
+    expect(result.reaped).toBe(1);
+    expect(result.runIds).toEqual([runId]);
+
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    const failedRun = runs.find((row) => row.id === runId);
+    expect(failedRun?.status).toBe("failed");
+    expect(failedRun?.errorCode).toBe("process_lost");
+
+    // The innocent recycler process must NOT have been signalled by the reaper.
+    expect(isPidAlive(recycler.pid)).toBe(true);
+  });
+
+  it("force-finalizes a process_detached run silent beyond the horizon even when the pid is alive", async () => {
+    // A genuinely-alive pid whose identity we cannot disprove (no recorded
+    // processStartedAt), already detached, but silent far past the horizon. Guard 2
+    // must finalize it regardless of liveness so the issue makes forward progress.
+    const child = spawnAliveProcess();
+    childProcesses.add(child);
+    expect(child.pid).toBeTypeOf("number");
+
+    const { runId } = await seedRunFixture({
+      processPid: child.pid ?? null,
+      runErrorCode: "process_detached",
+      lastOutputAt: new Date("2026-03-19T00:00:00.000Z"),
+      processLossRetryCount: 1,
+      includeIssue: false,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reapOrphanedRuns();
+    expect(result.reaped).toBe(1);
+
+    const run = await heartbeat.getRun(runId);
+    expect(run?.status).toBe("failed");
+    expect(run?.errorCode).toBe("process_lost");
   });
 
   it("queues exactly one retry when the recorded local pid is dead", async () => {
