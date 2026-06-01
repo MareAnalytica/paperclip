@@ -5,6 +5,7 @@ import {
   parseProviderFallbackChainEnv,
   resolveEffectiveProviderFallbackChain,
   enforceFallbackAdapterModel,
+  enforceFallbackAdapterCommand,
 } from "../services/heartbeat.ts";
 import {
   __setProviderFallbackPolicyForTests,
@@ -292,5 +293,69 @@ describe("provider fallback model boundary (merge integration)", () => {
       selectedFallbackAdapterType: "claude_local",
     });
     expect(merged.model).toBe("claude-opus-4-8");
+  });
+});
+
+
+describe("enforceFallbackAdapterCommand", () => {
+  it("drops an inherited claude command on a claude_local -> grok_local failover", () => {
+    // Regression: a claude_local agent persists `command: "claude"`. The model
+    // guard rewrites `model` but leaves `command` pointing at the claude binary,
+    // which the grok adapter cannot run ("command loops"). The command guard
+    // strips it so the grok adapter falls back to its own default command.
+    expect(
+      enforceFallbackAdapterCommand({
+        config: { model: "grok-4-latest", command: "claude" },
+        agentAdapterType: "claude_local",
+        selectedFallbackAdapterType: "grok_local",
+        fallbackAdapterCommand: null,
+      }),
+    ).toEqual({ model: "grok-4-latest" });
+  });
+
+  it("substitutes the fallback adapter's own command when supplied", () => {
+    expect(
+      enforceFallbackAdapterCommand({
+        config: { model: "grok-4-latest", command: "claude" },
+        agentAdapterType: "claude_local",
+        selectedFallbackAdapterType: "grok_local",
+        fallbackAdapterCommand: "/paperclip/.grok/bin/grok",
+      }),
+    ).toEqual({ model: "grok-4-latest", command: "/paperclip/.grok/bin/grok" });
+  });
+
+  it("leaves the config untouched for a same-adapter failover (account rotation)", () => {
+    const config = { model: "claude-opus-4-8", command: "claude", account: "aflabox" };
+    expect(
+      enforceFallbackAdapterCommand({
+        config,
+        agentAdapterType: "claude_local",
+        selectedFallbackAdapterType: "claude_local",
+        fallbackAdapterCommand: null,
+      }),
+    ).toBe(config);
+  });
+
+  it("leaves the config untouched when no fallback is engaged", () => {
+    const config = { command: "claude" };
+    expect(
+      enforceFallbackAdapterCommand({
+        config,
+        agentAdapterType: "claude_local",
+        selectedFallbackAdapterType: null,
+        fallbackAdapterCommand: null,
+      }),
+    ).toBe(config);
+  });
+
+  it("does not mutate the input config", () => {
+    const config = { model: "grok-4-latest", command: "claude" };
+    enforceFallbackAdapterCommand({
+      config,
+      agentAdapterType: "claude_local",
+      selectedFallbackAdapterType: "grok_local",
+      fallbackAdapterCommand: null,
+    });
+    expect(config).toEqual({ model: "grok-4-latest", command: "claude" });
   });
 });

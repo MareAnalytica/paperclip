@@ -1474,6 +1474,28 @@ export function enforceFallbackAdapterModel(input: {
   return next;
 }
 
+// Companion to enforceFallbackAdapterModel for the adapter *command*. A
+// claude_local agent persists `command: "claude"`; a cross-provider failover
+// (claude_local -> grok_local/codex_local) must not invoke the claude binary,
+// which produces broken "command loops". Substitute the fallback adapter's own
+// command when it carries one, else strip it so the adapter uses its default.
+export function enforceFallbackAdapterCommand(input: {
+  config: Record<string, unknown>;
+  agentAdapterType: string;
+  selectedFallbackAdapterType: ProviderFallbackAdapterType | null;
+  fallbackAdapterCommand: string | null;
+}): Record<string, unknown> {
+  const fallback = input.selectedFallbackAdapterType;
+  if (!fallback || fallback === input.agentAdapterType) return input.config;
+  const next = { ...input.config };
+  if (input.fallbackAdapterCommand) {
+    next.command = input.fallbackAdapterCommand;
+  } else {
+    delete next.command;
+  }
+  return next;
+}
+
 function modelProfileRunMetadata(
   modelProfile: ModelProfileApplication,
 ): Record<string, unknown> | null {
@@ -8182,7 +8204,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       ? readNonEmptyString(parseObject(providerFallbackSelection.adapterConfig).model) ??
         fallbackAdapterProfileModel
       : null;
-    const mergedConfig = enforceFallbackAdapterModel({
+    const fallbackAdapterCommand = selectedFallbackAdapterType
+      ? readNonEmptyString(parseObject(providerFallbackSelection.adapterConfig).command)
+      : null;
+    const modelEnforcedConfig = enforceFallbackAdapterModel({
       config: mergeModelProfileAdapterConfig({
         baseConfig: persistedWorkspaceManagedConfig,
         modelProfile: modelProfileApplication,
@@ -8199,6 +8224,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       agentAdapterType: agent.adapterType,
       selectedFallbackAdapterType,
       fallbackAdapterModel: fallbackAdapterModel ?? null,
+    });
+    const mergedConfig = enforceFallbackAdapterCommand({
+      config: modelEnforcedConfig,
+      agentAdapterType: agent.adapterType,
+      selectedFallbackAdapterType,
+      fallbackAdapterCommand: fallbackAdapterCommand ?? null,
     });
     const configSnapshot = buildExecutionWorkspaceConfigSnapshot(mergedConfig, selectedEnvironmentId);
     const executionRunConfig = stripWorkspaceRuntimeFromExecutionRunConfig(mergedConfig);
