@@ -137,6 +137,14 @@ export function pickRootRunProviderSelection(input: {
  * Record (or extend) the cooldown for a provider. The window is only ever
  * pushed later — `GREATEST(...)` keeps any longer existing window so a shorter
  * back-off from a later hop never shortens an honoured provider reset.
+ *
+ * The audit/provenance columns (`source`, `reason`, `account`, `last_run_id`,
+ * `last_issue_id`) are gated behind the *same* window choice (ELI-857): they
+ * are only restamped when the incoming event's window wins (`excluded >=
+ * existing`). When the existing longer window is kept, its provenance is kept
+ * too, so a later shorter-window hop can never mislabel where the live window
+ * actually came from. `adapter_type` is a stable property of the provider id
+ * (not event provenance), so it stays an unconditional overwrite.
  */
 export async function upsertProviderAccountCooldown(
   db: Db,
@@ -149,6 +157,9 @@ export async function upsertProviderAccountCooldown(
   },
 ): Promise<void> {
   const now = input.now ?? new Date();
+  // True when the incoming event's window is the one being kept (ties go to the
+  // newer event, mirroring GREATEST). Provenance columns follow this choice.
+  const incomingWindowWins = sql`excluded.cooldown_until >= ${providerAccountCooldowns.cooldownUntil}`;
   await db
     .insert(providerAccountCooldowns)
     .values({
@@ -169,11 +180,11 @@ export async function upsertProviderAccountCooldown(
       set: {
         cooldownUntil: sql`GREATEST(${providerAccountCooldowns.cooldownUntil}, excluded.cooldown_until)`,
         adapterType: input.adapterType,
-        account: input.account ?? null,
-        source: input.source,
-        reason: input.reason ?? null,
-        lastRunId: input.lastRunId ?? null,
-        lastIssueId: input.lastIssueId ?? null,
+        account: sql`CASE WHEN ${incomingWindowWins} THEN excluded.account ELSE ${providerAccountCooldowns.account} END`,
+        source: sql`CASE WHEN ${incomingWindowWins} THEN excluded.source ELSE ${providerAccountCooldowns.source} END`,
+        reason: sql`CASE WHEN ${incomingWindowWins} THEN excluded.reason ELSE ${providerAccountCooldowns.reason} END`,
+        lastRunId: sql`CASE WHEN ${incomingWindowWins} THEN excluded.last_run_id ELSE ${providerAccountCooldowns.lastRunId} END`,
+        lastIssueId: sql`CASE WHEN ${incomingWindowWins} THEN excluded.last_issue_id ELSE ${providerAccountCooldowns.lastIssueId} END`,
         updatedAt: now,
       },
     });

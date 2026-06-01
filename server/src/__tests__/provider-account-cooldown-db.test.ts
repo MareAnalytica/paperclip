@@ -72,27 +72,52 @@ describeEmbeddedPostgres("provider_account_cooldowns (DB round-trip)", () => {
     expect([...active]).toEqual(["claude-code-personal"]);
   });
 
-  // GREATEST: a later, shorter back-off must never shorten an honoured window.
-  it("keeps the longer window when re-upserting the same provider", async () => {
+  // GREATEST: a later, shorter back-off must never shorten an honoured window,
+  // and (ELI-857) must not mislabel the kept window's provenance either.
+  it("keeps the longer window AND its provenance when re-upserting the same provider", async () => {
     const longWindow = new Date(NOW.getTime() + 120 * 60_000);
     const shortWindow = new Date(NOW.getTime() + 10 * 60_000);
+    const runLong = randomUUID();
+    const issueLong = randomUUID();
+    const runShort = randomUUID();
+    const issueShort = randomUUID();
     const base = {
       companyId,
       providerId: "claude-code-personal",
       adapterType: "claude_local",
       account: "personal" as string | null,
-      source: "provider_header" as const,
       now: NOW,
     };
-    await upsertProviderAccountCooldown(db, { ...base, cooldownUntil: longWindow });
+    // Long window from an honoured provider reset, with its own audit ids.
     await upsertProviderAccountCooldown(db, {
       ...base,
+      cooldownUntil: longWindow,
+      source: "provider_header",
+      reason: "provider_fallback_limit",
+      lastRunId: runLong,
+      lastIssueId: issueLong,
+    });
+    // Later, shorter default back-off from a different run/issue: window loses,
+    // and so must its provenance.
+    await upsertProviderAccountCooldown(db, {
+      ...base,
+      account: "personal-other",
       cooldownUntil: shortWindow,
       source: "retryAfterMinutesDefault",
+      reason: "provider_fallback_default",
+      lastRunId: runShort,
+      lastIssueId: issueShort,
     });
 
     const rows = await db
-      .select({ cooldownUntil: providerAccountCooldowns.cooldownUntil })
+      .select({
+        cooldownUntil: providerAccountCooldowns.cooldownUntil,
+        account: providerAccountCooldowns.account,
+        source: providerAccountCooldowns.source,
+        reason: providerAccountCooldowns.reason,
+        lastRunId: providerAccountCooldowns.lastRunId,
+        lastIssueId: providerAccountCooldowns.lastIssueId,
+      })
       .from(providerAccountCooldowns)
       .where(
         and(
@@ -102,6 +127,68 @@ describeEmbeddedPostgres("provider_account_cooldowns (DB round-trip)", () => {
       );
     expect(rows).toHaveLength(1); // one row per (company, provider)
     expect(rows[0]!.cooldownUntil.getTime()).toBe(longWindow.getTime());
+    // Provenance stays pinned to the event that owns the live (long) window.
+    expect(rows[0]!.source).toBe("provider_header");
+    expect(rows[0]!.reason).toBe("provider_fallback_limit");
+    expect(rows[0]!.account).toBe("personal");
+    expect(rows[0]!.lastRunId).toBe(runLong);
+    expect(rows[0]!.lastIssueId).toBe(issueLong);
+  });
+
+  // The reverse of ELI-857: when a *longer* window arrives later it wins, so its
+  // provenance must replace the older row's — provenance follows the live window.
+  it("restamps provenance when a later, longer window extends the cooldown", async () => {
+    const shortWindow = new Date(NOW.getTime() + 10 * 60_000);
+    const longWindow = new Date(NOW.getTime() + 120 * 60_000);
+    const runShort = randomUUID();
+    const issueShort = randomUUID();
+    const runLong = randomUUID();
+    const issueLong = randomUUID();
+    const base = {
+      companyId,
+      providerId: "claude-code-personal",
+      adapterType: "claude_local",
+      account: "personal" as string | null,
+      now: NOW,
+    };
+    await upsertProviderAccountCooldown(db, {
+      ...base,
+      cooldownUntil: shortWindow,
+      source: "retryAfterMinutesDefault",
+      reason: "provider_fallback_default",
+      lastRunId: runShort,
+      lastIssueId: issueShort,
+    });
+    await upsertProviderAccountCooldown(db, {
+      ...base,
+      cooldownUntil: longWindow,
+      source: "provider_header",
+      reason: "provider_fallback_limit",
+      lastRunId: runLong,
+      lastIssueId: issueLong,
+    });
+
+    const rows = await db
+      .select({
+        cooldownUntil: providerAccountCooldowns.cooldownUntil,
+        source: providerAccountCooldowns.source,
+        reason: providerAccountCooldowns.reason,
+        lastRunId: providerAccountCooldowns.lastRunId,
+        lastIssueId: providerAccountCooldowns.lastIssueId,
+      })
+      .from(providerAccountCooldowns)
+      .where(
+        and(
+          eq(providerAccountCooldowns.companyId, companyId),
+          eq(providerAccountCooldowns.providerId, "claude-code-personal"),
+        ),
+      );
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.cooldownUntil.getTime()).toBe(longWindow.getTime());
+    expect(rows[0]!.source).toBe("provider_header");
+    expect(rows[0]!.reason).toBe("provider_fallback_limit");
+    expect(rows[0]!.lastRunId).toBe(runLong);
+    expect(rows[0]!.lastIssueId).toBe(issueLong);
   });
 
   // Acceptance #3 — an elapsed window is no longer returned (provider eligible).
