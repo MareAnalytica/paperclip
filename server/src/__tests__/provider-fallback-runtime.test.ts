@@ -1,8 +1,10 @@
 import { afterEach, describe, expect, it } from "vitest";
 
 import {
+  mergeModelProfileAdapterConfig,
   parseProviderFallbackChainEnv,
   resolveEffectiveProviderFallbackChain,
+  enforceFallbackAdapterModel,
 } from "../services/heartbeat.ts";
 import {
   __setProviderFallbackPolicyForTests,
@@ -116,5 +118,179 @@ describe("resolveEffectiveProviderFallbackChain", () => {
       companyId: "co-1",
     });
     expect(chain).toEqual([]);
+  });
+});
+
+const NOOP_MODEL_PROFILE = {
+  requested: null,
+  requestedBy: null,
+  applied: null,
+  configSource: null,
+  fallbackReason: null,
+  adapterConfig: null,
+} as const;
+
+describe("enforceFallbackAdapterModel", () => {
+  it("drops an inherited claude model on a claude_local -> grok_local failover", () => {
+    expect(
+      enforceFallbackAdapterModel({
+        config: { model: "claude-opus-4-8", command: "/paperclip/.grok/bin/grok" },
+        agentAdapterType: "claude_local",
+        selectedFallbackAdapterType: "grok_local",
+        fallbackAdapterModel: null,
+      }),
+    ).toEqual({ command: "/paperclip/.grok/bin/grok" });
+  });
+
+  it("drops an inherited NON-claude model on a codex_local -> grok_local failover", () => {
+    // Regression for the Codex review: a codex model id must not survive into
+    // the grok adapter just because it is not claude-family.
+    expect(
+      enforceFallbackAdapterModel({
+        config: { model: "gpt-5.3-codex", command: "/paperclip/.grok/bin/grok" },
+        agentAdapterType: "codex_local",
+        selectedFallbackAdapterType: "grok_local",
+        fallbackAdapterModel: null,
+      }),
+    ).toEqual({ command: "/paperclip/.grok/bin/grok" });
+  });
+
+  it("drops an inherited claude model that arrived via an issue override", () => {
+    // The override model is provider-specific to the PRIMARY adapter and must
+    // not survive into a cross-provider fallback adapter.
+    expect(
+      enforceFallbackAdapterModel({
+        config: { model: "claude-opus-4-8", account: "x" },
+        agentAdapterType: "claude_local",
+        selectedFallbackAdapterType: "codex_local",
+        fallbackAdapterModel: null,
+      }),
+    ).toEqual({ account: "x" });
+  });
+
+  it("uses the fallback adapter's own model when one is supplied", () => {
+    expect(
+      enforceFallbackAdapterModel({
+        config: { model: "claude-opus-4-8" },
+        agentAdapterType: "claude_local",
+        selectedFallbackAdapterType: "grok_local",
+        fallbackAdapterModel: "grok-4-latest",
+      }),
+    ).toEqual({ model: "grok-4-latest" });
+  });
+
+  it("leaves the config untouched for a same-adapter failover (claude account rotation)", () => {
+    const config = { model: "claude-opus-4-8", account: "aflabox" };
+    expect(
+      enforceFallbackAdapterModel({
+        config,
+        agentAdapterType: "claude_local",
+        selectedFallbackAdapterType: "claude_local",
+        fallbackAdapterModel: null,
+      }),
+    ).toBe(config);
+  });
+
+  it("leaves the config untouched when no fallback is engaged", () => {
+    const config = { model: "claude-opus-4-8" };
+    expect(
+      enforceFallbackAdapterModel({
+        config,
+        agentAdapterType: "claude_local",
+        selectedFallbackAdapterType: null,
+        fallbackAdapterModel: null,
+      }),
+    ).toBe(config);
+  });
+
+  it("does not mutate the input config", () => {
+    const config = { model: "claude-opus-4-8", command: "claude" };
+    enforceFallbackAdapterModel({
+      config,
+      agentAdapterType: "claude_local",
+      selectedFallbackAdapterType: "grok_local",
+      fallbackAdapterModel: null,
+    });
+    expect(config).toEqual({ model: "claude-opus-4-8", command: "claude" });
+  });
+});
+
+describe("provider fallback model boundary (merge integration)", () => {
+  // Mirror the production call site: a valid fallback model is the engaged
+  // provider's chain-entry model, else the fallback adapter's own profile
+  // default; primary-keyed sources are unsafe and excluded.
+  const integrate = (opts: {
+    baseConfig: Record<string, unknown>;
+    issueAdapterConfig: Record<string, unknown>;
+    chainEntryModel?: string;
+    profileDefaultModel?: string;
+    agentAdapterType: string;
+    selectedFallbackAdapterType: "claude_local" | "codex_local" | "grok_local" | null;
+  }) =>
+    enforceFallbackAdapterModel({
+      config: mergeModelProfileAdapterConfig({
+        baseConfig: opts.baseConfig,
+        modelProfile: NOOP_MODEL_PROFILE,
+        issueAdapterConfig: opts.issueAdapterConfig,
+      }),
+      agentAdapterType: opts.agentAdapterType,
+      selectedFallbackAdapterType: opts.selectedFallbackAdapterType,
+      fallbackAdapterModel: opts.chainEntryModel ?? opts.profileDefaultModel ?? null,
+    });
+
+  it("grok fallback receives no claude model id so the adapter uses its own default", () => {
+    const merged = integrate({
+      baseConfig: { model: "claude-opus-4-8", command: "/paperclip/.grok/bin/grok" },
+      issueAdapterConfig: { command: "/paperclip/.grok/bin/grok" },
+      agentAdapterType: "claude_local",
+      selectedFallbackAdapterType: "grok_local",
+    });
+    expect("model" in merged).toBe(false);
+    expect(merged.command).toBe("/paperclip/.grok/bin/grok");
+  });
+
+  it("strips a claude model that arrives via an issue-level adapter override", () => {
+    const merged = integrate({
+      baseConfig: { model: "claude-opus-4-8" },
+      issueAdapterConfig: { command: "/paperclip/.grok/bin/grok", model: "claude-opus-4-8" },
+      agentAdapterType: "claude_local",
+      selectedFallbackAdapterType: "grok_local",
+    });
+    expect("model" in merged).toBe(false);
+  });
+
+  it("a chain-entry model for the fallback adapter wins", () => {
+    const merged = integrate({
+      baseConfig: { model: "claude-opus-4-8" },
+      issueAdapterConfig: { command: "codex" },
+      chainEntryModel: "gpt-5.3-codex",
+      agentAdapterType: "claude_local",
+      selectedFallbackAdapterType: "codex_local",
+    });
+    expect(merged.model).toBe("gpt-5.3-codex");
+  });
+
+  it("uses the fallback adapter's own profile default when the chain entry omits a model", () => {
+    // DEE-659 round-4 regression: a requested model profile must still resolve
+    // to the FALLBACK adapter's own profile model (not the primary model, not
+    // dropped) on a cross-provider failover.
+    const merged = integrate({
+      baseConfig: { model: "claude-opus-4-8" },
+      issueAdapterConfig: { command: "/paperclip/.grok/bin/grok" },
+      profileDefaultModel: "grok-code-fast",
+      agentAdapterType: "claude_local",
+      selectedFallbackAdapterType: "grok_local",
+    });
+    expect(merged.model).toBe("grok-code-fast");
+  });
+
+  it("claude account-rotation fallback keeps the inherited claude model", () => {
+    const merged = integrate({
+      baseConfig: { model: "claude-opus-4-8" },
+      issueAdapterConfig: { account: "aflabox" },
+      agentAdapterType: "claude_local",
+      selectedFallbackAdapterType: "claude_local",
+    });
+    expect(merged.model).toBe("claude-opus-4-8");
   });
 });

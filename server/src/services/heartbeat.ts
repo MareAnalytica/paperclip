@@ -1422,6 +1422,46 @@ export function mergeModelProfileAdapterConfig(input: {
   };
 }
 
+/**
+ * Adapter-boundary guard (DEE-659): a provider fallback that crosses adapter
+ * providers must never hand the engaged adapter a model id belonging to a
+ * different provider.
+ *
+ * During failover the merged run config can carry a model inherited from the
+ * agent's primary adapterConfig (e.g. `claude-opus-4-8`) or from an issue-level
+ * custom model override — both provider-specific to the PRIMARY adapter. The
+ * grok/codex CLI then runs `--model claude-opus-4-8` and rejects it ("unknown
+ * model id"), the run errors, and the agent sticks in status=error during
+ * exhaustion windows (parent incident DEE-658). The same hazard exists for
+ * non-claude -> non-claude hops (e.g. codex_local -> grok_local carrying a
+ * codex model id).
+ *
+ * When the engaged fallback adapter differs from the agent's primary adapter,
+ * force the model to come ONLY from the fallback adapter's own configuration —
+ * its chain entry or its adapter model profile, both already resolved for the
+ * fallback adapter (`fallbackAdapterModel`). With no such model, drop it so the
+ * adapter uses its own provider-valid default. A failover that stays on the
+ * agent's own adapter (e.g. a claude account rotation) is left untouched.
+ */
+export function enforceFallbackAdapterModel(input: {
+  config: Record<string, unknown>;
+  agentAdapterType: string;
+  selectedFallbackAdapterType: ProviderFallbackAdapterType | null;
+  fallbackAdapterModel: string | null;
+}): Record<string, unknown> {
+  const fallback = input.selectedFallbackAdapterType;
+  // No failover, or a failover that stays on the agent's own adapter, cannot
+  // cross a provider boundary: the inherited model is already valid.
+  if (!fallback || fallback === input.agentAdapterType) return input.config;
+  const next = { ...input.config };
+  if (input.fallbackAdapterModel) {
+    next.model = input.fallbackAdapterModel;
+  } else {
+    delete next.model;
+  }
+  return next;
+}
+
 function modelProfileRunMetadata(
   modelProfile: ModelProfileApplication,
 ): Record<string, unknown> | null {
@@ -7988,18 +8028,47 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     } else {
       delete context.paperclipModelProfile;
     }
-    const mergedConfig = mergeModelProfileAdapterConfig({
-      baseConfig: persistedWorkspaceManagedConfig,
-      modelProfile: modelProfileApplication,
-      issueAdapterConfig: selectedFallbackAdapterType
-        ? {
-            ...parseObject(providerFallbackSelection.adapterConfig),
-            ...(issueAssigneeOverrides?.adapterConfig ?? null),
-            ...(readNonEmptyString(providerFallbackSelection.account)
-              ? { account: readNonEmptyString(providerFallbackSelection.account) }
-              : {}),
-          }
-        : issueAssigneeOverrides?.adapterConfig ?? null,
+    // DEE-659: pick a model that is genuinely valid for the engaged
+    // cross-provider fallback adapter. Two sources are safe because both are
+    // resolved FOR the fallback adapter: (1) its own chain-entry model, then
+    // (2) its own adapter model-profile default (from adapterModelProfiles,
+    // which was resolved for executionAdapterType). Everything else folded into
+    // the merged config — the agent's primary adapterConfig, an issue-level
+    // model override, and the agent's runtime model-profile override (merged
+    // into modelProfileApplication.adapterConfig) — is keyed to the PRIMARY
+    // adapter and may carry a model id the fallback adapter rejects. With
+    // neither safe source present the fallback adapter uses its own
+    // provider-valid CLI default.
+    const fallbackAdapterProfileModel = modelProfileApplication.applied
+      ? readNonEmptyString(
+          parseObject(
+            adapterModelProfiles.find(
+              (profile) => profile.key === modelProfileApplication.applied,
+            )?.adapterConfig,
+          ).model,
+        )
+      : null;
+    const fallbackAdapterModel = selectedFallbackAdapterType
+      ? readNonEmptyString(parseObject(providerFallbackSelection.adapterConfig).model) ??
+        fallbackAdapterProfileModel
+      : null;
+    const mergedConfig = enforceFallbackAdapterModel({
+      config: mergeModelProfileAdapterConfig({
+        baseConfig: persistedWorkspaceManagedConfig,
+        modelProfile: modelProfileApplication,
+        issueAdapterConfig: selectedFallbackAdapterType
+          ? {
+              ...parseObject(providerFallbackSelection.adapterConfig),
+              ...(issueAssigneeOverrides?.adapterConfig ?? null),
+              ...(readNonEmptyString(providerFallbackSelection.account)
+                ? { account: readNonEmptyString(providerFallbackSelection.account) }
+                : {}),
+            }
+          : issueAssigneeOverrides?.adapterConfig ?? null,
+      }),
+      agentAdapterType: agent.adapterType,
+      selectedFallbackAdapterType,
+      fallbackAdapterModel: fallbackAdapterModel ?? null,
     });
     const configSnapshot = buildExecutionWorkspaceConfigSnapshot(mergedConfig, selectedEnvironmentId);
     const executionRunConfig = stripWorkspaceRuntimeFromExecutionRunConfig(mergedConfig);
