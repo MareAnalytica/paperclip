@@ -1575,6 +1575,76 @@ describe("IssueDetail", () => {
       );
     expect(footer?.className).toContain("bg-background");
   });
+
+  it("keeps main non-blank with a loading skeleton while the issue query is pending", async () => {
+    const pending = createDeferred<Issue>();
+    mockIssuesApi.get.mockReturnValueOnce(pending.promise);
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <IssueDetail />
+        </QueryClientProvider>,
+      );
+    });
+    await flushReact();
+
+    expect(container.querySelectorAll('[data-testid="skeleton"]').length).toBeGreaterThan(0);
+    expect(container.querySelector('[data-testid="issue-detail-fallback"]')).toBeNull();
+
+    pending.resolve(createIssue());
+    await flushReact();
+  });
+
+  it("renders an error fallback with a working retry instead of a blank main", async () => {
+    mockIssuesApi.get.mockRejectedValueOnce(new Error("Boom while loading"));
+    mockIssuesApi.get.mockResolvedValue(createIssue());
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <IssueDetail />
+        </QueryClientProvider>,
+      );
+    });
+
+    await waitForAssertion(() => {
+      expect(container.querySelector('[data-testid="issue-detail-fallback"]')).toBeTruthy();
+    });
+    expect(container.textContent).toContain("Couldn't load this issue");
+    expect(container.textContent).toContain("Boom while loading");
+
+    const retry = container.querySelector('[data-testid="issue-detail-retry"]') as HTMLButtonElement | null;
+    expect(retry).toBeTruthy();
+    const getCallsBeforeRetry = mockIssuesApi.get.mock.calls.length;
+
+    await act(async () => {
+      retry!.click();
+    });
+    await waitForAssertion(() => {
+      expect(container.textContent).toContain("Issue detail smoke");
+    });
+    expect(mockIssuesApi.get.mock.calls.length).toBeGreaterThan(getCallsBeforeRetry);
+  });
+
+  it("renders a not-found fallback (never a blank main) when a settled query has no issue", async () => {
+    mockIssuesApi.get.mockResolvedValueOnce(null as unknown as Issue);
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <IssueDetail />
+        </QueryClientProvider>,
+      );
+    });
+
+    await waitForAssertion(() => {
+      expect(container.querySelector('[data-testid="issue-detail-fallback"]')).toBeTruthy();
+    });
+    expect(container.textContent).toContain("Issue not found");
+    expect((container.textContent ?? "").trim().length).toBeGreaterThan(0);
+    expect(container.querySelector('[data-testid="issue-detail-retry"]')).toBeTruthy();
+  });
 });
 
 describe("canBoardResolveRecoveryAction", () => {

@@ -132,6 +132,7 @@ import {
   Paperclip,
   PlayCircle,
   Plus,
+  RefreshCw,
   Repeat,
   SlidersHorizontal,
   Trash2,
@@ -508,6 +509,50 @@ function IssueDetailLoadingState({
       </div>
 
       <IssueSectionSkeleton titleWidth="w-24" rows={3} />
+    </div>
+  );
+}
+
+function IssueDetailFallbackState({
+  headerSeed,
+  title,
+  description,
+  onRetry,
+  retryPending,
+}: {
+  headerSeed: ReturnType<typeof readIssueDetailHeaderSeed>;
+  title: string;
+  description: string;
+  onRetry: () => void;
+  retryPending: boolean;
+}) {
+  const identifier = headerSeed?.identifier ?? headerSeed?.id.slice(0, 8) ?? null;
+  return (
+    <div className="max-w-3xl space-y-6" data-testid="issue-detail-fallback">
+      {identifier ? (
+        <span className="text-sm font-mono text-muted-foreground">{identifier}</span>
+      ) : null}
+      <div
+        role="alert"
+        className="flex flex-col items-start gap-3 rounded-lg border border-border bg-muted/30 p-6"
+      >
+        <div className="flex items-center gap-2 text-sm font-medium">
+          <AlertTriangle className="h-4 w-4 shrink-0 text-destructive" />
+          <span>{title}</span>
+        </div>
+        <p className="text-sm text-muted-foreground">{description}</p>
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          onClick={onRetry}
+          disabled={retryPending}
+          data-testid="issue-detail-retry"
+        >
+          <RefreshCw className={cn("h-3.5 w-3.5", retryPending ? "animate-spin" : null)} />
+          {retryPending ? "Retrying..." : "Retry"}
+        </Button>
+      </div>
     </div>
   );
 }
@@ -1269,7 +1314,7 @@ export function IssueDetail() {
     [location.state, resolvedIssueDetailState],
   );
 
-  const { data: issue, isLoading, error } = useQuery({
+  const { data: issue, isLoading, error, refetch, isFetching } = useQuery({
     ...getIssueDetailQueryOptions(queryClient, issueId!, {
       placeholderIssue: issueHeaderSeed ? {
         id: issueHeaderSeed.id,
@@ -3078,8 +3123,32 @@ export function IssueDetail() {
   );
 
   if (isLoading) return <IssueDetailLoadingState headerSeed={issueHeaderSeed} />;
-  if (error) return <p className="text-sm text-destructive">{error.message}</p>;
-  if (!issue) return null;
+  if (error) {
+    return (
+      <IssueDetailFallbackState
+        headerSeed={issueHeaderSeed}
+        title="Couldn't load this issue"
+        description={error.message || "Something went wrong while loading this issue."}
+        onRetry={() => {
+          void refetch();
+        }}
+        retryPending={isFetching}
+      />
+    );
+  }
+  if (!issue) {
+    return (
+      <IssueDetailFallbackState
+        headerSeed={issueHeaderSeed}
+        title="Issue not found"
+        description="This issue may have been moved, deleted, or isn't available to you."
+        onRetry={() => {
+          void refetch();
+        }}
+        retryPending={isFetching}
+      />
+    );
+  }
 
   // Ancestors are returned oldest-first from the server (root at end, immediate parent at start)
   const ancestors = issue.ancestors ?? [];
