@@ -9,6 +9,9 @@ test("captures planning mode UI for desktop and mobile", async ({ page }) => {
   const timestamp = Date.now();
   const companyName = `PAP-3413-${timestamp}`;
   const screenshotDir = "test-results/planning-mode";
+  // Heavy test: full onboarding + 6 navigations + 4 full-page screenshots + API polls.
+  // The default 60s budget is tight under CI load; give explicit headroom (DEE-673).
+  test.setTimeout(120_000);
 
   await page.goto("/onboarding");
   await expect(page.locator("h3", { hasText: "Name your company" })).toBeVisible({ timeout: 5_000 });
@@ -105,6 +108,9 @@ test("captures planning mode UI for desktop and mobile", async ({ page }) => {
   await setMode("planning");
 
   await page.goto(issuePath);
+  // DEE-673 flake guard: the app shell/breadcrumb can render while the issue-detail `main`
+  // body stays empty under load. Wait for the detail body to actually mount before interacting.
+  await expect(page.getByTestId("issue-chat-composer")).toBeVisible({ timeout: 30_000 });
   await expect(page.getByText("Planning").first()).toBeVisible();
   await expect(page.getByTestId("issue-chat-composer")).toHaveAttribute("data-pending-work-mode", "planning");
   const desktopPlanningToggle = page.getByTestId("issue-chat-composer-work-mode-toggle");
@@ -126,6 +132,9 @@ test("captures planning mode UI for desktop and mobile", async ({ page }) => {
   });
 
   await page.goto(issuePath);
+  // DEE-673 flake guard: the app shell/breadcrumb can render while the issue-detail `main`
+  // body stays empty under load. Wait for the detail body to actually mount before interacting.
+  await expect(page.getByTestId("issue-chat-composer")).toBeVisible({ timeout: 30_000 });
   await page.getByTestId("issue-chat-composer-work-mode-toggle").click();
   await expect(page.getByTestId("issue-chat-composer")).toHaveAttribute("data-pending-work-mode", "standard");
   await expect(page.getByTestId("issue-chat-composer-work-mode-toggle")).toBeHidden();
@@ -137,6 +146,9 @@ test("captures planning mode UI for desktop and mobile", async ({ page }) => {
   await setMode("planning");
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto(issuePath);
+  // DEE-673 flake guard: the app shell/breadcrumb can render while the issue-detail `main`
+  // body stays empty under load. Wait for the detail body to actually mount before interacting.
+  await expect(page.getByTestId("issue-chat-composer")).toBeVisible({ timeout: 30_000 });
   await expect(page.getByText("Planning").first()).toBeVisible();
   const mobilePlanningToggle = page.getByTestId("issue-chat-composer-work-mode-toggle");
   await expect(mobilePlanningToggle).toBeVisible();
