@@ -233,6 +233,19 @@ async function cancelActiveRunsForCleanup(
 }
 
 async function spawnOrphanedProcessGroup() {
+  // Spawn a detached process-group leader that STAYS ALIVE for the duration of the
+  // test. Keeping the leader (and therefore the process-group id) resident is the
+  // root fix for this test's historical flakiness: the previous fixture let the
+  // leader exit immediately and reused leader.pid as BOTH processPid and
+  // processGroupId, so on a busy host the freed pid could be recycled before
+  // reapOrphanedRuns() probed it -- flipping isProcessAlive(processPid) true and
+  // skipping the reap (and the descendant-group cleanup) entirely.
+  //
+  // We instead model the "parent pid is already gone" condition with the
+  // unrecyclable sentinel pid 999_999_999 (matching the sibling orphan-reaper
+  // fixtures), while this real, live process group stands in for the surviving
+  // descendant group the reaper must terminate. No real pid we reference is ever
+  // dead-and-recyclable while a probe could observe it.
   const leader = spawn(
     process.execPath,
     [
@@ -241,7 +254,9 @@ async function spawnOrphanedProcessGroup() {
         "const { spawn } = require('node:child_process');",
         "const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });",
         "process.stdout.write(String(child.pid));",
-        "setTimeout(() => process.exit(0), 25);",
+        // Keep the leader resident so its pid (== the process-group id) cannot be
+        // recycled before the reaper terminates the whole group.
+        "setInterval(() => {}, 1000);",
       ].join(" "),
     ],
     {
@@ -250,24 +265,44 @@ async function spawnOrphanedProcessGroup() {
     },
   );
 
-  let stdout = "";
-  leader.stdout?.on("data", (chunk) => {
-    stdout += String(chunk);
-  });
-
-  await new Promise<void>((resolve, reject) => {
+  const descendantPid = await new Promise<number>((resolve, reject) => {
+    let stdout = "";
+    const onData = (chunk: unknown) => {
+      stdout += String(chunk);
+      const parsed = Number.parseInt(stdout.trim(), 10);
+      if (Number.isInteger(parsed) && parsed > 0) {
+        leader.stdout?.off("data", onData);
+        resolve(parsed);
+      }
+    };
+    leader.stdout?.on("data", onData);
     leader.once("error", reject);
-    leader.once("exit", () => resolve());
+    leader.once("exit", (code, signal) =>
+      reject(
+        new Error(
+          `Orphan process-group leader exited before reporting its descendant pid (code=${code}, signal=${signal})`,
+        ),
+      ),
+    );
   });
 
-  const descendantPid = Number.parseInt(stdout.trim(), 10);
-  if (!Number.isInteger(descendantPid) || descendantPid <= 0) {
-    throw new Error(`Failed to capture orphaned descendant pid from detached process group: ${stdout}`);
+  const processGroupId = leader.pid ?? null;
+  if (typeof processGroupId !== "number" || !Number.isInteger(processGroupId) || processGroupId <= 0) {
+    leader.kill("SIGKILL");
+    throw new Error(`Failed to establish orphaned process-group leader pid: ${processGroupId}`);
   }
 
+  // The leader is detached and intentionally outlives this call; don't let it keep
+  // the test runner's event loop alive. It is terminated by the reaper (via the
+  // group kill) and, as a backstop, by the afterEach cleanup that SIGKILLs leaderPid.
+  leader.unref();
+
   return {
-    processPid: leader.pid ?? null,
-    processGroupId: leader.pid ?? null,
+    // Parent run pid modeled as already gone, via an unrecyclable sentinel so the
+    // reaper deterministically takes the descendant-process-group cleanup path.
+    processPid: 999_999_999,
+    processGroupId,
+    leaderPid: processGroupId,
     descendantPid,
   };
 }
@@ -1034,6 +1069,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     async () => {
     const orphan = await spawnOrphanedProcessGroup();
     cleanupPids.add(orphan.descendantPid);
+    cleanupPids.add(orphan.leaderPid);
     expect(isPidAlive(orphan.descendantPid)).toBe(true);
 
     const { agentId, runId, issueId } = await seedRunFixture({
