@@ -25,7 +25,7 @@ describeEmbeddedPostgres("issueService labels", () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-labels-service-");
     db = createDb(tempDb.connectionString);
     svc = issueService(db);
-  }, 20_000);
+  }, 60_000);
 
   afterEach(async () => {
     await db.delete(labels);

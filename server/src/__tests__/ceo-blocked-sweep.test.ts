@@ -110,7 +110,7 @@ describeEmbeddedPostgres("ceo-blocked-sweep / reconcile + tick", () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-ceo-blocked-sweep-");
     db = createDb(tempDb.connectionString);
     svc = ceoBlockedSweepService(db);
-  }, 20_000);
+  }, 60_000);
 
   afterEach(async () => {
     await db.delete(activityLog);

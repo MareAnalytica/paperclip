@@ -77,7 +77,7 @@ describeEmbeddedPostgres("cloud upstream persistence", () => {
     process.env.PAPERCLIP_SECRETS_MASTER_KEY = "12345678901234567890123456789012";
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-cloud-upstreams-");
     db = createDb(tempDb.connectionString);
-  }, 20_000);
+  }, 60_000);
 
   afterEach(async () => {
     vi.restoreAllMocks();

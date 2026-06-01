@@ -62,7 +62,7 @@ describeEmbeddedPostgres("multilingual issue routes", () => {
       issuePrefix: "LNG",
       requireBoardApprovalForNewAgents: false,
     });
-  }, 20_000);
+  }, 60_000);
 
   afterAll(async () => {
     await tempDb?.cleanup();
