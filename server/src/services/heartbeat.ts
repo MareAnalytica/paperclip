@@ -1307,6 +1307,24 @@ function resolvePrimaryProviderId(
   return match?.id ?? chain[0]?.id ?? null;
 }
 
+// ELI-856: when provider fallback switches to a different adapter family, the
+// effective runtime command must switch with it. Otherwise the run inherits the
+// agent's base command (e.g. `claude`) and invokes the wrong binary with the new
+// adapter's flags (observed: grok_local selected but /usr/local/bin/claude run).
+export function enforceFallbackAdapterCommand(input: {
+  config: Record<string, unknown>;
+  agentAdapterType: string;
+  selectedFallbackAdapterType: string | null;
+  fallbackAdapterCommand: string | null;
+}): Record<string, unknown> {
+  const fallback = input.selectedFallbackAdapterType;
+  if (!fallback || fallback === input.agentAdapterType) return input.config;
+  const next = { ...input.config };
+  if (input.fallbackAdapterCommand) next.command = input.fallbackAdapterCommand;
+  else delete next.command;
+  return next;
+}
+
 // Read the accumulated per-provider reset map from a run's context snapshot,
 // keeping only string|null reset values keyed by provider id.
 function readProviderFallbackResetMap(value: Record<string, unknown>): Record<string, string | null> {
@@ -8182,23 +8200,31 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       ? readNonEmptyString(parseObject(providerFallbackSelection.adapterConfig).model) ??
         fallbackAdapterProfileModel
       : null;
-    const mergedConfig = enforceFallbackAdapterModel({
-      config: mergeModelProfileAdapterConfig({
-        baseConfig: persistedWorkspaceManagedConfig,
-        modelProfile: modelProfileApplication,
-        issueAdapterConfig: selectedFallbackAdapterType
-          ? {
-              ...parseObject(providerFallbackSelection.adapterConfig),
-              ...(issueAssigneeOverrides?.adapterConfig ?? null),
-              ...(readNonEmptyString(providerFallbackSelection.account)
-                ? { account: readNonEmptyString(providerFallbackSelection.account) }
-                : {}),
-            }
-          : issueAssigneeOverrides?.adapterConfig ?? null,
+    const fallbackAdapterCommand = selectedFallbackAdapterType
+      ? readNonEmptyString(parseObject(providerFallbackSelection.adapterConfig).command)
+      : null;
+    const mergedConfig = enforceFallbackAdapterCommand({
+      config: enforceFallbackAdapterModel({
+        config: mergeModelProfileAdapterConfig({
+          baseConfig: persistedWorkspaceManagedConfig,
+          modelProfile: modelProfileApplication,
+          issueAdapterConfig: selectedFallbackAdapterType
+            ? {
+                ...(issueAssigneeOverrides?.adapterConfig ?? null),
+                ...parseObject(providerFallbackSelection.adapterConfig),
+                ...(readNonEmptyString(providerFallbackSelection.account)
+                  ? { account: readNonEmptyString(providerFallbackSelection.account) }
+                  : {}),
+              }
+            : issueAssigneeOverrides?.adapterConfig ?? null,
+        }),
+        agentAdapterType: agent.adapterType,
+        selectedFallbackAdapterType,
+        fallbackAdapterModel: fallbackAdapterModel ?? null,
       }),
       agentAdapterType: agent.adapterType,
       selectedFallbackAdapterType,
-      fallbackAdapterModel: fallbackAdapterModel ?? null,
+      fallbackAdapterCommand,
     });
     const configSnapshot = buildExecutionWorkspaceConfigSnapshot(mergedConfig, selectedEnvironmentId);
     const executionRunConfig = stripWorkspaceRuntimeFromExecutionRunConfig(mergedConfig);

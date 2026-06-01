@@ -16,6 +16,7 @@ import {
   resolveProviderFallbackEscalation,
   selectNextProviderFallbackEntry,
 } from "../services/provider-fallback-policy.js";
+import { enforceFallbackAdapterCommand } from "../services/heartbeat.js";
 
 const VALID_DOC = `
 schemaVersion: "1"
@@ -319,6 +320,67 @@ describe("provider-fallback-policy", () => {
       const escalation = resolveProviderFallbackEscalation("any-company", resolved);
       expect(escalation.retryAfterMinutesDefault).toBe(30);
       expect(escalation.boardEscalation).toEqual({ enabled: true, notifyKind: "wake" });
+    });
+  });
+
+
+
+  describe("enforceFallbackAdapterCommand (ELI-856 cross-adapter command)", () => {
+    it("forces the Grok command instead of inheriting claude when fallback adapter is grok_local", () => {
+      const config = enforceFallbackAdapterCommand({
+        config: { command: "claude", env: { CLAUDE_CONFIG_DIR: "/paperclip/claude-accounts/personal" } },
+        agentAdapterType: "claude_local",
+        selectedFallbackAdapterType: "grok_local",
+        fallbackAdapterCommand: "/paperclip/.grok/bin/grok",
+      });
+
+      expect(config.command).toBe("/paperclip/.grok/bin/grok");
+      // unrelated keys are preserved
+      expect(config.env).toEqual({ CLAUDE_CONFIG_DIR: "/paperclip/claude-accounts/personal" });
+    });
+
+    it("forces the configured Codex command when fallback adapter is codex_local", () => {
+      const config = enforceFallbackAdapterCommand({
+        config: { command: "claude" },
+        agentAdapterType: "claude_local",
+        selectedFallbackAdapterType: "codex_local",
+        fallbackAdapterCommand: "/paperclip/.codex/bin/codex",
+      });
+
+      expect(config.command).toBe("/paperclip/.codex/bin/codex");
+    });
+
+    it("removes inherited claude command when a cross-adapter fallback has no command override", () => {
+      const config = enforceFallbackAdapterCommand({
+        config: { command: "claude" },
+        agentAdapterType: "claude_local",
+        selectedFallbackAdapterType: "grok_local",
+        fallbackAdapterCommand: null,
+      });
+
+      expect(config.command).toBeUndefined();
+    });
+
+    it("preserves the base command for a same-family claude_local fallback hop", () => {
+      const config = enforceFallbackAdapterCommand({
+        config: { command: "claude", env: { CLAUDE_CONFIG_DIR: "/paperclip/claude-accounts/aflabox" } },
+        agentAdapterType: "claude_local",
+        selectedFallbackAdapterType: "claude_local",
+        fallbackAdapterCommand: null,
+      });
+
+      expect(config.command).toBe("claude");
+    });
+
+    it("is a no-op when there is no fallback selection", () => {
+      const config = enforceFallbackAdapterCommand({
+        config: { command: "claude" },
+        agentAdapterType: "claude_local",
+        selectedFallbackAdapterType: null,
+        fallbackAdapterCommand: null,
+      });
+
+      expect(config.command).toBe("claude");
     });
   });
 
