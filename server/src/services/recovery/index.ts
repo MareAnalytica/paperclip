@@ -62,3 +62,18 @@ export type {
   SuccessfulRunHandoffNotice,
   SuccessfulRunHandoffDecision,
 } from "./successful-run-handoff.js";
+export {
+  AGENT_LATCH_RECOVERY_ADAPTERS,
+  AGENT_LATCH_RECOVERY_REASON,
+  DEFAULT_AGENT_LATCH_RECOVERY_BACKOFF_BASE_MINUTES,
+  DEFAULT_MAX_AGENT_LATCH_RECOVERY_ATTEMPTS,
+  buildAgentLatchRecoveryIdempotencyKey,
+  computeAgentLatchRecoveryBackoffMinutes,
+  countPriorAgentLatchRecoveryWakes,
+  decideAgentLatchRecovery,
+  findExistingAgentLatchRecoveryWake,
+  readAgentLatchRecoveryAttempt,
+} from "./agent-latch-recovery.js";
+export type {
+  AgentLatchRecoveryDecision,
+} from "./agent-latch-recovery.js";

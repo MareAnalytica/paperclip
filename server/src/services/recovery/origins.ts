@@ -7,6 +7,7 @@ export const RECOVERY_ORIGIN_KINDS = {
 
 export const RECOVERY_REASON_KINDS = {
   runLivenessContinuation: "run_liveness_continuation",
+  agentLatchRecovery: "agent_latch_recovery",
 } as const;
 
 export const RECOVERY_KEY_PREFIXES = {
