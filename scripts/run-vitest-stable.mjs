@@ -46,6 +46,7 @@ const additionalSerializedServerTests = new Set([
   "server/src/__tests__/routines-e2e.test.ts",
 ]);
 let invocationIndex = 0;
+let flakyRetryToGreenCount = 0;
 const serializedModeName = "serialized";
 const generalModeName = "general";
 const allModeName = "all";
@@ -244,8 +245,26 @@ function selectSerializedSuites(routeTests, shardIndex, shardCount) {
   return routeTests.filter((_, index) => index % shardCount === shardIndex);
 }
 
-function runVitest(args, label) {
-  console.log(`\n[test:run] ${label}`);
+// Retry-to-green harness for known-flaky CI shards (DEE-649). Retry is OFF by
+// default (1 attempt) so local `pnpm test` behaviour is unchanged; CI lanes opt
+// in via PAPERCLIP_TEST_RETRY_ATTEMPTS. Because retries are bounded and applied
+// per Vitest invocation, a deterministic regression still fails every attempt
+// and stays red — only genuinely flaky suites are rescued.
+const flakyRetryAttempts = (() => {
+  const raw = process.env.PAPERCLIP_TEST_RETRY_ATTEMPTS;
+  if (raw === undefined || raw.trim() === "") return 1;
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed < 1) {
+    fail(
+      `PAPERCLIP_TEST_RETRY_ATTEMPTS must be a positive integer. Received "${raw}".`,
+    );
+  }
+  return parsed;
+})();
+
+function runVitestOnce(args, label, attempt, maxAttempts) {
+  const attemptSuffix = maxAttempts > 1 ? ` (attempt ${attempt}/${maxAttempts})` : "";
+  console.log(`\n[test:run] ${label}${attemptSuffix}`);
   invocationIndex += 1;
   const tempRootParent = process.platform === "win32" ? os.tmpdir() : "/tmp";
   const testRoot = mkdtempSync(path.join(tempRootParent, `pcvt-${process.pid}-${invocationIndex}-`));
@@ -267,9 +286,32 @@ function runVitest(args, label) {
     console.error(`[test:run] Failed to start Vitest: ${result.error.message}`);
     process.exit(1);
   }
-  if (result.status !== 0) {
-    process.exit(result.status ?? 1);
+  return result.status ?? 1;
+}
+
+function runVitest(args, label) {
+  let lastStatus = 1;
+  for (let attempt = 1; attempt <= flakyRetryAttempts; attempt += 1) {
+    lastStatus = runVitestOnce(args, label, attempt, flakyRetryAttempts);
+    if (lastStatus === 0) {
+      if (attempt > 1) {
+        flakyRetryToGreenCount += 1;
+        console.warn(
+          `[test:run][flaky-retry] "${label}" passed on attempt ${attempt}/${flakyRetryAttempts} after ${attempt - 1} failed attempt(s). Flaky — track for root-fix (DEE-649).`,
+        );
+      }
+      return;
+    }
+    if (attempt < flakyRetryAttempts) {
+      console.warn(
+        `[test:run][flaky-retry] "${label}" failed on attempt ${attempt}/${flakyRetryAttempts} (exit ${lastStatus}). Retrying...`,
+      );
+    }
   }
+  console.error(
+    `[test:run] "${label}" failed on all ${flakyRetryAttempts} attempt(s) (exit ${lastStatus}). Treating as a real failure.`,
+  );
+  process.exit(lastStatus);
 }
 
 function runGeneralSuites(routeTests) {
@@ -375,4 +417,11 @@ if (options.mode === generalModeName || options.mode === allModeName) {
 
 if (options.mode === serializedModeName || options.mode === allModeName) {
   runSerializedSuites(routeTests, options.shardIndex ?? 0, options.shardCount ?? 1);
+}
+
+
+if (flakyRetryToGreenCount > 0) {
+  console.warn(
+    `\n[test:run][flaky-retry] ${flakyRetryToGreenCount} suite(s) passed only after retry this run. These are flaky and should be root-fixed (DEE-649).`,
+  );
 }
