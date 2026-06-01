@@ -175,6 +175,7 @@ import {
   getProviderFallbackPolicy,
   policyForCompany,
   resolveProviderFallbackEscalation,
+  resolveProviderFallbackAccountCooldown,
   type ProviderFallbackNotifyKind,
 } from "./provider-fallback-policy.js";
 import {
@@ -183,6 +184,12 @@ import {
   renderProviderFallbackExhaustedMarkdown,
   type ProviderFallbackExhaustedReport,
 } from "./provider-fallback-exhaustion.js";
+import {
+  computeProviderCooldownRecord,
+  getActiveProviderCooldownIds,
+  pickRootRunProviderSelection,
+  upsertProviderAccountCooldown,
+} from "./provider-account-cooldown.js";
 import { issueThreadInteractionService } from "./issue-thread-interactions.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 
@@ -5817,6 +5824,44 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         ? failedProviderReset.toISOString()
         : null;
     }
+    // Account/provider cooldown (ticket ELI-855): a provider-fallback-eligible
+    // failure is a limit signal — persist a cross-run cooldown so subsequent
+    // *new root runs* skip this provider until its reset, instead of every fresh
+    // run re-trying a Claude account that already reported "blocked until X".
+    if (shouldAttemptProviderFallback && failedProviderId) {
+      const accountCooldown = resolveProviderFallbackAccountCooldown(run.companyId);
+      if (accountCooldown.enabled) {
+        const failedEntry = findProviderFallbackEntry(providerFallbackChain, failedProviderId);
+        const cooldownRecord = computeProviderCooldownRecord({
+          providerId: failedProviderId,
+          adapterType: failedEntry?.adapter ?? agent.adapterType,
+          account: failedEntry?.account ?? null,
+          failedProviderReset,
+          now,
+          retryAfterMinutesDefault: resolveProviderFallbackEscalation(run.companyId)
+            .retryAfterMinutesDefault,
+        });
+        if (cooldownRecord) {
+          try {
+            await upsertProviderAccountCooldown(db, {
+              ...cooldownRecord,
+              companyId: run.companyId,
+              reason: "provider_fallback_limit",
+              lastRunId: run.id,
+              lastIssueId: readNonEmptyString(parseObject(run.contextSnapshot).issueId),
+              now,
+            });
+          } catch (err) {
+            // Cooldown persistence is best-effort: never fail a retry schedule
+            // because the circuit-breaker write hiccuped.
+            logger.warn(
+              { err, runId: run.id, providerId: failedProviderId },
+              "[provider-account-cooldown] failed to record cooldown",
+            );
+          }
+        }
+      }
+    }
     const providerFallbackEscalation = providerFallbackExhausted
       ? resolveProviderFallbackEscalation(run.companyId)
       : null;
@@ -7791,7 +7836,55 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     const runtime = await ensureRuntimeState(agent);
     const context = parseObject(run.contextSnapshot);
-    const providerFallbackSelection = parseObject(context.providerFallbackSelection);
+    let providerFallbackSelection = parseObject(context.providerFallbackSelection);
+    // Account/provider cooldown (ticket ELI-855): when a run starts with no
+    // provider already selected (a fresh root run — within-run fallback hops set
+    // this for retries), skip providers still cooling down from a recent limit
+    // error so a new root run does not re-try a known-blocked Claude account.
+    if (!readNonEmptyString(providerFallbackSelection.id)) {
+      try {
+        const accountCooldown = resolveProviderFallbackAccountCooldown(agent.companyId);
+        if (accountCooldown.enabled) {
+          const cooledDownProviderIds = await getActiveProviderCooldownIds(db, agent.companyId);
+          if (cooledDownProviderIds.size > 0) {
+            const fallbackChain = resolveEffectiveProviderFallbackChain(agent);
+            const pick = pickRootRunProviderSelection({
+              chain: fallbackChain,
+              adapterType: agent.adapterType,
+              cooledDownProviderIds,
+            });
+            if (pick) {
+              providerFallbackSelection = {
+                id: pick.id,
+                adapter: pick.adapter,
+                account: pick.account,
+                adapterConfig: pick.adapterConfig,
+                probe: pick.probe ?? null,
+                reason: "account_cooldown",
+              };
+              await appendRunEvent(run, await nextRunEventSeq(run.id), {
+                eventType: "lifecycle",
+                stream: "system",
+                level: "info",
+                message: `Root run starting on fallback provider ${pick.id}; primary is cooling down from a recent limit error`,
+                payload: {
+                  reason: "account_cooldown",
+                  selectedProviderId: pick.id,
+                  cooledDownProviderIds: [...cooledDownProviderIds],
+                },
+              });
+            }
+          }
+        }
+      } catch (err) {
+        // Cooldown lookup is advisory: never block a run because the
+        // circuit-breaker read failed. Fall back to the agent primary.
+        logger.warn(
+          { err, runId: run.id, companyId: agent.companyId },
+          "[provider-account-cooldown] root-run provider selection failed; using primary",
+        );
+      }
+    }
     const selectedFallbackAdapterType = normalizeProviderFallbackAdapterType(providerFallbackSelection.adapter);
     const selectedFallbackId = readNonEmptyString(providerFallbackSelection.id);
     const executionAdapterType = selectedFallbackAdapterType ?? agent.adapterType;

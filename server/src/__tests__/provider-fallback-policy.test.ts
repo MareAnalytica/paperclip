@@ -257,6 +257,23 @@ describe("provider-fallback-policy", () => {
       expect(resolved.boardEscalation).toEqual({ enabled: true, notifyKind: "approval" });
     });
 
+    it("defaults accountCooldown.enabled to true and honours an explicit override", () => {
+      const def = parseProviderFallbackPolicy({
+        schemaVersion: "1",
+        providerFallback: { default: { chain: [{ id: "codex-local", adapter: "codex_local" }] } },
+      });
+      expect(def.accountCooldown).toEqual({ enabled: true });
+
+      const off = parseProviderFallbackPolicy({
+        schemaVersion: "1",
+        providerFallback: {
+          default: { chain: [{ id: "codex-local", adapter: "codex_local" }] },
+          accountCooldown: { enabled: false },
+        },
+      });
+      expect(off.accountCooldown).toEqual({ enabled: false });
+    });
+
     it("rejects an out-of-range retryAfterMinutesDefault", () => {
       expect(() =>
         parseProviderFallbackPolicy({

@@ -46,6 +46,17 @@ const DEFAULT_BOARD_ESCALATION: ProviderFallbackBoardEscalation = {
   notifyKind: "approval",
 };
 
+export interface ProviderFallbackAccountCooldown {
+  // When true (default), a limit error records an account/provider cooldown and
+  // new root runs skip providers still cooling down (ticket ELI-855). Set false
+  // to fall back to legacy behaviour (every root run starts on the primary).
+  enabled: boolean;
+}
+
+const DEFAULT_ACCOUNT_COOLDOWN: ProviderFallbackAccountCooldown = {
+  enabled: true,
+};
+
 export interface ResolvedProviderFallbackPolicy {
   schemaVersion: "1";
   default: ProviderFallbackPolicy;
@@ -54,6 +65,8 @@ export interface ResolvedProviderFallbackPolicy {
   // override of these is a documented follow-up.
   retryAfterMinutesDefault: number;
   boardEscalation: ProviderFallbackBoardEscalation;
+  // Account/provider cooldown for new root runs (ticket ELI-855).
+  accountCooldown: ProviderFallbackAccountCooldown;
 }
 
 export interface ProviderFallbackLoadOptions {
@@ -282,6 +295,20 @@ function parseBoardEscalation(boardEscalation: unknown): ProviderFallbackBoardEs
   return { enabled, notifyKind };
 }
 
+function parseAccountCooldown(accountCooldown: unknown): ProviderFallbackAccountCooldown {
+  if (accountCooldown === undefined || accountCooldown === null) {
+    return { ...DEFAULT_ACCOUNT_COOLDOWN };
+  }
+  if (typeof accountCooldown !== "object" || Array.isArray(accountCooldown)) {
+    throw new Error(
+      "[provider-fallback-policy] providerFallback.accountCooldown must be an object",
+    );
+  }
+  const o = accountCooldown as Record<string, unknown>;
+  const enabled = o.enabled === undefined ? DEFAULT_ACCOUNT_COOLDOWN.enabled : Boolean(o.enabled);
+  return { enabled };
+}
+
 export function parseProviderFallbackPolicy(
   raw: unknown,
   options: ProviderFallbackLoadOptions = {},
@@ -343,6 +370,7 @@ export function parseProviderFallbackPolicy(
     overrides,
     retryAfterMinutesDefault: parseRetryAfterMinutes(block.limitDetection),
     boardEscalation: parseBoardEscalation(block.boardEscalation),
+    accountCooldown: parseAccountCooldown(block.accountCooldown),
   };
 }
 
@@ -369,6 +397,7 @@ export function builtinDefaultProviderFallbackPolicy(): ResolvedProviderFallback
     overrides: new Map(),
     retryAfterMinutesDefault: PROVIDER_FALLBACK_RETRY_AFTER_MINUTES_DEFAULT,
     boardEscalation: { ...DEFAULT_BOARD_ESCALATION },
+    accountCooldown: { ...DEFAULT_ACCOUNT_COOLDOWN },
   };
 }
 
@@ -386,6 +415,19 @@ export function resolveProviderFallbackEscalation(
     retryAfterMinutesDefault: resolved.retryAfterMinutesDefault,
     boardEscalation: { ...resolved.boardEscalation },
   };
+}
+
+/**
+ * Resolve the account/provider cooldown config for a company (ticket ELI-855).
+ * Company-wide for v1; `companyId` is accepted now so callers do not change
+ * when per-company overrides land.
+ */
+export function resolveProviderFallbackAccountCooldown(
+  companyId: string,
+  resolved: ResolvedProviderFallbackPolicy = getProviderFallbackPolicy(),
+): ProviderFallbackAccountCooldown {
+  void companyId;
+  return { ...resolved.accountCooldown };
 }
 
 export function policyForCompany(
