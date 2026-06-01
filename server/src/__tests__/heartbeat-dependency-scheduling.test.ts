@@ -2,21 +2,14 @@ import { randomUUID } from "node:crypto";
 import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
-  activityLog,
   agents,
-  agentRuntimeState,
   agentWakeupRequests,
-  companySkills,
   companies,
   createDb,
-  documentRevisions,
   documents,
-  environmentLeases,
   environments,
-  heartbeatRunEvents,
   heartbeatRuns,
   issueComments,
-  issueDocuments,
   issueRelations,
   issueTreeHolds,
   issues,
@@ -124,25 +117,38 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
     await new Promise((resolve) => setTimeout(resolve, 50));
-    await db.delete(environmentLeases);
-    await db.delete(activityLog);
-    await db.delete(companySkills);
-    await db.delete(issueComments);
-    await db.delete(issueDocuments);
-    await db.delete(documentRevisions);
-    await db.delete(documents);
-    await db.delete(issueRelations);
-    await db.delete(issueTreeHolds);
-    await db.delete(issues);
-    await db.delete(heartbeatRunEvents);
-    await db.delete(activityLog);
-    await db.delete(heartbeatRuns);
-    await db.delete(agentWakeupRequests);
-    await db.delete(agentRuntimeState);
-    await db.delete(agents);
-    await db.delete(companySkills);
-    await db.delete(environments);
-    await db.delete(companies);
+    // DEE-664: Replace the ordered per-table deletes with a single atomic
+    // TRUNCATE ... CASCADE. The previous sequence deleted issue_comments and
+    // then issues in *separate* statements; under load a background heartbeat
+    // run could promote a lingering queued run (e.g. the maxConcurrentRuns case
+    // deliberately leaves a second wake queued) and insert an issue_comment in
+    // the window between those two deletes, tripping the
+    // issue_comments -> issues foreign key during teardown (the deterministic
+    // "Failed query: delete from \"issues\"" failure on the serialized shard).
+    // TRUNCATE takes an ACCESS EXCLUSIVE lock and removes parents and their
+    // dependents together, so the FK can never be violated regardless of
+    // teardown ordering or a racing insert.
+    await db.execute(sql`
+      TRUNCATE TABLE
+        environment_leases,
+        activity_log,
+        company_skills,
+        issue_comments,
+        issue_documents,
+        document_revisions,
+        documents,
+        issue_relations,
+        issue_tree_holds,
+        issues,
+        heartbeat_run_events,
+        heartbeat_runs,
+        agent_wakeup_requests,
+        agent_runtime_state,
+        agents,
+        environments,
+        companies
+      CASCADE
+    `);
   });
 
   afterAll(async () => {
