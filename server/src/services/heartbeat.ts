@@ -1287,12 +1287,47 @@ function selectNextProviderFallbackEntry(input: {
 // The provider id that just failed on this run: the active fallback selection,
 // or — on the first failure with no selection — the agent's primary provider
 // (the chain entry whose adapter matches the agent, else the chain head).
-function resolvePrimaryProviderId(
+export function resolvePrimaryProviderId(
   chain: ProviderFallbackEntry[],
   adapterType: string,
 ): string | null {
   const match = chain.find((entry) => entry.adapter === adapterType);
   return match?.id ?? chain[0]?.id ?? null;
+}
+
+export function selectProviderFallbackEntryForCooldown(input: {
+  chain: ProviderFallbackEntry[];
+  currentAdapterType: string;
+  cooldowns: Record<string, string | Date | null | undefined>;
+  now: Date;
+}): ProviderFallbackEntry | null {
+  const enabled = input.chain.filter((entry) => entry.enabled);
+  if (enabled.length === 0) return null;
+  const primaryId = resolvePrimaryProviderId(enabled, input.currentAdapterType);
+  if (!primaryId) return null;
+  const rawReset = input.cooldowns[primaryId];
+  if (!rawReset) return null;
+  const reset = rawReset instanceof Date ? rawReset : new Date(rawReset);
+  if (Number.isNaN(reset.getTime()) || reset.getTime() <= input.now.getTime()) return null;
+  return selectNextProviderFallbackEntry({
+    chain: enabled,
+    currentId: primaryId,
+    currentAdapterType: input.currentAdapterType,
+  });
+}
+
+export function enforceFallbackAdapterCommand(input: {
+  config: Record<string, unknown>;
+  agentAdapterType: string;
+  selectedFallbackAdapterType: string | null;
+  fallbackAdapterCommand: string | null;
+}): Record<string, unknown> {
+  const fallback = input.selectedFallbackAdapterType;
+  if (!fallback || fallback === input.agentAdapterType) return input.config;
+  const next = { ...input.config };
+  if (input.fallbackAdapterCommand) next.command = input.fallbackAdapterCommand;
+  else delete next.command;
+  return next;
 }
 
 // Read the accumulated per-provider reset map from a run's context snapshot,
@@ -1304,6 +1339,44 @@ function readProviderFallbackResetMap(value: Record<string, unknown>): Record<st
     else if (raw === null) out[key] = null;
   }
   return out;
+}
+
+async function readActiveProviderFallbackCooldowns(input: {
+  db: Db;
+  companyId: string;
+  chain: ProviderFallbackEntry[];
+  currentAdapterType: string;
+  now: Date;
+}): Promise<Record<string, string>> {
+  const since = new Date(input.now.getTime() - 6 * 60 * 60 * 1000);
+  const rows = await input.db
+    .select({
+      errorCode: heartbeatRuns.errorCode,
+      resultJson: heartbeatRuns.resultJson,
+      contextSnapshot: heartbeatRuns.contextSnapshot,
+      createdAt: heartbeatRuns.createdAt,
+    })
+    .from(heartbeatRuns)
+    .where(and(eq(heartbeatRuns.companyId, input.companyId), gt(heartbeatRuns.createdAt, since)))
+    .orderBy(desc(heartbeatRuns.createdAt))
+    .limit(200);
+
+  const cooldowns: Record<string, string> = {};
+  for (const row of rows) {
+    if (!isProviderFallbackEligibleError(row)) continue;
+    const reset = readTransientRetryNotBeforeFromRun(row);
+    if (!reset || reset.getTime() <= input.now.getTime()) continue;
+    const context = parseObject(row.contextSnapshot);
+    const selection = parseObject(context.providerFallbackSelection);
+    const providerId = readNonEmptyString(selection.id) ??
+      resolvePrimaryProviderId(input.chain, input.currentAdapterType);
+    if (!providerId) continue;
+    const existing = cooldowns[providerId] ? new Date(cooldowns[providerId]) : null;
+    if (!existing || reset.getTime() > existing.getTime()) {
+      cooldowns[providerId] = reset.toISOString();
+    }
+  }
+  return cooldowns;
 }
 
 function readModelProfileKey(value: unknown): ModelProfileKey | null {
@@ -7754,9 +7827,46 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     const runtime = await ensureRuntimeState(agent);
     const context = parseObject(run.contextSnapshot);
-    const providerFallbackSelection = parseObject(context.providerFallbackSelection);
-    const selectedFallbackAdapterType = normalizeProviderFallbackAdapterType(providerFallbackSelection.adapter);
-    const selectedFallbackId = readNonEmptyString(providerFallbackSelection.id);
+    const providerFallbackChainForExecution = resolveEffectiveProviderFallbackChain(agent);
+    let providerFallbackSelection = parseObject(context.providerFallbackSelection);
+    let selectedFallbackAdapterType = normalizeProviderFallbackAdapterType(providerFallbackSelection.adapter);
+    let selectedFallbackId = readNonEmptyString(providerFallbackSelection.id);
+    if (!selectedFallbackAdapterType && providerFallbackChainForExecution.length > 0) {
+      const now = new Date();
+      const cooldowns = await readActiveProviderFallbackCooldowns({
+        db,
+        companyId: agent.companyId,
+        chain: providerFallbackChainForExecution,
+        currentAdapterType: agent.adapterType,
+        now,
+      });
+      const cooldownFallback = selectProviderFallbackEntryForCooldown({
+        chain: providerFallbackChainForExecution,
+        currentAdapterType: agent.adapterType,
+        cooldowns,
+        now,
+      });
+      if (cooldownFallback) {
+        const primaryId = resolvePrimaryProviderId(providerFallbackChainForExecution, agent.adapterType);
+        context.providerFallbackSelection = {
+          id: cooldownFallback.id,
+          adapter: cooldownFallback.adapter,
+          account: cooldownFallback.account ?? null,
+          adapterConfig: cooldownFallback.adapterConfig ?? null,
+          probe: cooldownFallback.probe ?? null,
+        };
+        context.providerFallbackResets = primaryId ? { [primaryId]: cooldowns[primaryId] ?? null } : {};
+        context.providerFallbackCooldownApplied = {
+          skippedProviderId: primaryId,
+          selectedProviderId: cooldownFallback.id,
+          resetAt: primaryId ? cooldowns[primaryId] ?? null : null,
+        };
+        await db.update(heartbeatRuns).set({ contextSnapshot: context, updatedAt: now }).where(eq(heartbeatRuns.id, run.id));
+        providerFallbackSelection = parseObject(context.providerFallbackSelection);
+        selectedFallbackAdapterType = normalizeProviderFallbackAdapterType(providerFallbackSelection.adapter);
+        selectedFallbackId = readNonEmptyString(providerFallbackSelection.id);
+      }
+    }
     const executionAdapterType = selectedFallbackAdapterType ?? agent.adapterType;
     const executionAgent = executionAdapterType === agent.adapterType
       ? agent
@@ -8052,23 +8162,31 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       ? readNonEmptyString(parseObject(providerFallbackSelection.adapterConfig).model) ??
         fallbackAdapterProfileModel
       : null;
-    const mergedConfig = enforceFallbackAdapterModel({
-      config: mergeModelProfileAdapterConfig({
-        baseConfig: persistedWorkspaceManagedConfig,
-        modelProfile: modelProfileApplication,
-        issueAdapterConfig: selectedFallbackAdapterType
-          ? {
-              ...parseObject(providerFallbackSelection.adapterConfig),
-              ...(issueAssigneeOverrides?.adapterConfig ?? null),
-              ...(readNonEmptyString(providerFallbackSelection.account)
-                ? { account: readNonEmptyString(providerFallbackSelection.account) }
-                : {}),
-            }
-          : issueAssigneeOverrides?.adapterConfig ?? null,
+    const fallbackAdapterCommand = selectedFallbackAdapterType
+      ? readNonEmptyString(parseObject(providerFallbackSelection.adapterConfig).command)
+      : null;
+    const mergedConfig = enforceFallbackAdapterCommand({
+      config: enforceFallbackAdapterModel({
+        config: mergeModelProfileAdapterConfig({
+          baseConfig: persistedWorkspaceManagedConfig,
+          modelProfile: modelProfileApplication,
+          issueAdapterConfig: selectedFallbackAdapterType
+            ? {
+                ...(issueAssigneeOverrides?.adapterConfig ?? null),
+                ...parseObject(providerFallbackSelection.adapterConfig),
+                ...(readNonEmptyString(providerFallbackSelection.account)
+                  ? { account: readNonEmptyString(providerFallbackSelection.account) }
+                  : {}),
+              }
+            : issueAssigneeOverrides?.adapterConfig ?? null,
+        }),
+        agentAdapterType: agent.adapterType,
+        selectedFallbackAdapterType,
+        fallbackAdapterModel: fallbackAdapterModel ?? null,
       }),
       agentAdapterType: agent.adapterType,
       selectedFallbackAdapterType,
-      fallbackAdapterModel: fallbackAdapterModel ?? null,
+      fallbackAdapterCommand,
     });
     const configSnapshot = buildExecutionWorkspaceConfigSnapshot(mergedConfig, selectedEnvironmentId);
     const executionRunConfig = stripWorkspaceRuntimeFromExecutionRunConfig(mergedConfig);
