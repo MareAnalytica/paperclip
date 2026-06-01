@@ -62,6 +62,11 @@ export {
 } from "./command-redaction.js";
 export { buildSandboxNpmInstallCommand } from "./sandbox-install-command.js";
 export { inferOpenAiCompatibleBiller } from "./billing.js";
+export {
+  parseProviderResetTimestamp,
+  extractProviderResetTimestamp,
+  normalizeResetTimeZone,
+} from "./provider-reset-timestamp.js";
 // Keep the root adapter-utils entry browser-safe because the UI imports it.
 // The sandbox callback bridge stays available via its dedicated subpath export.
 export type {

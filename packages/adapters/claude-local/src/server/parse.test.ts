@@ -120,4 +120,20 @@ describe("extractClaudeRetryNotBefore", () => {
       extractClaudeRetryNotBefore({ errorMessage: "Overloaded. Try again later." }, new Date()),
     ).toBeNull();
   });
+
+  it("parses a weekly limit reset that carries a date, not just a clock (ELI-864)", () => {
+    const now = new Date("2026-06-01T12:00:00.000Z");
+    const extracted = extractClaudeRetryNotBefore(
+      { errorMessage: "weekly limit · resets Jun 7, 2am (UTC)" },
+      now,
+    );
+    // Must honour the real Jun 7 reset, not roll the clock to tomorrow.
+    expect(extracted?.toISOString()).toBe("2026-06-07T02:00:00.000Z");
+  });
+
+  it("classifies the short 'weekly limit' wording (no 'reached') as transient", () => {
+    expect(
+      isClaudeTransientUpstreamError({ errorMessage: "weekly limit · resets Jun 7, 2am (UTC)" }),
+    ).toBe(true);
+  });
 });

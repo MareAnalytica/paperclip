@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { extractProviderResetTimestamp } from "@paperclipai/adapter-utils";
 
 import {
   activeCooledDownProviderIds,
@@ -75,6 +76,68 @@ describe("computeProviderCooldownRecord", () => {
         retryAfterMinutesDefault: 60,
       }),
     ).toBeNull();
+  });
+});
+
+// ELI-864 end-to-end: a real provider limit message is parsed to its reset
+// timestamp (not the short default) and the cooldown is recorded until then.
+// This is the synthetic verification of the parse → cooldown-record chain that
+// the heartbeat performs on a provider-fallback-eligible failure.
+describe("provider limit message → cooldown record (ELI-864)", () => {
+  it("records the real weekly reset for a Claude-style limit message", () => {
+    const failedProviderReset = extractProviderResetTimestamp(
+      "weekly limit · resets Jun 7, 2am (UTC)",
+      NOW,
+    );
+    expect(failedProviderReset?.toISOString()).toBe("2026-06-07T02:00:00.000Z");
+
+    const record = computeProviderCooldownRecord({
+      providerId: "claude-code-personal",
+      adapterType: "claude_local",
+      account: "personal",
+      failedProviderReset,
+      now: NOW,
+      retryAfterMinutesDefault: 60,
+    });
+    // The honoured weekly window — days out, not a ~60-minute default back-off.
+    expect(record?.source).toBe("provider_header");
+    expect(record?.cooldownUntil.toISOString()).toBe("2026-06-07T02:00:00.000Z");
+  });
+
+  it("records the real reset for a generic provider 'try again at' message", () => {
+    const failedProviderReset = extractProviderResetTimestamp(
+      "Quota exhausted for this account. Available again 2026-06-07T02:00:00Z.",
+      NOW,
+    );
+    const record = computeProviderCooldownRecord({
+      providerId: "minimax-local",
+      adapterType: "opencode_local",
+      account: null,
+      failedProviderReset,
+      now: NOW,
+      retryAfterMinutesDefault: 60,
+    });
+    expect(record?.source).toBe("provider_header");
+    expect(record?.cooldownUntil.toISOString()).toBe("2026-06-07T02:00:00.000Z");
+  });
+
+  it("preserves the default back-off when the limit message has no parseable reset", () => {
+    const failedProviderReset = extractProviderResetTimestamp(
+      "You are out of extra usage. Try again later.",
+      NOW,
+    );
+    expect(failedProviderReset).toBeNull();
+
+    const record = computeProviderCooldownRecord({
+      providerId: "claude-code-personal",
+      adapterType: "claude_local",
+      account: "personal",
+      failedProviderReset,
+      now: NOW,
+      retryAfterMinutesDefault: 60,
+    });
+    expect(record?.source).toBe("retryAfterMinutesDefault");
+    expect(record?.cooldownUntil).toEqual(new Date(NOW.getTime() + 60 * 60_000));
   });
 });
 
