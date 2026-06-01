@@ -64,10 +64,34 @@ import {
 } from "./model-profile-hint.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "./pause-hold-guard.js";
 import { isPermanentSinkIssue } from "./audit-sink-guard.js";
+import {
+  AGENT_LATCH_RECOVERY_ADAPTERS,
+  AGENT_LATCH_RECOVERY_REASON,
+  DEFAULT_AGENT_LATCH_RECOVERY_BACKOFF_BASE_MINUTES,
+  DEFAULT_MAX_AGENT_LATCH_RECOVERY_ATTEMPTS,
+  buildAgentLatchRecoveryIdempotencyKey,
+  countPriorAgentLatchRecoveryWakes,
+  decideAgentLatchRecovery,
+  findExistingAgentLatchRecoveryWake,
+  type AgentLatchRecoveryDecision,
+} from "./agent-latch-recovery.js";
+import {
+  readHeartbeatRunErrorFamily,
+  readTransientRecoveryContractFromRun,
+} from "./heartbeat-run-error-family.js";
 
 const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = ["failed", "cancelled", "timed_out"] as const;
 export const ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS = 60 * 60 * 1000;
+// DEE-680 agent-latch recovery wiring knobs.
+// Fallback transient retry window when a latch run did not persist `retryNotBefore`
+// (CEO binding condition 4 fallback: `finishedAt + retryAfterMinutesDefault`, default 60m).
+const DEFAULT_AGENT_LATCH_RETRY_AFTER_MINUTES = 60;
+// Clamp policy-supplied knobs (mirrors the watchdog reArmWindow clamp, ELI-776) so a
+// misconfig can neither disable the cap nor set a zero-minute backoff.
+const AGENT_LATCH_RECOVERY_MAX_ATTEMPTS_CEILING = 20;
+const AGENT_LATCH_RECOVERY_BACKOFF_MIN_MINUTES = 1;
+const AGENT_LATCH_RECOVERY_BACKOFF_MAX_MINUTES = 24 * 60;
 export const ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS = 4 * 60 * 60 * 1000;
 export const ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS = 30 * 60 * 1000;
 
@@ -4483,6 +4507,345 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return result;
   }
 
+  type AgentLatchRecoveryConfig = {
+    enabled: boolean;
+    maxAttempts: number;
+    backoffBaseMinutes: number;
+  };
+
+  // Read-time, back-compat-by-construction config (DEE-680): `companies.policies` is an
+  // untyped `z.record(z.unknown())`, so resolve defensively like `resolveWatchdogConfig`.
+  // Ships dark — `enabled` is false unless the policy explicitly sets `true`. Clamp the
+  // knobs so a misconfig can neither disable the cap nor set a zero-minute backoff.
+  async function resolveAgentLatchRecoveryConfig(companyId: string): Promise<AgentLatchRecoveryConfig> {
+    const [row] = await db
+      .select({ policies: companies.policies })
+      .from(companies)
+      .where(eq(companies.id, companyId))
+      .limit(1);
+    const policy = parseObject(parseObject(parseObject(row?.policies)["recovery"])["agentLatchRecovery"]);
+
+    const enabled = policy["enabled"] === true;
+
+    const requestedMaxAttempts = asNumber(policy["maxAttempts"], DEFAULT_MAX_AGENT_LATCH_RECOVERY_ATTEMPTS);
+    const maxAttempts = Math.min(
+      AGENT_LATCH_RECOVERY_MAX_ATTEMPTS_CEILING,
+      Math.max(1, Math.floor(requestedMaxAttempts)),
+    );
+
+    const requestedBackoffMinutes = asNumber(
+      policy["backoffBaseMinutes"],
+      DEFAULT_AGENT_LATCH_RECOVERY_BACKOFF_BASE_MINUTES,
+    );
+    const backoffBaseMinutes = Math.min(
+      AGENT_LATCH_RECOVERY_BACKOFF_MAX_MINUTES,
+      Math.max(AGENT_LATCH_RECOVERY_BACKOFF_MIN_MINUTES, Math.floor(requestedBackoffMinutes)),
+    );
+
+    return { enabled, maxAttempts, backoffBaseMinutes };
+  }
+
+  async function getLatestRunForAgentLatch(companyId: string, agentId: string) {
+    return db
+      .select({
+        id: heartbeatRuns.id,
+        status: heartbeatRuns.status,
+        errorCode: heartbeatRuns.errorCode,
+        resultJson: heartbeatRuns.resultJson,
+        contextSnapshot: heartbeatRuns.contextSnapshot,
+        finishedAt: heartbeatRuns.finishedAt,
+      })
+      .from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.agentId, agentId)))
+      .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+  }
+
+  async function hasActiveRunForAgent(companyId: string, agentId: string) {
+    return db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, companyId),
+          eq(heartbeatRuns.agentId, agentId),
+          inArray(heartbeatRuns.status, [...EXECUTION_PATH_HEARTBEAT_RUN_STATUSES]),
+        ),
+      )
+      .limit(1)
+      .then((rows) => Boolean(rows[0]));
+  }
+
+  async function escalateExhaustedAgentLatchRecovery(input: {
+    agent: typeof agents.$inferSelect;
+    episodeRunId: string;
+    decision: Extract<AgentLatchRecoveryDecision, { kind: "exhausted" }>;
+    latchIssueId: string | null;
+  }): Promise<boolean> {
+    // Escalate-once (condition 5): the auto-revive loop has ALREADY stopped (the exhausted
+    // branch emits no wake), so this is purely the one-time human notice. Idempotent per
+    // (agent, episode) via an activity-log pre-check so repeated sweeps never spam it.
+    // (Routing to a dedicated board-blocked escalation issue is a deliberate follow-up; the
+    // activity feed is the durable, queryable Phase-1 notice surface.)
+    const existing = await db
+      .select({ details: activityLog.details })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.companyId, input.agent.companyId),
+          eq(activityLog.action, "agent_latch_recovery_exhausted"),
+          eq(activityLog.entityType, "agent"),
+          eq(activityLog.entityId, input.agent.id),
+        ),
+      );
+    if (existing.some((row) => parseObject(row.details)["episodeRunId"] === input.episodeRunId)) {
+      return false;
+    }
+
+    await logActivity(db, {
+      companyId: input.agent.companyId,
+      actorType: "system",
+      actorId: "agent_latch_recovery",
+      action: "agent_latch_recovery_exhausted",
+      entityType: "agent",
+      entityId: input.agent.id,
+      agentId: input.agent.id,
+      runId: input.episodeRunId,
+      details: {
+        episodeRunId: input.episodeRunId,
+        attempts: input.decision.attempt,
+        maxAttempts: input.decision.maxAttempts,
+        ...(input.latchIssueId ? { latchIssueId: input.latchIssueId } : {}),
+        notice: input.decision.comment,
+      },
+    });
+
+    logger.warn(
+      {
+        agentId: input.agent.id,
+        companyId: input.agent.companyId,
+        episodeRunId: input.episodeRunId,
+        attempts: input.decision.attempt,
+        maxAttempts: input.decision.maxAttempts,
+      },
+      "agent_latch_recovery exhausted bounded attempts; escalated once and stopped auto-revive",
+    );
+    return true;
+  }
+
+  // Periodic sweep (DEE-680): re-wake a `claude_local` agent latched in `status="error"`
+  // on a CLEARED transient upstream failure, using the sanctioned internal
+  // `enqueueWakeup(actorType:"system",source:"automation")` lever. Modeled on the existing
+  // `reconcileStrandedBlockedCeoParents` periodic sweep; the pure decision is delegated to
+  // `decideAgentLatchRecovery` (one unit test per CEO binding condition). Ships dark.
+  async function reconcileAgentLatchRecovery(opts?: { now?: Date; companyId?: string }) {
+    const now = opts?.now ?? new Date();
+    const result = {
+      evaluated: 0,
+      wakesEmitted: 0,
+      escalated: 0,
+      skipped: 0,
+      skippedReasons: {} as Record<string, number>,
+      agentIds: [] as string[],
+    };
+    const bumpSkip = (reason: string) => {
+      result.skipped += 1;
+      result.skippedReasons[reason] = (result.skippedReasons[reason] ?? 0) + 1;
+    };
+
+    // Phase-1 scope (condition 1) + error-latch pushed into the query so the sweep is a
+    // single indexed scan when nothing is latched.
+    const candidates = await db
+      .select()
+      .from(agents)
+      .where(
+        and(
+          eq(agents.status, "error"),
+          inArray(agents.adapterType, [...AGENT_LATCH_RECOVERY_ADAPTERS]),
+          ...(opts?.companyId ? [eq(agents.companyId, opts.companyId)] : []),
+        ),
+      );
+
+    const configByCompany = new Map<string, AgentLatchRecoveryConfig>();
+
+    for (const agent of candidates) {
+      result.evaluated += 1;
+
+      let config = configByCompany.get(agent.companyId);
+      if (!config) {
+        config = await resolveAgentLatchRecoveryConfig(agent.companyId);
+        configByCompany.set(agent.companyId, config);
+      }
+      if (!config.enabled) {
+        bumpSkip("disabled_by_policy");
+        continue;
+      }
+
+      // Condition 6: skip if a queued/running/scheduled_retry run already exists — the
+      // recovery already produced an execution path (or real work is in flight).
+      if (await hasActiveRunForAgent(agent.companyId, agent.id)) {
+        bumpSkip("active_run_exists");
+        continue;
+      }
+
+      const latchRun = await getLatestRunForAgentLatch(agent.companyId, agent.id);
+      if (!latchRun) {
+        bumpSkip("no_latch_run");
+        continue;
+      }
+
+      // P1 (Hydra binding): bound the cap against the EPISODE-ORIGIN run, not the latest
+      // re-latched run. Each transient re-latch produces a new failed run; the recovery wake
+      // propagates the origin id via `contextSnapshot.agentLatchRecoverySourceRunId`, so
+      // resolve the episode id from that hook and only fall back to the run's own id for a
+      // fresh, never-recovered latch. Without this the counter resets every episode and
+      // cap-3/escalate-once never trips (unbounded ~1/hr re-wake).
+      const episodeRunId =
+        readNonEmptyString(parseObject(latchRun.contextSnapshot)["agentLatchRecoverySourceRunId"]) ?? latchRun.id;
+
+      // Single shared classifier (condition 3) — never re-derive the family in the sweep.
+      const errorFamily = readHeartbeatRunErrorFamily(latchRun);
+      const contract = readTransientRecoveryContractFromRun(latchRun);
+      // Window gate (condition 4): persisted retryNotBefore, else finishedAt + default.
+      const retryNotBefore =
+        contract?.retryNotBefore ??
+        (latchRun.finishedAt
+          ? new Date(latchRun.finishedAt.getTime() + DEFAULT_AGENT_LATCH_RETRY_AFTER_MINUTES * 60_000)
+          : null);
+
+      // Pause-hold is issue-tree-scoped; reuse the existing predicate verbatim (condition 6)
+      // against the issue the latched run was working.
+      const latchIssueId = readNonEmptyString(parseObject(latchRun.contextSnapshot)["issueId"]);
+      const pauseHoldSuppressed = latchIssueId
+        ? await isAutomaticRecoverySuppressedByPauseHold(db, agent.companyId, latchIssueId, treeControlSvc)
+        : false;
+
+      const priorAttempts = await countPriorAgentLatchRecoveryWakes(db, {
+        companyId: agent.companyId,
+        agentId: agent.id,
+        latchRunId: episodeRunId,
+      });
+      const candidateIdempotencyKey = buildAgentLatchRecoveryIdempotencyKey({
+        agentId: agent.id,
+        latchRunId: episodeRunId,
+        nextAttempt: priorAttempts + 1,
+      });
+      // The read pre-check is the dedupe guard (same as the run-liveness sibling):
+      // `enqueueWakeup` does not de-dupe on idempotencyKey at insert (no unique constraint),
+      // and recovery sweeps run single-threaded from one setInterval chain.
+      const idempotentWakeExists = Boolean(
+        await findExistingAgentLatchRecoveryWake(db, {
+          companyId: agent.companyId,
+          idempotencyKey: candidateIdempotencyKey,
+        }),
+      );
+
+      const decision = decideAgentLatchRecovery({
+        agent: {
+          id: agent.id,
+          companyId: agent.companyId,
+          status: agent.status,
+          adapterType: agent.adapterType,
+        },
+        latchRunId: episodeRunId,
+        errorFamily,
+        retryNotBefore,
+        now,
+        priorAttempts,
+        idempotentWakeExists,
+        enabled: config.enabled,
+        pauseHoldSuppressed,
+        maxAttempts: config.maxAttempts,
+        backoffBaseMinutes: config.backoffBaseMinutes,
+      });
+
+      if (decision.kind === "skip") {
+        bumpSkip(decision.reason);
+        continue;
+      }
+
+      if (decision.kind === "exhausted") {
+        const escalated = await escalateExhaustedAgentLatchRecovery({
+          agent,
+          episodeRunId,
+          decision,
+          latchIssueId,
+        });
+        if (escalated) {
+          result.escalated += 1;
+          result.agentIds.push(agent.id);
+        } else {
+          bumpSkip("escalation_already_emitted");
+        }
+        continue;
+      }
+
+      let queuedWake: Awaited<ReturnType<typeof deps.enqueueWakeup>> = null;
+      try {
+        queuedWake = await deps.enqueueWakeup(agent.id, {
+          source: "automation",
+          triggerDetail: "system",
+          reason: AGENT_LATCH_RECOVERY_REASON,
+          idempotencyKey: decision.idempotencyKey,
+          payload: decision.payload,
+          requestedByActorType: "system",
+          requestedByActorId: null,
+          contextSnapshot: decision.contextSnapshot,
+        });
+      } catch (err) {
+        // A per-agent enqueue failure (e.g. a budget hard-stop) must not abort the sweep for
+        // the other latched agents (Codex P2).
+        logger.error(
+          { err, agentId: agent.id, companyId: agent.companyId, episodeRunId },
+          "agent_latch_recovery wake enqueue failed; skipping this agent",
+        );
+        bumpSkip("wake_enqueue_error");
+        continue;
+      }
+      if (!queuedWake) {
+        // `enqueueWakeup` declined the wake at its normal gates (wake-on-demand disabled,
+        // dependency-blocked, ...). Do NOT count it as emitted — that would both misreport
+        // and, because the skipped row is not an ISSUED attempt, never advance the cap.
+        bumpSkip("wake_not_queued");
+        continue;
+      }
+
+      await logActivity(db, {
+        companyId: agent.companyId,
+        actorType: "system",
+        actorId: "agent_latch_recovery",
+        action: "agent_latch_recovery_wake_enqueued",
+        entityType: "agent",
+        entityId: agent.id,
+        agentId: agent.id,
+        runId: latchRun.id,
+        details: {
+          episodeRunId,
+          attempt: decision.nextAttempt,
+          maxAttempts: config.maxAttempts,
+          idempotencyKey: decision.idempotencyKey,
+          errorFamily: "transient_upstream",
+        },
+      });
+
+      logger.warn(
+        {
+          agentId: agent.id,
+          companyId: agent.companyId,
+          episodeRunId,
+          attempt: decision.nextAttempt,
+          maxAttempts: config.maxAttempts,
+        },
+        "agent_latch_recovery enqueued system re-wake for cleared transient latch",
+      );
+      result.wakesEmitted += 1;
+      result.agentIds.push(agent.id);
+    }
+
+    return result;
+  }
+
   function readRecoveryTimerIntervalMs(raw: unknown, fallback: number) {
     return Math.max(1, Math.floor(asNumber(raw, fallback)));
   }
@@ -4497,6 +4860,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     reconcileStrandedBlockedCeoParents,
     buildIssueGraphLivenessAutoRecoveryPreview,
     reconcileIssueGraphLiveness,
+    reconcileAgentLatchRecovery,
     readRecoveryTimerIntervalMs,
   };
 }
