@@ -9,6 +9,19 @@ metadata:
     app.kubernetes.io/component: web
 spec:
   replicas: 1
+  # ELI-911 (follow-up to ELI-903): pin a zero-downtime rollout explicitly instead
+  # of relying on the implicit RollingUpdate default. With replicas:1 the k8s default
+  # (maxSurge:25%/maxUnavailable:25%) only rounds to maxSurge:1/maxUnavailable:0 by
+  # luck; any future replica/strategy change — or an overlay that overrides it like
+  # the old dev overlay did (maxSurge:0/maxUnavailable:1) — would empty the paperclip
+  # Service endpoint on every rollout/restart/eviction and return external Traefik
+  # 502s on all routes (incl /health). Pinning maxSurge:1/maxUnavailable:0 guarantees
+  # a new Ready pod binds :3100 before the old one is removed.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
   selector:
     matchLabels:
       app: paperclip
@@ -61,9 +74,14 @@ spec:
             requests:
               cpu: 250m
               memory: 512Mi
+              # ELI-911: reserve node ephemeral storage for the /tmp + /app/data
+              # emptyDir budget so a noisy /tmp cannot trip a node-level DiskPressure
+              # eviction (which, at replicas:1, reproduces the same external 502 gap).
+              ephemeral-storage: "3Gi"
             limits:
               cpu: "2"
               memory: 2Gi
+              ephemeral-storage: "5Gi"
           readinessProbe:
             tcpSocket:
               port: 3100
@@ -95,7 +113,10 @@ spec:
       volumes:
         - name: tmp
           emptyDir:
-            sizeLimit: 1Gi
+            # ELI-911: raise /tmp cap. Root fs is read-only (readOnlyRootFilesystem:
+            # true), so the app writes scratch/uploads to /tmp; the old 1Gi cap
+            # evicted the pod, which at replicas:1 caused the external 502 gap.
+            sizeLimit: 3Gi
         - name: data
           emptyDir:
             sizeLimit: 1Gi
