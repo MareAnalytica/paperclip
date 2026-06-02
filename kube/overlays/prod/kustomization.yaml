@@ -8,4 +8,28 @@ resources:
 
 images:
   - name: registry.mareanalytica.com/paperclip
-    newTag: latest
+    # ELI-911 / Option B (code-neutral prod hardening): pin prod to its
+    # CURRENTLY-RUNNING image *digest* instead of the mutable `:latest` tag.
+    #
+    # Why: the kube/base zero-downtime rollout + /tmp/ephemeral-storage hardening
+    # (PR #94, commit 18f88aa7) is inherited by this overlay with no resource
+    # patches, so applying this overlay rolls the prod Deployment. With
+    # `newTag: latest` + `imagePullPolicy: Always`, that roll would pull whatever
+    # `:latest` is in the registry NOW — and `_build.yml` only ever pushes the
+    # single mutable `:latest` tag (shared by dev main-merges AND prod `v*`
+    # releases), so `:latest` today is ~1055 commits ahead of prod. Rolling prod
+    # to it would ship the entire main delta with no clean rollback. Pinning the
+    # digest makes the hardening apply CODE-NEUTRAL: the rollout topology + /tmp
+    # fix land while the running image stays byte-identical to prod today.
+    #
+    # The running digest is addressable ONLY by digest (no immutable `v*` image
+    # tag exists). OPERATOR with prod-cluster access must replace the placeholder
+    # below with the live digest before this PR leaves draft / is applied:
+    #   kubectl -n paperclip get pod -l app.kubernetes.io/name=paperclip \
+    #     -o jsonpath='{.items[0].status.containerStatuses[0].imageID}'
+    # -> yields registry.mareanalytica.com/paperclip@sha256:<digest>; use the
+    #    sha256:<digest> portion below.
+    #
+    # The all-zero placeholder is intentionally non-pullable (fail-safe:
+    # ImagePullBackOff, never a silent main-delta ship) and MUST NOT be applied.
+    digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
