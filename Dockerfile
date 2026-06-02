@@ -61,17 +61,32 @@ ARG USER_GID=1000
 WORKDIR /app
 COPY --chown=node:node --from=build /app /app
 ARG KUBECTL_VERSION=v1.34.4
-RUN npm install --global --omit=dev @anthropic-ai/claude-code@latest @openai/codex@latest opencode-ai \
-  && apt-get update \
+
+# DEE-708: split the former single ~745 MB production layer into smaller per-tool
+# layers. A single 745 MB blob PUT crossed the registry ingress' ~60s proxy timeout
+# (the registry pod is CPU-limited to 200m and streams the sha256 at ~8 MB/s),
+# causing repeated client-disconnect / HTTP 499 push failures that blocked all image
+# promotion. Keeping each global npm CLI / kubectl / apt set in its own layer keeps
+# every blob comfortably under the timeout — with no shared registry/ingress change.
+
+# Runtime system packages (apt update+install+clean stay in one layer per apt best practice).
+RUN apt-get update \
   && apt-get install -y --no-install-recommends openssh-client jq \
   && rm -rf /var/lib/apt/lists/* \
-  && curl -fsSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl" -o /usr/local/bin/kubectl \
+  && mkdir -p /paperclip \
+  && chown node:node /paperclip
+
+# kubectl in its own layer (~50 MB), checksum-verified.
+RUN curl -fsSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl" -o /usr/local/bin/kubectl \
   && curl -fsSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl.sha256" -o /tmp/kubectl.sha256 \
   && echo "$(cat /tmp/kubectl.sha256)  /usr/local/bin/kubectl" | sha256sum -c - \
   && chmod +x /usr/local/bin/kubectl \
-  && rm /tmp/kubectl.sha256 \
-  && mkdir -p /paperclip \
-  && chown node:node /paperclip
+  && rm /tmp/kubectl.sha256
+
+# Global CLIs — one package per layer so no single blob approaches the registry timeout.
+RUN npm install --global --omit=dev @anthropic-ai/claude-code@latest
+RUN npm install --global --omit=dev @openai/codex@latest
+RUN npm install --global --omit=dev opencode-ai
 
 COPY scripts/docker-entrypoint.sh /usr/local/bin/
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
