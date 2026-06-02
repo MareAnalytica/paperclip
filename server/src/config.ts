@@ -85,6 +85,10 @@ export interface Config {
   feedbackExportBackendToken: string | undefined;
   heartbeatSchedulerEnabled: boolean;
   heartbeatSchedulerIntervalMs: number;
+  schedulerLeaderElectionEnabled: boolean;
+  schedulerLeaderElectionPollMs: number;
+  schedulerLeaderLockClassId: number;
+  schedulerLeaderLockObjId: number;
   companyDeletionEnabled: boolean;
   telemetryEnabled: boolean;
 }
@@ -331,6 +335,19 @@ export function loadConfig(): Config {
     feedbackExportBackendToken,
     heartbeatSchedulerEnabled: process.env.HEARTBEAT_SCHEDULER_ENABLED !== "false",
     heartbeatSchedulerIntervalMs: Math.max(10000, Number(process.env.HEARTBEAT_SCHEDULER_INTERVAL_MS) || 30000),
+    // Single-leader guard for the heartbeat scheduler so paperclip can run with
+    // replicas>1 safely (DEE-699). Opt-in: defaults OFF to preserve exact
+    // single-replica behavior; the replicas:2 + PDB overlay (DEE-696) flips this
+    // to "true" alongside the replica bump. When enabled, exactly one pod holds a
+    // session-scoped pg_advisory_lock and runs timers/reconcilers/dispatch while
+    // every pod keeps serving HTTP + /api/health.
+    schedulerLeaderElectionEnabled: process.env.SCHEDULER_LEADER_ELECTION_ENABLED === "true",
+    schedulerLeaderElectionPollMs: Math.max(1000, Number(process.env.SCHEDULER_LEADER_ELECTION_POLL_MS) || 5000),
+    // Two-int advisory-lock key space (distinct from the single-bigint key space
+    // used by plugin migrations, so there is no collision). Overridable only to
+    // resolve an accidental clash; the default pair is the canonical scheduler key.
+    schedulerLeaderLockClassId: Number(process.env.SCHEDULER_LEADER_LOCK_CLASS_ID) || 0x70636c70, // "pclp"
+    schedulerLeaderLockObjId: Number(process.env.SCHEDULER_LEADER_LOCK_OBJ_ID) || 0x73636864, // "schd"
     companyDeletionEnabled,
     telemetryEnabled: fileConfig?.telemetry?.enabled ?? true,
   };

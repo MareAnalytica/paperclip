@@ -40,6 +40,7 @@ import {
   routineService,
 } from "./services/index.js";
 import { ceoBlockedSweepService } from "./services/ceo-blocked-sweep.js";
+import { createSchedulerLeaderElection, type SchedulerLeaderElection } from "./services/leader-election.js";
 import { createFeedbackTraceShareClientFromConfig } from "./services/feedback-share-client.js";
 import { ensureSystemPeerIssueUser } from "./services/peer-issue-system-user.js";
 import { initCeoFlowPolicy } from "./services/ceo-flow-policy.js";
@@ -725,6 +726,7 @@ export async function startServer(): Promise<StartedServer> {
       logger.error({ err }, "startup reconciliation of cloud upstream runs failed");
     });
   
+  let schedulerLeaderElection: SchedulerLeaderElection | null = null;
   if (config.heartbeatSchedulerEnabled) {
     const heartbeat = heartbeatService(db as any, { pluginWorkerManager });
     const routines = routineService(db as any, { pluginWorkerManager });
@@ -739,78 +741,87 @@ export async function startServer(): Promise<StartedServer> {
       };
     };
 
-    // Startup: reconcile sweep routines across all companies so a process
-    // restart or settings-change picks up the current expected state.
-    void ceoBlockedSweep
-      .reconcileAllCompanies({
-        experimentalSettings: sweepExperimentalSettings,
-        listCompanyIds: () => settingsForSweep.listCompanyIds(),
-      })
-      .then((r) => {
-        if (r.created > 0 || r.updated > 0 || r.removed > 0) {
-          logger.info({ ...r }, "startup CEO blocked-sweep reconciliation changed routines");
-        }
-      })
-      .catch((err) => {
-        logger.error({ err }, "startup CEO blocked-sweep reconciliation failed");
-      });
-  
-    // Reap orphaned running runs at startup while in-memory execution state is empty,
-    // then resume any persisted queued runs that were waiting on the previous process.
-    void heartbeat
-      .reapOrphanedRuns()
-      .then(() => heartbeat.reapStaleScheduledRetryCheckouts())
-      .then((reaped) => {
-        if (reaped.reaped > 0) {
-          logger.warn({ ...reaped }, "startup reaped stale scheduled_retry issue checkouts");
-        }
-        return heartbeat.promoteDueScheduledRetries();
-      })
-      .then(async (promotion) => {
-        await heartbeat.resumeQueuedRuns();
-        const reconciled = await heartbeat.reconcileStrandedAssignedIssues();
-        if (
-          promotion.promoted > 0 ||
-          reconciled.assignmentDispatched > 0 ||
-          reconciled.dispatchRequeued > 0 ||
-          reconciled.continuationRequeued > 0 ||
-          reconciled.successfulRunHandoffEscalated > 0 ||
-          reconciled.escalated > 0
-        ) {
-          logger.warn(
-            { promotedScheduledRetries: promotion.promoted, promotedScheduledRetryRunIds: promotion.runIds, ...reconciled },
-            "startup heartbeat recovery changed assigned issue state",
-          );
-        }
-      })
-      .then(async () => {
-        const reconciled = await heartbeat.reconcileStrandedBlockedCeoParents();
-        if (reconciled.wakesEmitted > 0) {
-          logger.warn({ ...reconciled }, "stranded_blocked_ceo_parent reconciliation emitted wakes");
-        }
-      })
-      .then(async () => {
-        const reconciled = await heartbeat.reconcileIssueGraphLiveness();
-        if (reconciled.escalationsCreated > 0) {
-          logger.warn({ ...reconciled }, "startup issue-graph liveness reconciliation created escalations");
-        }
-      })
-      .then(async () => {
-        const scanned = await heartbeat.scanSilentActiveRuns();
-        if (scanned.created > 0 || scanned.escalated > 0) {
-          logger.warn({ ...scanned }, "startup active-run output watchdog created review work");
-        }
-      })
-      .then(async () => {
-        const reviewed = await heartbeat.reconcileProductivityReviews();
-        if (reviewed.created > 0 || reviewed.updated > 0 || reviewed.failed > 0) {
-          logger.warn({ ...reviewed }, "startup productivity reconciliation created or updated review work");
-        }
-      })
-      .catch((err) => {
-        logger.error({ err }, "startup heartbeat recovery failed");
-      });
-    setInterval(() => {
+    // The heartbeat scheduler performs every timer/reconciler/dispatch
+    // side-effect. Under replicas>1 these must run on exactly one pod (DEE-699);
+    // the optional leader-election guard below enforces that while every pod
+    // keeps serving HTTP + /api/health. Startup recovery runs once per
+    // leadership acquisition: at process boot for a single leader, or at
+    // promotion for a survivor (which then reaps the dead leader's orphans).
+    const runSchedulerStartupRecovery = () => {
+      // Reconcile sweep routines across all companies so a process restart or
+      // settings-change picks up the current expected state.
+      void ceoBlockedSweep
+        .reconcileAllCompanies({
+          experimentalSettings: sweepExperimentalSettings,
+          listCompanyIds: () => settingsForSweep.listCompanyIds(),
+        })
+        .then((r) => {
+          if (r.created > 0 || r.updated > 0 || r.removed > 0) {
+            logger.info({ ...r }, "startup CEO blocked-sweep reconciliation changed routines");
+          }
+        })
+        .catch((err) => {
+          logger.error({ err }, "startup CEO blocked-sweep reconciliation failed");
+        });
+
+      // Reap orphaned running runs at startup while in-memory execution state is empty,
+      // then resume any persisted queued runs that were waiting on the previous process.
+      void heartbeat
+        .reapOrphanedRuns()
+        .then(() => heartbeat.reapStaleScheduledRetryCheckouts())
+        .then((reaped) => {
+          if (reaped.reaped > 0) {
+            logger.warn({ ...reaped }, "startup reaped stale scheduled_retry issue checkouts");
+          }
+          return heartbeat.promoteDueScheduledRetries();
+        })
+        .then(async (promotion) => {
+          await heartbeat.resumeQueuedRuns();
+          const reconciled = await heartbeat.reconcileStrandedAssignedIssues();
+          if (
+            promotion.promoted > 0 ||
+            reconciled.assignmentDispatched > 0 ||
+            reconciled.dispatchRequeued > 0 ||
+            reconciled.continuationRequeued > 0 ||
+            reconciled.successfulRunHandoffEscalated > 0 ||
+            reconciled.escalated > 0
+          ) {
+            logger.warn(
+              { promotedScheduledRetries: promotion.promoted, promotedScheduledRetryRunIds: promotion.runIds, ...reconciled },
+              "startup heartbeat recovery changed assigned issue state",
+            );
+          }
+        })
+        .then(async () => {
+          const reconciled = await heartbeat.reconcileStrandedBlockedCeoParents();
+          if (reconciled.wakesEmitted > 0) {
+            logger.warn({ ...reconciled }, "stranded_blocked_ceo_parent reconciliation emitted wakes");
+          }
+        })
+        .then(async () => {
+          const reconciled = await heartbeat.reconcileIssueGraphLiveness();
+          if (reconciled.escalationsCreated > 0) {
+            logger.warn({ ...reconciled }, "startup issue-graph liveness reconciliation created escalations");
+          }
+        })
+        .then(async () => {
+          const scanned = await heartbeat.scanSilentActiveRuns();
+          if (scanned.created > 0 || scanned.escalated > 0) {
+            logger.warn({ ...scanned }, "startup active-run output watchdog created review work");
+          }
+        })
+        .then(async () => {
+          const reviewed = await heartbeat.reconcileProductivityReviews();
+          if (reviewed.created > 0 || reviewed.updated > 0 || reviewed.failed > 0) {
+            logger.warn({ ...reviewed }, "startup productivity reconciliation created or updated review work");
+          }
+        })
+        .catch((err) => {
+          logger.error({ err }, "startup heartbeat recovery failed");
+        });
+    };
+
+    const runSchedulerPeriodicTick = () => {
       void heartbeat
         .tickTimers(new Date())
         .then((result) => {
@@ -850,7 +861,7 @@ export async function startServer(): Promise<StartedServer> {
         .catch((err) => {
           logger.error({ err }, "ceo blocked-sweep tick failed");
         });
-  
+
       // Periodically reap orphaned runs (5-min staleness threshold) and make sure
       // persisted queued work is still being driven forward.
       void heartbeat
@@ -906,6 +917,42 @@ export async function startServer(): Promise<StartedServer> {
         .catch((err) => {
           logger.error({ err }, "periodic heartbeat recovery failed");
         });
+    };
+
+    if (config.schedulerLeaderElectionEnabled) {
+      // replicas>1: exactly one pod runs the scheduler. The lock auto-releases on
+      // connection drop, so a survivor is promoted and reaps the dead leader's runs.
+      schedulerLeaderElection = createSchedulerLeaderElection({
+        connectionString: activeDatabaseConnectionString,
+        classId: config.schedulerLeaderLockClassId,
+        objId: config.schedulerLeaderLockObjId,
+        pollIntervalMs: config.schedulerLeaderElectionPollMs,
+        logger,
+        onAcquire: () => {
+          runSchedulerStartupRecovery();
+        },
+        onLose: () => {
+          logger.warn(
+            { reason: "leadership_lost" },
+            "scheduler leadership lost; this pod paused timers/reconcilers/dispatch until re-acquired",
+          );
+        },
+      });
+      schedulerLeaderElection.start();
+      logger.info(
+        { pollIntervalMs: config.schedulerLeaderElectionPollMs },
+        "heartbeat scheduler leader-election enabled (replicas>1 safe)",
+      );
+    } else {
+      // Single-replica behavior (default): this pod always runs the scheduler.
+      runSchedulerStartupRecovery();
+    }
+
+    setInterval(() => {
+      // When leader-election is active, only the elected leader runs the tick;
+      // followers keep serving HTTP and skip the scheduler body cheaply.
+      if (schedulerLeaderElection && !schedulerLeaderElection.isLeader()) return;
+      runSchedulerPeriodicTick();
     }, config.heartbeatSchedulerIntervalMs);
   }
   
@@ -1004,6 +1051,16 @@ export async function startServer(): Promise<StartedServer> {
 
       const appShutdown = (app as { locals?: { paperclipShutdown?: () => void } }).locals?.paperclipShutdown;
       appShutdown?.();
+
+      // Release scheduler leadership promptly so a surviving replica is promoted
+      // on its next poll instead of waiting for Postgres to detect the dead session.
+      if (schedulerLeaderElection) {
+        try {
+          await schedulerLeaderElection.stop();
+        } catch (err) {
+          logger.error({ err }, "Failed to release scheduler leadership on shutdown");
+        }
+      }
 
       if (embeddedPostgres && embeddedPostgresStartedByThisProcess) {
         logger.info({ signal }, "Stopping embedded PostgreSQL");
