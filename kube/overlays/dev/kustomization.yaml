@@ -7,8 +7,6 @@ namespace: paperclip-dev
 
 resources:
   - ../../base
-  # DEE-696: PDB only applies in dev (replicas:2); meaningless at base replicas:1.
-  - poddisruptionbudget.yaml
 
 images:
   # DEE-695 (DEE-694/DEE-692 class): pin the dev image to a verified digest instead
@@ -62,15 +60,25 @@ patches:
       metadata:
         name: paperclip
       spec:
-        # DEE-696 (safety-gated on DEE-699/DEE-700): scale dev to 2 replicas for
-        # availability hardening so a rolling/hung pod never zeroes the Service
-        # endpoint (paired with the PodDisruptionBudget below, which is meaningless
-        # at replicas:1). SAFE only because the heartbeat scheduler now runs behind
-        # the SCHEDULER_LEADER_ELECTION_ENABLED pg_advisory_lock single-leader guard
-        # (DEE-699 #102) + the inline run-execution leader gate (DEE-700 #103): every
-        # pod serves HTTP+/api/health, but exactly one runs timers/reconcilers/
-        # dispatch, so a second replica cannot double-run heartbeat wakeups.
-        replicas: 2
+        # DEE-696 (CEO decision option B, 2026-06-02): dev stays at replicas:1.
+        # The leader-election safety gate (DEE-699 #102 pg_advisory_lock + DEE-700
+        # #103 inline run-execution gate) is complete and runtime-verified, so
+        # replicas>1 is now SAFE in principle. But in THIS single-node dev cluster
+        # the second replica buys ~zero resilience and cannot reliably schedule:
+        #   - paperclip-home-pvc is RWO + node-pinned to `liquidmetallabs`, so every
+        #     replica lands on the same node -> no node-failure resilience, only
+        #     pod-restart resilience (already delivered by the DEE-695 httpGet
+        #     liveness probe).
+        #   - the node sits at ~99% memory; a 2nd ~725Mi pod stays Pending
+        #     (Insufficient memory), which deadlocks the maxUnavailable:0 rollout and
+        #     makes the CI->Dev rollout-wait time out by design (DEE-704).
+        # So we revert to replicas:1 (clean, schedulable, single advisory-lock
+        # leader). The SCHEDULER_LEADER_ELECTION_ENABLED flag below is kept ON: it is
+        # harmless at replicas:1 (the single pod simply becomes the leader) and means
+        # any future RWX/right-sized multi-replica env can flip replicas>1 with the
+        # gate already satisfied. Capacity follow-up tracked separately (node
+        # saturation), deploy reliability under DEE-704.
+        replicas: 1
         # ELI-903: zero-downtime rollout. With replicas:1, maxSurge:0+maxUnavailable:1
         # tore the only pod down BEFORE its replacement bound :3100, leaving the
         # Service endpoint empty on every rollout/restart -> external Traefik 502
