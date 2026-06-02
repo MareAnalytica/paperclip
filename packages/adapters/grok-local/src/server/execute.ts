@@ -205,6 +205,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const permissionMode = asString(config.permissionMode, "dontAsk").trim() || "dontAsk";
   const reasoningEffort = asString(config.reasoningEffort, "").trim();
   const maxTurns = asNumber(config.maxTurns, 0);
+  const outputFormat = asString(config.outputFormat, "streaming-json").trim() || "streaming-json";
   const alwaysApprove = asBoolean(config.alwaysApprove, true);
   const disableWebSearch = asBoolean(config.disableWebSearch, true);
 
@@ -429,7 +430,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     };
 
     const buildArgs = (resumeSessionId: string | null) => {
-      const args = ["--cwd", effectiveExecutionCwd, "--output-format", "streaming-json"];
+      const args = ["--cwd", effectiveExecutionCwd, "--output-format", outputFormat];
       if (resumeSessionId) args.push("--resume", resumeSessionId);
       if (model && model !== DEFAULT_GROK_LOCAL_MODEL) args.push("--model", model);
       if (reasoningEffort) args.push("--reasoning-effort", reasoningEffort);

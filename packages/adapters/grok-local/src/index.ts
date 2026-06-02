@@ -29,8 +29,9 @@ Core fields:
 - permissionMode (string, optional): Grok permission mode. Defaults to \`dontAsk\`
 - reasoningEffort (string, optional): Grok reasoning effort passed via \`--reasoning-effort\`
 - maxTurns (number, optional): maximum agent turns for the run
+- outputFormat (string, optional): value passed to \`--output-format\` for the streaming event mode that the parser supports. Allowed: \`streaming-json\` (default), \`stream-json\`. Defaults to \`streaming-json\`. Set to \`stream-json\` on hosts whose \`grok\` CLI only accepts that spelling for the streaming-jsonl mode (prevents launch \`adapter_failed\`). Non-streaming \`json\`/\`text\` are accepted by some grok CLIs but are not supported here (parser expects streaming events; would lose sessionId/summary).
 - command (string, optional): defaults to "grok"
-- extraArgs (string[], optional): additional CLI args
+- extraArgs (string[], optional): additional CLI args (note: outputFormat is applied first; put other flags here)
 - env (object, optional): KEY=VALUE environment variables
 
 Operational fields:
@@ -38,7 +39,9 @@ Operational fields:
 - graceSec (number, optional): SIGTERM grace period in seconds
 
 Notes:
-- Runs use \`grok --single\` with \`--output-format streaming-json\`.
+- Runs use \`grok --single\` with \`--output-format <outputFormat>\` (default \`streaming-json\`; override per-host via config if the local grok CLI requires \`stream-json\` spelling for its streaming mode).
+- Only streaming-compatible values are supported (parser requires thought/text/end events); this makes launch flag choice a governed adapter policy detail for provider-fallback (ELI-880-G).
+- Adapter launch is resilient to grok CLI version differences in flag spelling for the streaming output mode (addresses launch invariants surfaced in recovery runs).
 - Sessions resume with \`--resume <sessionId>\` when the saved session cwd matches the current cwd.
 - Paperclip stages desired runtime skills into \`.claude/skills\` inside the execution workspace so Grok discovers them as project skills.
 - Use \`grok models\` to inspect authentication and available models on the host.

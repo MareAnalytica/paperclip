@@ -486,6 +486,7 @@ export interface CreateConfigValues {
   command: string;
   args: string;
   extraArgs: string;
+  outputFormat?: string;
   envVars: string;
   envBindings: Record<string, unknown>;
   url: string;

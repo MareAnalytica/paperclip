@@ -69,6 +69,7 @@ export function buildGrokLocalConfig(v: CreateConfigValues): Record<string, unkn
   if (Object.keys(env).length > 0) ac.env = env;
 
   if (v.command) ac.command = v.command;
+  if (v.outputFormat) ac.outputFormat = v.outputFormat;
   if (v.extraArgs) ac.extraArgs = parseCommaArgs(v.extraArgs);
   return ac;
 }

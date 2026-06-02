@@ -106,6 +106,7 @@ export async function testEnvironment(
   const checks: AdapterEnvironmentCheck[] = [];
   const config = parseObject(ctx.config);
   const command = asString(config.command, "grok");
+  const outputFormat = asString(config.outputFormat, "streaming-json").trim() || "streaming-json";
   const target = ctx.executionTarget ?? null;
   const targetIsRemote = target?.kind === "remote";
   const cwd = resolveAdapterExecutionTargetCwd(target, asString(config.cwd, ""), process.cwd());
@@ -243,7 +244,7 @@ export async function testEnvironment(
   if (canRunProbe) {
     const probeArgs = [
       "--output-format",
-      "streaming-json",
+      outputFormat,
       "--always-approve",
       "--permission-mode",
       "dontAsk",

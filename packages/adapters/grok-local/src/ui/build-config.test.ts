@@ -9,6 +9,7 @@ describe("buildGrokLocalConfig", () => {
       model: "grok-build",
       thinkingEffort: "high",
       envVars: "XAI_API_KEY=secret\n",
+      outputFormat: "stream-json",
       extraArgs: "--check, --verbatim",
     } as never)).toEqual({
       cwd: "/tmp/project",
@@ -17,6 +18,7 @@ describe("buildGrokLocalConfig", () => {
       timeoutSec: 0,
       graceSec: 20,
       reasoningEffort: "high",
+      outputFormat: "stream-json",
       env: {
         XAI_API_KEY: { type: "plain", value: "secret" },
       },
