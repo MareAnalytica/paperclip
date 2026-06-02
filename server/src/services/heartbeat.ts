@@ -176,6 +176,8 @@ import {
   policyForCompany,
   resolveProviderFallbackEscalation,
   resolveProviderFallbackAccountCooldown,
+  resolveProviderFallbackLimitMarkers,
+  matchesConfiguredLimitMarker,
   type ProviderFallbackNotifyKind,
 } from "./provider-fallback-policy.js";
 import {
@@ -351,15 +353,49 @@ function readTransientRecoveryContractFromRun(
     : null;
 }
 
-function isProviderFallbackEligibleError(run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode" | "resultJson">) {
+// Build the failure message/status text the §3 safety-net classifier matches
+// `limitMarkers` against (ELI-902 / G2). Scoped to the failure *message/status*
+// fields — the top-level run error, the adapter-surfaced resultJson error/message,
+// and the errorCode — not full stdout/stderr, so unrelated agent output mentioning
+// "rate limit" cannot spuriously trigger a hop.
+function readProviderFallbackFailureText(
+  run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode" | "resultJson" | "error">,
+): string {
+  const resultJson = parseObject(run.resultJson);
+  return [
+    readNonEmptyString(run.error),
+    readNonEmptyString(resultJson.error),
+    readNonEmptyString(resultJson.message),
+    readNonEmptyString(run.errorCode),
+  ]
+    .filter((part): part is string => Boolean(part))
+    .join("\n");
+}
+
+export function isProviderFallbackEligibleError(
+  run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode" | "resultJson" | "error">,
+  // Engine-level safety-net markers (ELI-902 / G2). Consulted only when the
+  // active adapter produced no native usage-limit classification; native
+  // detection (transient_upstream / known errorCodes) always wins.
+  limitMarkers: readonly string[] = [],
+) {
   const errorCode = readNonEmptyString(run.errorCode);
   if (readHeartbeatRunErrorFamily(run) === "transient_upstream") return true;
-  if (!errorCode) return false;
-  return (
-    errorCode.includes("auth") ||
-    errorCode.includes("session") ||
-    errorCode === "claude_usage_limit"
-  );
+  if (
+    errorCode &&
+    (errorCode.includes("auth") ||
+      errorCode.includes("session") ||
+      errorCode === "claude_usage_limit")
+  ) {
+    return true;
+  }
+  // Safety-net: the adapter missed it (no native limit classification above).
+  // Test the failure message/status against the configured markers so an adapter
+  // in the chain with no native detection still hops on a real usage limit.
+  if (matchesConfiguredLimitMarker(readProviderFallbackFailureText(run), limitMarkers)) {
+    return true;
+  }
+  return false;
 }
 
 function mergeAdapterRecoveryMetadata(input: {
@@ -5810,7 +5846,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const priorFallbackId = readNonEmptyString(priorFallbackSelection.id);
     const shouldAttemptProviderFallback =
       retryReason === BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON &&
-      isProviderFallbackEligibleError(run);
+      isProviderFallbackEligibleError(run, resolveProviderFallbackLimitMarkers(agent.companyId));
     const nextProviderFallback = shouldAttemptProviderFallback
       ? selectNextProviderFallbackEntry({
           chain: providerFallbackChain,
@@ -9107,7 +9143,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           }
         } else if (
           outcome === "failed" &&
-          (readTransientRecoveryContractFromRun(livenessRun) || isProviderFallbackEligibleError(livenessRun))
+          (readTransientRecoveryContractFromRun(livenessRun) ||
+            isProviderFallbackEligibleError(
+              livenessRun,
+              resolveProviderFallbackLimitMarkers(agent.companyId),
+            ))
         ) {
           await scheduleBoundedRetryForRun(livenessRun, agent);
         }

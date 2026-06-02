@@ -10,10 +10,13 @@ import {
   computePolicyHash,
   initProviderFallbackPolicy,
   loadProviderFallbackPolicyFromString,
+  matchesConfiguredLimitMarker,
   parseProviderFallbackPolicy,
   policyForCompany,
+  PROVIDER_FALLBACK_DEFAULT_LIMIT_MARKERS,
   reloadProviderFallbackPolicy,
   resolveProviderFallbackEscalation,
+  resolveProviderFallbackLimitMarkers,
   selectNextProviderFallbackEntry,
 } from "../services/provider-fallback-policy.js";
 import { enforceFallbackAdapterCommand } from "../services/heartbeat.js";
@@ -320,6 +323,107 @@ describe("provider-fallback-policy", () => {
       const escalation = resolveProviderFallbackEscalation("any-company", resolved);
       expect(escalation.retryAfterMinutesDefault).toBe(30);
       expect(escalation.boardEscalation).toEqual({ enabled: true, notifyKind: "wake" });
+    });
+  });
+
+  describe("§2.1 limitMarkers safety-net config (ELI-902 / G2)", () => {
+    it("defaults limitMarkers to the spec §2.1 list", () => {
+      const resolved = builtinDefaultProviderFallbackPolicy();
+      expect(resolved.limitMarkers).toEqual([...PROVIDER_FALLBACK_DEFAULT_LIMIT_MARKERS]);
+      // Spec §2.1 default list, verbatim.
+      expect(resolved.limitMarkers).toEqual([
+        "usage limit",
+        "rate limit",
+        "max reached",
+        "quota exceeded",
+        "insufficient_quota",
+        "429",
+        "529",
+        "overloaded",
+      ]);
+    });
+
+    it("omitting limitDetection.limitMarkers keeps the spec §2.1 defaults", () => {
+      const resolved = parseProviderFallbackPolicy({
+        schemaVersion: "1",
+        providerFallback: {
+          default: { chain: [{ id: "codex-local", adapter: "codex_local" }] },
+          limitDetection: { retryAfterMinutesDefault: 90 },
+        },
+      });
+      expect(resolved.limitMarkers).toEqual([...PROVIDER_FALLBACK_DEFAULT_LIMIT_MARKERS]);
+    });
+
+    it("loads, lowercases, trims, and de-duplicates a configured limitMarkers list", () => {
+      const resolved = parseProviderFallbackPolicy({
+        schemaVersion: "1",
+        providerFallback: {
+          default: { chain: [{ id: "codex-local", adapter: "codex_local" }] },
+          limitDetection: {
+            limitMarkers: ["  USAGE Limit ", "Throttled", "throttled", "TOO MANY REQUESTS"],
+          },
+        },
+      });
+      expect(resolved.limitMarkers).toEqual(["usage limit", "throttled", "too many requests"]);
+    });
+
+    it("rejects a non-array limitMarkers", () => {
+      expect(() =>
+        parseProviderFallbackPolicy({
+          schemaVersion: "1",
+          providerFallback: {
+            default: { chain: [{ id: "codex-local", adapter: "codex_local" }] },
+            limitDetection: { limitMarkers: "usage limit" },
+          },
+        }),
+      ).toThrow(/limitMarkers must be an array of non-empty strings/);
+    });
+
+    it("rejects an empty or blank-only limitMarkers list", () => {
+      expect(() =>
+        parseProviderFallbackPolicy({
+          schemaVersion: "1",
+          providerFallback: {
+            default: { chain: [{ id: "codex-local", adapter: "codex_local" }] },
+            limitDetection: { limitMarkers: [] },
+          },
+        }),
+      ).toThrow(/limitMarkers must contain at least one non-empty marker/);
+      expect(() =>
+        parseProviderFallbackPolicy({
+          schemaVersion: "1",
+          providerFallback: {
+            default: { chain: [{ id: "codex-local", adapter: "codex_local" }] },
+            limitDetection: { limitMarkers: ["   "] },
+          },
+        }),
+      ).toThrow(/limitMarkers must be an array of non-empty strings/);
+    });
+
+    it("resolveProviderFallbackLimitMarkers returns the resolved company-wide markers", () => {
+      const resolved = parseProviderFallbackPolicy({
+        schemaVersion: "1",
+        providerFallback: {
+          default: { chain: [{ id: "codex-local", adapter: "codex_local" }] },
+          limitDetection: { limitMarkers: ["custom marker"] },
+        },
+      });
+      expect(resolveProviderFallbackLimitMarkers("any-company", resolved)).toEqual([
+        "custom marker",
+      ]);
+    });
+
+    it("matchesConfiguredLimitMarker is case-insensitive substring matching", () => {
+      const markers = [...PROVIDER_FALLBACK_DEFAULT_LIMIT_MARKERS];
+      expect(matchesConfiguredLimitMarker("Provider returned 429 Too Many Requests", markers)).toBe(
+        true,
+      );
+      expect(matchesConfiguredLimitMarker("Model OVERLOADED, retry later", markers)).toBe(true);
+      expect(matchesConfiguredLimitMarker("TypeError: cannot read property", markers)).toBe(false);
+      // No markers configured → never matches (safety net is off).
+      expect(matchesConfiguredLimitMarker("usage limit reached", [])).toBe(false);
+      // Empty failure text → never matches.
+      expect(matchesConfiguredLimitMarker("", markers)).toBe(false);
     });
   });
 
