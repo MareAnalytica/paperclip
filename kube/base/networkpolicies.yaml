@@ -13,7 +13,7 @@ spec:
     - Ingress
     - Egress
 ---
-# Allow ingress from ingress-nginx namespace to paperclip pods on port 3100
+# Allow ingress from kube-system (traefik controller ns) to paperclip pods on port 3100. ELI-903: was "ingress-nginx" (common nginx-ingress default) but this cluster runs traefik in kube-system; default-deny + mismatch = external 502 despite healthy endpoints/pod.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -32,7 +32,7 @@ spec:
     - from:
         - namespaceSelector:
             matchLabels:
-              kubernetes.io/metadata.name: ingress-nginx
+              kubernetes.io/metadata.name: kube-system
       ports:
         - protocol: TCP
           port: 3100
