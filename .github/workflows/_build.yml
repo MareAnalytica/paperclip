@@ -84,6 +84,32 @@ jobs:
           SHORT_SHA="${GIT_SHA:0:12}"
           DIGESTS_JSON='{}'
 
+          # DEE-708: large-layer pushes can hit transient client-disconnect / HTTP 499
+          # drops on the registry ingress path. Retry the push with linear backoff so a
+          # transient drop self-heals instead of failing the whole image promotion.
+          # (The Dockerfile also splits the formerly oversized layer so blobs stay small;
+          # this retry is defense-in-depth for the residual marginal-capacity edge.)
+          # On success the final push output is emitted on stdout (so the caller can parse
+          # the digest); retry/diagnostic lines go to stderr.
+          push_with_retry() {
+            local ref="$1" attempt=1 max=4 out=""
+            while :; do
+              if out="$(docker push "${ref}" 2>&1)"; then
+                printf '%s\n' "${out}"
+                return 0
+              fi
+              printf '%s\n' "${out}" >&2
+              if [ "${attempt}" -ge "${max}" ]; then
+                echo "✗ push of ${ref} failed after ${max} attempts" >&2
+                return 1
+              fi
+              local sleep_s=$((attempt * 15))
+              echo "↻ push of ${ref} failed (attempt ${attempt}/${max}); retrying in ${sleep_s}s..." >&2
+              sleep "${sleep_s}"
+              attempt=$((attempt + 1))
+            done
+          }
+
           for i in "${!NAMES[@]}"; do
             name="${NAMES[$i]}"
             context="${CONTEXTS[$i]}"
@@ -105,9 +131,9 @@ jobs:
             echo "══════════════════════════════════════════"
             docker build -t "${tag_latest}" -t "${tag_sha}" -f "${dockerfile}" "${context}"
 
-            docker push "${tag_latest}"
+            push_with_retry "${tag_latest}"
             # Push the immutable tag and capture the digest from push output.
-            push_out="$(docker push "${tag_sha}")"
+            push_out="$(push_with_retry "${tag_sha}")"
             echo "${push_out}"
             digest="$(echo "${push_out}" | sed -n 's/.*[[:space:]]digest:[[:space:]]\(sha256:[0-9a-f]\{64\}\).*/\1/p' | head -1)"
             if [ -z "${digest}" ]; then
