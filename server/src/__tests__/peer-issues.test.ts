@@ -72,7 +72,7 @@ async function makeGrant(
   agentId: string,
   targetCompanyId: string,
   scopes: string[],
-  overrides: { expiresAt?: Date | null; revokedAt?: Date | null } = {},
+  overrides: { expiresAt?: Date | null; revokedAt?: Date | null; maxUses?: number | null } = {},
 ) {
   return db
     .insert(agentPeerGrants)
@@ -83,6 +83,7 @@ async function makeGrant(
       grantedByUserId: "board",
       expiresAt: overrides.expiresAt ?? null,
       revokedAt: overrides.revokedAt ?? null,
+      maxUses: overrides.maxUses ?? null,
     })
     .returning()
     .then((rows) => rows[0]!);
@@ -461,5 +462,107 @@ describeEmbeddedPostgres("peer-issue service (spec §6)", () => {
     expect(inbound).toHaveLength(1);
     expect(outbound).toHaveLength(1);
     expect(inbound[0]!.id).toBe(outbound[0]!.id);
+  });
+});
+
+describeEmbeddedPostgres("peerGrantService.findActiveGrant single-use enforcement (ELI-386, spec §3/§5.5/§8 O1)", () => {
+  let db!: ReturnType<typeof createDb>;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+  let grants!: ReturnType<typeof peerGrantService>;
+  let source!: Awaited<ReturnType<typeof makeCompany>>;
+  let target!: Awaited<ReturnType<typeof makeCompany>>;
+  let agent!: Awaited<ReturnType<typeof makeAgent>>;
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-peer-grant-uses-");
+    db = createDb(tempDb.connectionString);
+    grants = peerGrantService(db);
+  }, 30_000);
+
+  beforeEach(async () => {
+    source = await makeCompany(db, "Source");
+    target = await makeCompany(db, "Target");
+    agent = await makeAgent(db, source.id, "general", "Requester");
+  });
+
+  afterEach(async () => {
+    await db.delete(agentPeerGrants);
+    await db.delete(agents);
+    await db.delete(companies);
+  });
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  });
+
+  async function usesCountOf(grantId: string) {
+    const [row] = await db
+      .select({ usesCount: agentPeerGrants.usesCount })
+      .from(agentPeerGrants)
+      .where(eq(agentPeerGrants.id, grantId));
+    return row!.usesCount;
+  }
+
+  it("null maxUses (legacy) grants unlimited uses but still tracks usesCount", async () => {
+    const grant = await makeGrant(db, agent.id, target.id, ["peer_issue:create"], { maxUses: null });
+    for (let i = 0; i < 5; i++) {
+      const found = await grants.findActiveGrant(agent.id, target.id, "peer_issue:create");
+      expect(found?.id).toBe(grant.id);
+    }
+    expect(await usesCountOf(grant.id)).toBe(5);
+  });
+
+  it("single-use grant (maxUses=1) is consumed on first lookup and inactive thereafter", async () => {
+    const grant = await makeGrant(db, agent.id, target.id, ["peer_issue:create"], { maxUses: 1 });
+    const first = await grants.findActiveGrant(agent.id, target.id, "peer_issue:create");
+    expect(first?.id).toBe(grant.id);
+    expect(first?.usesCount).toBe(1);
+    const second = await grants.findActiveGrant(agent.id, target.id, "peer_issue:create");
+    expect(second).toBeNull();
+    expect(await usesCountOf(grant.id)).toBe(1);
+  });
+
+  it("limited-use grant (maxUses=N) stays active for exactly N lookups", async () => {
+    const grant = await makeGrant(db, agent.id, target.id, ["peer_issue:create"], { maxUses: 3 });
+    for (let i = 1; i <= 3; i++) {
+      const found = await grants.findActiveGrant(agent.id, target.id, "peer_issue:create");
+      expect(found?.usesCount).toBe(i);
+    }
+    expect(await grants.findActiveGrant(agent.id, target.id, "peer_issue:create")).toBeNull();
+    expect(await usesCountOf(grant.id)).toBe(3);
+  });
+
+  it("concurrent lookups on a single-use grant only consume it once", async () => {
+    const grant = await makeGrant(db, agent.id, target.id, ["peer_issue:create"], { maxUses: 1 });
+    const results = await Promise.all(
+      Array.from({ length: 8 }, () => grants.findActiveGrant(agent.id, target.id, "peer_issue:create")),
+    );
+    const wins = results.filter((r) => r !== null);
+    expect(wins).toHaveLength(1);
+    expect(await usesCountOf(grant.id)).toBe(1);
+  });
+
+  it("scope mismatch does not consume a use", async () => {
+    const grant = await makeGrant(db, agent.id, target.id, ["peer_issue:create"], { maxUses: 1 });
+    expect(await grants.findActiveGrant(agent.id, target.id, "peer_issue:comment")).toBeNull();
+    expect(await usesCountOf(grant.id)).toBe(0);
+  });
+
+  it("expired grant does not consume a use", async () => {
+    const grant = await makeGrant(db, agent.id, target.id, ["peer_issue:create"], {
+      maxUses: 1,
+      expiresAt: new Date(Date.now() - 60_000),
+    });
+    expect(await grants.findActiveGrant(agent.id, target.id, "peer_issue:create")).toBeNull();
+    expect(await usesCountOf(grant.id)).toBe(0);
+  });
+
+  it("revoked grant does not consume a use", async () => {
+    const grant = await makeGrant(db, agent.id, target.id, ["peer_issue:create"], {
+      maxUses: 1,
+      revokedAt: new Date(),
+    });
+    expect(await grants.findActiveGrant(agent.id, target.id, "peer_issue:create")).toBeNull();
+    expect(await usesCountOf(grant.id)).toBe(0);
   });
 });

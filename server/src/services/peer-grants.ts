@@ -1,4 +1,4 @@
-import { and, eq, isNull, gt, or, desc } from "drizzle-orm";
+import { and, eq, isNull, gt, or, desc, inArray, sql } from "drizzle-orm";
 import { agentPeerGrants, agents, type Db } from "@paperclipai/db";
 import { badRequest, notFound } from "../errors.js";
 
@@ -19,6 +19,12 @@ export interface PeerGrantInput {
   grantedByUserId: string;
   expiresAt?: Date | null;
   notes?: string | null;
+  /**
+   * Server-enforced per-grant use cap (spec §8 O1). null => legacy TTL-only
+   * (unlimited uses). CEO-minted grants default to single-use via the request
+   * policy, so this is set on the approval path.
+   */
+  maxUses?: number | null;
 }
 
 export function peerGrantService(db: Db) {
@@ -55,6 +61,7 @@ export function peerGrantService(db: Db) {
           grantedByUserId: input.grantedByUserId,
           expiresAt: input.expiresAt ?? null,
           notes: input.notes ?? null,
+          maxUses: input.maxUses ?? null,
         })
         .returning();
       return row;
@@ -91,7 +98,19 @@ export function peerGrantService(db: Db) {
 
     /**
      * Look up the active grant (if any) that authorizes `agentId` to act against
-     * `targetCompanyId` with the required scope.
+     * `targetCompanyId` with the required scope, and atomically consume one use.
+     *
+     * Single-use / limited-use enforcement (spec §3, §5.5, §8 O1): a grant with a
+     * non-null `maxUses` is active only while `usesCount < maxUses`. A successful
+     * lookup increments `usesCount` in the same statement, so the Nth+1 call to a
+     * grant with `maxUses = N` returns null. Grants with `maxUses = null` keep the
+     * legacy TTL-only behavior (unlimited uses; `usesCount` still tracked).
+     *
+     * The lookup targets the newest non-revoked grant only (matching the prior
+     * selection semantics — it does not fall through to older grants). Because the
+     * `usesCount < maxUses` predicate is in the outer UPDATE WHERE, concurrent calls
+     * cannot both consume the final use: Postgres re-checks the predicate against the
+     * row each transaction locks, so the loser updates zero rows and returns null.
      */
     findActiveGrant: async (
       agentId: string,
@@ -99,8 +118,8 @@ export function peerGrantService(db: Db) {
       requiredScope: PeerGrantScope,
     ) => {
       const now = new Date();
-      const row = await db
-        .select()
+      const newestNonRevoked = db
+        .select({ id: agentPeerGrants.id })
         .from(agentPeerGrants)
         .where(and(
           eq(agentPeerGrants.agentId, agentId),
@@ -108,11 +127,21 @@ export function peerGrantService(db: Db) {
           isNull(agentPeerGrants.revokedAt),
         ))
         .orderBy(desc(agentPeerGrants.createdAt))
-        .then((rows) => rows[0] ?? null);
-      if (!row) return null;
-      if (row.expiresAt && row.expiresAt.getTime() <= now.getTime()) return null;
-      if (!row.scopes.includes(requiredScope)) return null;
-      return row;
+        .limit(1);
+      const [row] = await db
+        .update(agentPeerGrants)
+        .set({ usesCount: sql`${agentPeerGrants.usesCount} + 1` })
+        .where(and(
+          inArray(agentPeerGrants.id, newestNonRevoked),
+          or(isNull(agentPeerGrants.expiresAt), gt(agentPeerGrants.expiresAt, now))!,
+          sql`${requiredScope} = ANY(${agentPeerGrants.scopes})`,
+          or(
+            isNull(agentPeerGrants.maxUses),
+            sql`${agentPeerGrants.usesCount} < ${agentPeerGrants.maxUses}`,
+          )!,
+        ))
+        .returning();
+      return row ?? null;
     },
   };
 }

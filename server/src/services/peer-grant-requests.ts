@@ -1,14 +1,15 @@
 import { createHash } from "node:crypto";
-import { and, eq } from "drizzle-orm";
+import { and, desc, eq } from "drizzle-orm";
 import {
   agents,
+  agentPeerGrants,
   companies,
   issues,
   peerGrantRequests,
   type Db,
 } from "@paperclipai/db";
-import { badRequest, forbidden, notFound } from "../errors.js";
-import { isValidPeerGrantScope, type PeerGrantScope } from "./peer-grants.js";
+import { badRequest, conflict, forbidden, notFound } from "../errors.js";
+import { isValidPeerGrantScope, peerGrantService, type PeerGrantScope } from "./peer-grants.js";
 import { issueThreadInteractionService } from "./issue-thread-interactions.js";
 import { heartbeatService } from "./heartbeat.js";
 import { logActivity } from "./activity-log.js";
@@ -127,6 +128,26 @@ export interface PeerGrantRequestCreateResult {
   wokeApproverIds: string[];
 }
 
+export type PeerGrantRow = typeof agentPeerGrants.$inferSelect;
+
+/** Identity of the agent deciding a request (the source-company approver). */
+export interface PeerGrantDecider {
+  agentId: string;
+  runId?: string | null;
+}
+
+export interface PeerGrantRequestDecisionResult {
+  request: PeerGrantRequestRow;
+  grant: PeerGrantRow | null;
+  wokeRequester: boolean;
+}
+
+export interface PeerGrantRequestListOptions {
+  /** `source` => requests this company originated (CEO inbox/history); `target` => requests aimed at this company. */
+  direction?: "source" | "target";
+  status?: string;
+}
+
 function isPendingDedupeConflict(error: unknown): boolean {
   if (typeof error !== "object" || error === null) return false;
   const err = error as { code?: string; constraint?: string; constraint_name?: string };
@@ -142,6 +163,7 @@ function clampOptional(value: number | null | undefined, max: number): number | 
 export function peerGrantRequestService(db: Db) {
   const interactions = issueThreadInteractionService(db);
   const heartbeat = heartbeatService(db);
+  const grants = peerGrantService(db);
 
   async function findPendingByDedupeKey(dedupeKey: string): Promise<PeerGrantRequestRow | null> {
     return db
@@ -152,6 +174,111 @@ export function peerGrantRequestService(db: Db) {
         eq(peerGrantRequests.status, "pending"),
       ))
       .then((rows) => rows[0] ?? null);
+  }
+
+  async function getRequestOrThrow(requestId: string): Promise<PeerGrantRequestRow> {
+    const row = await db
+      .select()
+      .from(peerGrantRequests)
+      .where(eq(peerGrantRequests.id, requestId))
+      .then((rows) => rows[0] ?? null);
+    if (!row) throw notFound("Peer-grant request not found");
+    return row;
+  }
+
+  /**
+   * Authorize a decision actor as the source-company approver (spec §5.3): an agent
+   * whose company is the request's source company and whose role matches the source
+   * company's `peerGrantPolicy.approverRole` (default `ceo`). Deliberately NOT
+   * `assertBoard` — this is the new CEO gate, and the board approval invariant for the
+   * generic `approvals` resource stays untouched.
+   */
+  async function authorizeApprover(
+    request: PeerGrantRequestRow,
+    approverAgentId: string,
+  ): Promise<PeerGrantPolicy> {
+    const approver = await db
+      .select({ id: agents.id, companyId: agents.companyId, role: agents.role })
+      .from(agents)
+      .where(eq(agents.id, approverAgentId))
+      .then((rows) => rows[0] ?? null);
+    if (!approver) throw forbidden("Approver agent not found");
+    const policy = await peerGrantRequestService(db).resolvePolicyForCompany(request.sourceCompanyId);
+    if (approver.companyId !== request.sourceCompanyId || approver.role !== policy.approverRole) {
+      throw forbidden(`Only a ${policy.approverRole} agent in the source company may decide this request`);
+    }
+    return policy;
+  }
+
+  /**
+   * Best-effort: drive the linked CEO decision card to a terminal state so it clears
+   * from the inbox. The request row is the source of truth, so a card already resolved
+   * by a parallel UI flow (or a missing source issue) must not fail the decision.
+   */
+  async function resolveDecisionCard(
+    request: PeerGrantRequestRow,
+    approverAgentId: string,
+    decision: "approve" | "reject",
+    note: string | null,
+  ): Promise<void> {
+    if (!request.interactionId) return;
+    const sourceIssue = await db
+      .select({ id: issues.id, companyId: issues.companyId, projectId: issues.projectId, goalId: issues.goalId })
+      .from(issues)
+      .where(eq(issues.identifier, request.sourceIssueIdentifier))
+      .then((rows) => rows[0] ?? null);
+    if (!sourceIssue) return;
+    try {
+      if (decision === "approve") {
+        await interactions.acceptInteraction(sourceIssue, request.interactionId, {}, { agentId: approverAgentId });
+      } else {
+        await interactions.rejectInteraction(
+          { id: sourceIssue.id, companyId: sourceIssue.companyId },
+          request.interactionId,
+          { reason: note ?? undefined },
+          { agentId: approverAgentId },
+        );
+      }
+    } catch (err) {
+      logger.warn({ err, requestId: request.id, interactionId: request.interactionId },
+        "peer_grant_request decision card resolution failed");
+    }
+  }
+
+  /** Wake the original requester after a decision (approval_approved / rejected pattern). */
+  async function wakeRequester(
+    request: PeerGrantRequestRow,
+    reason: string,
+    extra: Record<string, unknown>,
+  ): Promise<boolean> {
+    const sourceIssue = await db
+      .select({ id: issues.id })
+      .from(issues)
+      .where(eq(issues.identifier, request.sourceIssueIdentifier))
+      .then((rows) => rows[0] ?? null);
+    try {
+      await heartbeat.wakeup(request.requestedByAgentId, {
+        source: "automation",
+        triggerDetail: "callback",
+        reason,
+        payload: {
+          issueId: sourceIssue?.id ?? null,
+          issueIdentifier: request.sourceIssueIdentifier,
+          requestId: request.id,
+          targetCompanyId: request.targetCompanyId,
+          scopes: request.scopes,
+          status: request.status,
+          ...extra,
+        },
+        requestedByActorType: "system",
+        requestedByActorId: "peer-grant-request",
+      });
+      return true;
+    } catch (err) {
+      logger.warn({ err, agentId: request.requestedByAgentId, requestId: request.id },
+        "peer_grant_request requester wake failed");
+      return false;
+    }
   }
 
   return {
@@ -366,6 +493,165 @@ export function peerGrantRequestService(db: Db) {
       }
 
       return { request, replayed: false, interactionId: interaction.id, wokeApproverIds };
+    },
+
+    /**
+     * CEO approval (spec §5.3, §7). Mints a narrow, time-boxed, single-use-by-default
+     * `agent_peer_grants` row keyed to the exact (agent, targetCompany, scopes) the
+     * request named, links it back to the request, resolves the decision card, wakes
+     * the requester, and activity-logs on the source company. Idempotency: a request
+     * already decided returns `409` rather than minting a second grant.
+     */
+    approve: async (
+      requestId: string,
+      approver: PeerGrantDecider,
+      opts?: { decisionNote?: string | null },
+    ): Promise<PeerGrantRequestDecisionResult> => {
+      const request = await getRequestOrThrow(requestId);
+      if (request.status !== "pending") {
+        throw conflict(`Peer-grant request already ${request.status}`);
+      }
+      const policy = await authorizeApprover(request, approver.agentId);
+
+      const scopes = request.scopes.filter(isValidPeerGrantScope) as PeerGrantScope[];
+      if (scopes.length === 0) throw badRequest("Request has no valid scopes to grant");
+
+      const now = new Date();
+      const ttlSeconds = Math.min(
+        request.requestedTtlSeconds ?? policy.defaultGrantTtlSeconds,
+        policy.maxGrantTtlSeconds,
+      );
+      const expiresAt = new Date(now.getTime() + ttlSeconds * 1000);
+      const maxUses = Math.min(
+        request.requestedUses ?? policy.defaultGrantUses,
+        policy.maxGrantUses,
+      );
+
+      const grant = await grants.create(request.targetCompanyId, {
+        agentId: request.requestedByAgentId,
+        scopes,
+        grantedByUserId: `agent:${approver.agentId}`,
+        expiresAt,
+        maxUses,
+        notes: `peer_grant_request:${request.id}`,
+      });
+
+      const [updated] = await db
+        .update(peerGrantRequests)
+        .set({
+          status: "approved",
+          grantId: grant.id,
+          decidedByAgentId: approver.agentId,
+          decidedAt: now,
+          decisionNote: opts?.decisionNote ?? null,
+          updatedAt: now,
+        })
+        .where(and(eq(peerGrantRequests.id, request.id), eq(peerGrantRequests.status, "pending")))
+        .returning();
+      if (!updated) throw conflict("Peer-grant request already decided");
+
+      await resolveDecisionCard(updated, approver.agentId, "approve", opts?.decisionNote ?? null);
+
+      await logActivity(db, {
+        companyId: request.sourceCompanyId,
+        actorType: "agent",
+        actorId: approver.agentId,
+        agentId: approver.agentId,
+        runId: approver.runId ?? null,
+        action: "peer_grant_request.approved",
+        entityType: "peer_grant_request",
+        entityId: request.id,
+        details: {
+          grantId: grant.id,
+          decidedByAgentId: approver.agentId,
+          targetCompanyId: request.targetCompanyId,
+          scopes,
+          ttlSeconds,
+          maxUses,
+        },
+      });
+
+      const wokeRequester = await wakeRequester(updated, "peer_grant_request_approved", {
+        grantId: grant.id,
+        expiresAt: expiresAt.toISOString(),
+        maxUses,
+      });
+
+      return { request: updated, grant, wokeRequester };
+    },
+
+    /**
+     * CEO rejection (spec §5.3, §7). No grant minted; records the decision, resolves
+     * the decision card, wakes the requester with reason `peer_grant_request_rejected`,
+     * and activity-logs on the source company.
+     */
+    reject: async (
+      requestId: string,
+      approver: PeerGrantDecider,
+      opts?: { decisionNote?: string | null },
+    ): Promise<PeerGrantRequestDecisionResult> => {
+      const request = await getRequestOrThrow(requestId);
+      if (request.status !== "pending") {
+        throw conflict(`Peer-grant request already ${request.status}`);
+      }
+      await authorizeApprover(request, approver.agentId);
+
+      const now = new Date();
+      const [updated] = await db
+        .update(peerGrantRequests)
+        .set({
+          status: "rejected",
+          decidedByAgentId: approver.agentId,
+          decidedAt: now,
+          decisionNote: opts?.decisionNote ?? null,
+          updatedAt: now,
+        })
+        .where(and(eq(peerGrantRequests.id, request.id), eq(peerGrantRequests.status, "pending")))
+        .returning();
+      if (!updated) throw conflict("Peer-grant request already decided");
+
+      await resolveDecisionCard(updated, approver.agentId, "reject", opts?.decisionNote ?? null);
+
+      await logActivity(db, {
+        companyId: request.sourceCompanyId,
+        actorType: "agent",
+        actorId: approver.agentId,
+        agentId: approver.agentId,
+        runId: approver.runId ?? null,
+        action: "peer_grant_request.rejected",
+        entityType: "peer_grant_request",
+        entityId: request.id,
+        details: { decidedByAgentId: approver.agentId, decisionNote: opts?.decisionNote ?? null },
+      });
+
+      const wokeRequester = await wakeRequester(updated, "peer_grant_request_rejected", {
+        reason: opts?.decisionNote ?? null,
+      });
+
+      return { request: updated, grant: null, wokeRequester };
+    },
+
+    /**
+     * List requests for a company (spec §5.4): `direction=source` is the CEO inbox +
+     * source-issue history (requests this company originated); `direction=target` lists
+     * requests aimed at this company. Optional `status` filter.
+     */
+    list: async (
+      companyId: string,
+      opts?: PeerGrantRequestListOptions,
+    ): Promise<PeerGrantRequestRow[]> => {
+      const direction = opts?.direction ?? "source";
+      const conds = [
+        direction === "target"
+          ? eq(peerGrantRequests.targetCompanyId, companyId)
+          : eq(peerGrantRequests.sourceCompanyId, companyId),
+      ];
+      if (opts?.status) conds.push(eq(peerGrantRequests.status, opts.status));
+      return db
+        .select()
+        .from(peerGrantRequests)
+        .where(and(...conds))
+        .orderBy(desc(peerGrantRequests.createdAt));
     },
   };
 }
