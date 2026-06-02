@@ -2362,6 +2362,7 @@ export function agentRoutes(
       details: {
         canCreateAgents: agent.permissions?.canCreateAgents ?? false,
         canAssignTasks: effectiveCanAssignTasks,
+        canForceRelease: agent.permissions?.canForceRelease ?? false,
       },
     });
 

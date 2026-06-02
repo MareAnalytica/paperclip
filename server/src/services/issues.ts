@@ -5008,17 +5008,25 @@ export function issueService(db: Db) {
             id: issues.id,
             checkoutRunId: issues.checkoutRunId,
             executionRunId: issues.executionRunId,
+            executionState: issues.executionState,
           })
           .from(issues)
           .where(eq(issues.id, id))
           .then((rows) => rows[0] ?? null);
         if (!existing) return null;
 
+        // ELI-907/ELI-912: a force-release must fully unwedge the issue. Beyond
+        // the checkout/execution run locks, clear any pending in_review
+        // execution stage (executionState) and its monitor scheduling so a
+        // scheduled_retry run cannot re-arm the review limbo after release.
         const patch: Partial<typeof issues.$inferInsert> = {
           checkoutRunId: null,
           executionRunId: null,
           executionAgentNameKey: null,
           executionLockedAt: null,
+          executionState: null,
+          monitorNextCheckAt: null,
+          monitorWakeRequestedAt: null,
           updatedAt: new Date(),
         };
         if (options.clearAssignee) {
@@ -5039,6 +5047,7 @@ export function issueService(db: Db) {
           previous: {
             checkoutRunId: existing.checkoutRunId,
             executionRunId: existing.executionRunId,
+            hadExecutionState: existing.executionState != null,
           },
         };
       }),

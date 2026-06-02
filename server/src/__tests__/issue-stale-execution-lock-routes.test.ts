@@ -258,6 +258,7 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
     expect(res.body.previous).toEqual({
       checkoutRunId: currentRunId,
       executionRunId: failedRunId,
+      hadExecutionState: false,
     });
 
     const audit = await db
@@ -282,5 +283,173 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
         clearAssignee: true,
       },
     });
+  });
+
+  it("lets a privileged CEO agent force-release a wedged in_review scheduled case and clears executionState", async () => {
+    const { companyId, agentId, failedRunId, currentRunId } = await seedCompanyAgentAndRuns();
+
+    // Privileged CEO/flow-controller agent (role "ceo" => canForceRelease by default).
+    const ceoAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: ceoAgentId,
+      companyId,
+      name: "Mission Owner",
+      role: "ceo",
+      status: "active",
+      adapterType: "process",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    const ceoRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: ceoRunId,
+      companyId,
+      agentId: ceoAgentId,
+      status: "running",
+      invocationSource: "manual",
+      startedAt: new Date(),
+    });
+
+    // Issue wedged in_review: a scheduled_retry run (currentRunId) holds the
+    // checkout, an execution stage is pending, and a monitor wake is armed.
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Wedged in_review scheduled retry",
+      status: "in_review",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: currentRunId,
+      executionRunId: failedRunId,
+      executionAgentNameKey: "codexcoder",
+      executionLockedAt: new Date(),
+      executionState: {
+        status: "pending",
+        currentStageType: "review",
+        currentParticipant: { kind: "agent", agentId },
+      },
+      monitorNextCheckAt: new Date(Date.now() + 60_000),
+      monitorWakeRequestedAt: new Date(),
+    });
+
+    const res = await request(createApp(agentActor(companyId, ceoAgentId, ceoRunId)))
+      .post(`/api/issues/${issueId}/admin/force-release`)
+      .send();
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.issue).toMatchObject({
+      id: issueId,
+      checkoutRunId: null,
+      executionRunId: null,
+      executionLockedAt: null,
+      executionState: null,
+      // assignee preserved when clearAssignee is not requested
+      assigneeAgentId: agentId,
+    });
+    expect(res.body.previous).toMatchObject({
+      checkoutRunId: currentRunId,
+      executionRunId: failedRunId,
+      hadExecutionState: true,
+    });
+
+    const row = await db
+      .select({
+        executionState: issues.executionState,
+        monitorNextCheckAt: issues.monitorNextCheckAt,
+        monitorWakeRequestedAt: issues.monitorWakeRequestedAt,
+        checkoutRunId: issues.checkoutRunId,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row?.executionState).toBeNull();
+    expect(row?.monitorNextCheckAt).toBeNull();
+    expect(row?.monitorWakeRequestedAt).toBeNull();
+    expect(row?.checkoutRunId).toBeNull();
+
+    const audit = await db
+      .select({
+        actorType: activityLog.actorType,
+        actorId: activityLog.actorId,
+        agentId: activityLog.agentId,
+        details: activityLog.details,
+      })
+      .from(activityLog)
+      .where(eq(activityLog.action, "issue.admin_force_release"))
+      .then((rows) => rows[0]);
+    expect(audit).toMatchObject({
+      actorType: "agent",
+      actorId: ceoAgentId,
+      agentId: ceoAgentId,
+      details: {
+        issueId,
+        actorAgentId: ceoAgentId,
+        prevHadExecutionState: true,
+      },
+    });
+  });
+
+  it("forbids a non-privileged agent from force-releasing an in_review issue", async () => {
+    const { companyId, agentId, failedRunId, currentRunId } = await seedCompanyAgentAndRuns();
+
+    // A second, non-privileged agent (engineer role, no canForceRelease).
+    const otherAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: otherAgentId,
+      companyId,
+      name: "OtherCoder",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    const otherRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: otherRunId,
+      companyId,
+      agentId: otherAgentId,
+      status: "running",
+      invocationSource: "manual",
+      startedAt: new Date(),
+    });
+
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Wedged in_review",
+      status: "in_review",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: currentRunId,
+      executionRunId: failedRunId,
+      executionAgentNameKey: "codexcoder",
+      executionLockedAt: new Date(),
+      executionState: { status: "pending", currentStageType: "review" },
+    });
+
+    // Neither the assignee agent nor an unrelated agent may force-release.
+    await request(createApp(agentActor(companyId, agentId, currentRunId)))
+      .post(`/api/issues/${issueId}/admin/force-release`)
+      .expect(403);
+    await request(createApp(agentActor(companyId, otherAgentId, otherRunId)))
+      .post(`/api/issues/${issueId}/admin/force-release`)
+      .expect(403);
+
+    // The lock and execution stage must be untouched after the forbidden calls.
+    const row = await db
+      .select({
+        checkoutRunId: issues.checkoutRunId,
+        executionState: issues.executionState,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row?.checkoutRunId).toBe(currentRunId);
+    expect(row?.executionState).not.toBeNull();
   });
 });
