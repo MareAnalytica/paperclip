@@ -9,8 +9,12 @@ resources:
   - ../../base
 
 images:
+  # DEE-695 (DEE-694/DEE-692 class): pin the dev image to the running, verified digest
+  # instead of the mutable :latest tag. Removes nondeterministic rollouts and the
+  # ~1.3GB re-pull per restart (paired with base imagePullPolicy: IfNotPresent).
+  # Bump this digest deliberately when promoting a new dev build.
   - name: registry.mareanalytica.com/paperclip
-    newTag: latest
+    digest: sha256:b2482205344f5725ba4b38fbdfafe311e288dabd7c5bf253e778c8228516ab10
 
 patches:
   # Override namespace name for dev

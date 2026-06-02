@@ -43,7 +43,11 @@ spec:
       containers:
         - name: paperclip
           image: registry.mareanalytica.com/paperclip:latest
-          imagePullPolicy: Always
+          # DEE-695 (DEE-694/DEE-692 class): pull policy IfNotPresent so a digest-pinned
+          # image (set per-overlay via kustomize `images:`) is not re-pulled (~1.3GB) on
+          # every pod start/rollout and rollouts stay deterministic. With a digest, the
+          # tag here is only a human-readable placeholder; the overlay digest wins.
+          imagePullPolicy: IfNotPresent
           ports:
             - name: http
               containerPort: 3100
@@ -82,23 +86,50 @@ spec:
               cpu: "2"
               memory: 2Gi
               ephemeral-storage: "5Gi"
+          # DEE-695 (DEE-694/DEE-692 class): HTTP-aware probes. A bare `tcpSocket :3100`
+          # only proves the socket is open, so a hung-but-listening pod (event loop
+          # wedged, DB pool exhausted, etc.) stays Ready in the Service endpoints and
+          # external Traefik returns 502 on all routes until a MANUAL `kubectl rollout
+          # restart`. httpGet /api/health makes a wedged pod fail readiness (dropped
+          # from endpoints -> KubeServiceWithNoEndpoints alert) and fail liveness
+          # (automatic restart within the probe budget) with no human in the loop.
+          #
+          # Host header: /api/health sits behind privateHostnameGuard, which 403s any
+          # Host not in PAPERCLIP_ALLOWED_HOSTNAMES *except* loopback. `localhost` is
+          # always allowed, so this is portable across base/dev/prod without an
+          # overlay-specific Host patch (kubelet otherwise sends Host: <podIP> -> 403).
           readinessProbe:
-            tcpSocket:
+            httpGet:
+              path: /api/health
               port: 3100
+              httpHeaders:
+                - name: Host
+                  value: localhost
             initialDelaySeconds: 10
             periodSeconds: 10
+            timeoutSeconds: 5
             failureThreshold: 3
           livenessProbe:
-            tcpSocket:
+            httpGet:
+              path: /api/health
               port: 3100
+              httpHeaders:
+                - name: Host
+                  value: localhost
             initialDelaySeconds: 30
             periodSeconds: 15
+            timeoutSeconds: 5
             failureThreshold: 5
           startupProbe:
-            tcpSocket:
+            httpGet:
+              path: /api/health
               port: 3100
+              httpHeaders:
+                - name: Host
+                  value: localhost
             initialDelaySeconds: 5
             periodSeconds: 5
+            timeoutSeconds: 5
             failureThreshold: 30
           volumeMounts:
             - name: tmp
