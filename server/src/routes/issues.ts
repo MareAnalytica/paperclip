@@ -93,6 +93,7 @@ import {
   SVG_CONTENT_TYPE,
 } from "../attachment-types.js";
 import { queueIssueAssignmentWakeup } from "../services/issue-assignment-wakeup.js";
+import { isCeoHeartbeatControllerAgent } from "../services/heartbeat.js";
 import { assertEnvironmentSelectionForCompany } from "./environment-selection.js";
 import { executionWorkspaceService as executionWorkspaceServiceDirect } from "../services/execution-workspaces.js";
 import { feedbackService } from "../services/feedback.js";
@@ -4745,12 +4746,9 @@ export function issueRoutes(
   });
 
   router.post("/issues/:id/admin/force-release", async (req, res) => {
-    if (req.actor.type !== "board") {
+    if (req.actor.type === "none") {
       res.status(403).json({ error: "Board access required" });
       return;
-    }
-    if (!req.actor.userId) {
-      throw forbidden("Board user context required");
     }
 
     const id = req.params.id as string;
@@ -4760,6 +4758,34 @@ export function issueRoutes(
       return;
     }
     assertCompanyAccess(req, existing.companyId);
+
+    // ELI-907/ELI-912: force-release is the privileged path to unwedge issues
+    // held by scheduled_retry runs or stuck in_review stages. Allow:
+    //   - human board users (unchanged behaviour), and
+    //   - privileged agents: CEO/flow-controller agents, or any agent explicitly
+    //     granted `permissions.canForceRelease` (e.g. a designated ops agent).
+    // Non-privileged agents remain forbidden. Kept config-driven (role +
+    // permission flag) so no agent ids are hard-coded in platform code.
+    if (req.actor.type === "board") {
+      if (!req.actor.userId) {
+        throw forbidden("Board user context required");
+      }
+    } else {
+      const actorAgent = req.actor.agentId
+        ? await agentsSvc.getById(req.actor.agentId)
+        : null;
+      const privileged = Boolean(
+        actorAgent
+          && actorAgent.companyId === existing.companyId
+          && (actorAgent.permissions?.canForceRelease
+            || isCeoHeartbeatControllerAgent(actorAgent)),
+      );
+      if (!privileged) {
+        throw forbidden(
+          "Force-release requires a board user or a privileged (CEO / canForceRelease) agent",
+        );
+      }
+    }
 
     const clearAssignee = req.query.clearAssignee === "true";
     const result = await svc.adminForceRelease(id, { clearAssignee });
@@ -4780,9 +4806,11 @@ export function issueRoutes(
       entityId: result.issue.id,
       details: {
         issueId: result.issue.id,
-        actorUserId: req.actor.userId,
+        actorUserId: req.actor.userId ?? null,
+        actorAgentId: req.actor.type === "agent" ? req.actor.agentId ?? null : null,
         prevCheckoutRunId: result.previous.checkoutRunId,
         prevExecutionRunId: result.previous.executionRunId,
+        prevHadExecutionState: result.previous.hadExecutionState,
         clearAssignee,
       },
     });

@@ -158,6 +158,10 @@ export type TestAdapterEnvironment = z.infer<typeof testAdapterEnvironmentSchema
 export const updateAgentPermissionsSchema = z.object({
   canCreateAgents: z.boolean(),
   canAssignTasks: z.boolean(),
+  // ELI-912: lets a CEO grant a designated ops agent the privileged
+  // force-release capability (unwedging stuck checkouts / in_review stages).
+  // Optional so existing callers that only manage create/assign keep working.
+  canForceRelease: z.boolean().optional(),
 });
 
 export type UpdateAgentPermissions = z.infer<typeof updateAgentPermissionsSchema>;
