@@ -12,6 +12,11 @@ import {
 // detection: it is consulted only when the active adapter produced no native
 // usage-limit classification, and it tests the failure message/status against the
 // configured `limitMarkers`.
+//
+// NOTE (ELI-901): `isProviderFallbackEligibleError(run, authMode, limitMarkers)`
+// carries the auth model as its second arg (G1). These G2 cases pass `null`
+// (the oauth-session default) so the safety-net assertions are unaffected by the
+// auth gate; the raw-key/auth precedence is pinned in provider-fallback-runtime.
 
 const DEFAULT_MARKERS = [...PROVIDER_FALLBACK_DEFAULT_LIMIT_MARKERS];
 
@@ -56,9 +61,9 @@ describe("provider-fallback limitMarkers safety-net + chain-coverage (ELI-902 / 
         const run = bareAdapterFailureRun(REPRESENTATIVE_LIMIT_FAILURE[adapter]);
         // Without the safety net (no markers) a non-detecting adapter would fail
         // the run instead of hopping — that is the G2 gap.
-        expect(isProviderFallbackEligibleError(run, [])).toBe(false);
+        expect(isProviderFallbackEligibleError(run, null, [])).toBe(false);
         // With the configured markers the engine hops for every chain adapter.
-        expect(isProviderFallbackEligibleError(run, DEFAULT_MARKERS)).toBe(true);
+        expect(isProviderFallbackEligibleError(run, null, DEFAULT_MARKERS)).toBe(true);
       },
     );
   });
@@ -70,26 +75,26 @@ describe("provider-fallback limitMarkers safety-net + chain-coverage (ELI-902 / 
         error: null,
         resultJson: { errorFamily: "transient_upstream" } as Record<string, unknown>,
       };
-      expect(isProviderFallbackEligibleError(run, [])).toBe(true);
+      expect(isProviderFallbackEligibleError(run, null, [])).toBe(true);
     });
 
     it("auth/session/claude_usage_limit errorCodes stay eligible (native path unchanged)", () => {
       for (const errorCode of ["claude_auth_required", "codex_session_expired", "claude_usage_limit"]) {
         expect(
-          isProviderFallbackEligibleError({ errorCode, error: null, resultJson: null }, []),
+          isProviderFallbackEligibleError({ errorCode, error: null, resultJson: null }, null, []),
         ).toBe(true);
       }
     });
 
     it("the safety net only catches what the adapter missed — a non-limit failure does not hop", () => {
       const run = bareAdapterFailureRun("TypeError: cannot read properties of undefined");
-      expect(isProviderFallbackEligibleError(run, DEFAULT_MARKERS)).toBe(false);
+      expect(isProviderFallbackEligibleError(run, null, DEFAULT_MARKERS)).toBe(false);
     });
 
     it("the safety net is off when no markers are configured", () => {
       const run = bareAdapterFailureRun("usage limit reached");
-      expect(isProviderFallbackEligibleError(run, [])).toBe(false);
-      expect(isProviderFallbackEligibleError(run, DEFAULT_MARKERS)).toBe(true);
+      expect(isProviderFallbackEligibleError(run, null, [])).toBe(false);
+      expect(isProviderFallbackEligibleError(run, null, DEFAULT_MARKERS)).toBe(true);
     });
 
     it("matches the limit marker in the errorCode/status as well as the message", () => {
@@ -98,7 +103,7 @@ describe("provider-fallback limitMarkers safety-net + chain-coverage (ELI-902 / 
         error: null,
         resultJson: null,
       };
-      expect(isProviderFallbackEligibleError(run, DEFAULT_MARKERS)).toBe(true);
+      expect(isProviderFallbackEligibleError(run, null, DEFAULT_MARKERS)).toBe(true);
     });
   });
 });
