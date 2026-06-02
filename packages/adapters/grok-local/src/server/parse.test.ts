@@ -29,7 +29,7 @@ describe("parseGrokJsonl", () => {
     expect(parsed.errorMessage).toBe("Authentication required");
   });
 
-  it("separates reasoning turns that grok streaming-json glues together", () => {
+  it("separates reasoning turns that grok stream-json glues together", () => {
     // PAPA-349: at turn boundaries grok drops the newline between turns; the
     // aggregated thought should still read as two paragraphs.
     const parsed = parseGrokJsonl([
