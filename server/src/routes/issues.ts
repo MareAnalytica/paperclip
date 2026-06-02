@@ -2073,6 +2073,29 @@ export function issueRoutes(
     res.json({ count });
   });
 
+  router.get("/companies/:companyId/issues/stale-scheduled-retry-checkouts", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    const includeAll = req.query.includeAll !== "false";
+    const thresholdRaw = req.query.thresholdMs;
+    const thresholdMs =
+      typeof thresholdRaw === "string" && thresholdRaw.trim().length > 0 && Number.isFinite(Number(thresholdRaw))
+        ? Math.max(0, Number(thresholdRaw))
+        : undefined;
+    const limitRaw = req.query.limit;
+    const limit =
+      typeof limitRaw === "string" && limitRaw.trim().length > 0 && Number.isFinite(Number(limitRaw))
+        ? Math.max(1, Math.min(1000, Math.floor(Number(limitRaw))))
+        : undefined;
+    const items = await heartbeat.scanStaleScheduledRetryCheckouts({
+      companyId,
+      includeAll,
+      thresholdMs,
+      limit,
+    });
+    res.json({ items });
+  });
+
   router.get("/companies/:companyId/labels", async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);

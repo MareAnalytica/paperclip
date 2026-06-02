@@ -6406,6 +6406,257 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     };
   }
 
+  const REAPER_STALE_SCHEDULED_RETRY_CHECKOUT_MS = 15 * 60 * 1000;
+
+  type StaleScheduledRetryCheckout = {
+    companyId: string;
+    issueId: string;
+    issueIdentifier: string | null;
+    issueStatus: string;
+    assigneeAgentId: string | null;
+    runId: string;
+    agentId: string;
+    holdKind: "checkout" | "execution";
+    scheduledRetryAt: string | null;
+    scheduledRetryAttempt: number;
+    scheduledRetryReason: string | null;
+    executionLockedAt: string | null;
+    checkoutHoldDurationMs: number | null;
+    scheduledRetryAgeMs: number | null;
+    overdueBeyondThreshold: boolean;
+  };
+
+  // ELI-913: Detect issue checkout/execution locks held by a `scheduled_retry`
+  // heartbeat run. A scheduled_retry run that re-arms indefinitely (e.g. across
+  // transient ingress errors) can hold issue.checkoutRunId / executionRunId for
+  // an unbounded time. Because release is assignee-only and review-stage advance
+  // is currentParticipant-only, even the CEO cannot clear it (ELI-907). This
+  // read-only scan powers both CEO sweeps (observability: checkout hold duration
+  // + scheduled-retry age) and the reaper below, so both see one consistent set.
+  async function scanStaleScheduledRetryCheckouts(options?: {
+    companyId?: string;
+    now?: Date;
+    thresholdMs?: number;
+    includeAll?: boolean;
+    limit?: number;
+  }): Promise<StaleScheduledRetryCheckout[]> {
+    const now = options?.now ?? new Date();
+    const thresholdMs = Math.max(
+      0,
+      options?.thresholdMs ?? REAPER_STALE_SCHEDULED_RETRY_CHECKOUT_MS,
+    );
+    const limit = Math.max(1, Math.min(options?.limit ?? 200, 1000));
+    const includeAll = options?.includeAll === true;
+
+    const where = [eq(heartbeatRuns.status, "scheduled_retry")];
+    if (options?.companyId) {
+      where.push(eq(issues.companyId, options.companyId));
+    }
+
+    const rows = await db
+      .select({
+        companyId: issues.companyId,
+        issueId: issues.id,
+        issueIdentifier: issues.identifier,
+        issueStatus: issues.status,
+        assigneeAgentId: issues.assigneeAgentId,
+        checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId,
+        executionLockedAt: issues.executionLockedAt,
+        runId: heartbeatRuns.id,
+        agentId: heartbeatRuns.agentId,
+        scheduledRetryAt: heartbeatRuns.scheduledRetryAt,
+        scheduledRetryAttempt: heartbeatRuns.scheduledRetryAttempt,
+        scheduledRetryReason: heartbeatRuns.scheduledRetryReason,
+      })
+      .from(issues)
+      .innerJoin(
+        heartbeatRuns,
+        and(
+          eq(heartbeatRuns.companyId, issues.companyId),
+          or(
+            eq(issues.checkoutRunId, heartbeatRuns.id),
+            eq(issues.executionRunId, heartbeatRuns.id),
+          )!,
+        ),
+      )
+      .where(and(...where))
+      .orderBy(asc(heartbeatRuns.scheduledRetryAt), asc(issues.id))
+      .limit(limit);
+
+    const results: StaleScheduledRetryCheckout[] = [];
+    for (const row of rows) {
+      const scheduledRetryAtMs = row.scheduledRetryAt
+        ? new Date(row.scheduledRetryAt).getTime()
+        : null;
+      const scheduledRetryAgeMs =
+        scheduledRetryAtMs !== null ? now.getTime() - scheduledRetryAtMs : null;
+      const executionLockedAtMs = row.executionLockedAt
+        ? new Date(row.executionLockedAt).getTime()
+        : null;
+      const checkoutHoldDurationMs =
+        executionLockedAtMs !== null ? now.getTime() - executionLockedAtMs : null;
+      // Safety: only "stale" when the retry is overdue (in the past) by more
+      // than the threshold. Future-due / near-due runs are never stale.
+      const overdueBeyondThreshold =
+        scheduledRetryAgeMs !== null && scheduledRetryAgeMs > thresholdMs;
+      if (!includeAll && !overdueBeyondThreshold) continue;
+      results.push({
+        companyId: row.companyId,
+        issueId: row.issueId,
+        issueIdentifier: row.issueIdentifier,
+        issueStatus: row.issueStatus,
+        assigneeAgentId: row.assigneeAgentId,
+        runId: row.runId,
+        agentId: row.agentId,
+        holdKind: row.checkoutRunId === row.runId ? "checkout" : "execution",
+        scheduledRetryAt:
+          scheduledRetryAtMs !== null ? new Date(scheduledRetryAtMs).toISOString() : null,
+        scheduledRetryAttempt: row.scheduledRetryAttempt,
+        scheduledRetryReason: row.scheduledRetryReason,
+        executionLockedAt:
+          executionLockedAtMs !== null ? new Date(executionLockedAtMs).toISOString() : null,
+        checkoutHoldDurationMs,
+        scheduledRetryAgeMs,
+        overdueBeyondThreshold,
+      });
+    }
+    return results;
+  }
+
+  // ELI-913: Reap issue checkout/execution locks held by an overdue
+  // `scheduled_retry` heartbeat run. For each candidate it (1) terminalizes the
+  // wedged run (status=cancelled, errorCode=`reaper_stale_scheduled`) and
+  // (2) clears the issue lock (checkoutRunId / executionRunId / executionLockedAt)
+  // in one row-locked transaction, then emits an audit run event + cancels the
+  // pending wake. The assignee and issue status are preserved so the
+  // reconcileStrandedAssignedIssues pass (which runs immediately after in the
+  // scheduler tick) re-dispatches the work. Safety invariants: only acts on runs
+  // still in `scheduled_retry`, only when the retry is overdue beyond the
+  // threshold, and only while the issue still holds the lock — all re-checked
+  // under the row lock to avoid racing a concurrent promotion or fresh checkout.
+  async function reapStaleScheduledRetryCheckouts(options?: {
+    now?: Date;
+    thresholdMs?: number;
+    companyId?: string;
+    limit?: number;
+  }) {
+    const now = options?.now ?? new Date();
+    const thresholdMs = Math.max(
+      0,
+      options?.thresholdMs ?? REAPER_STALE_SCHEDULED_RETRY_CHECKOUT_MS,
+    );
+    const candidates = await scanStaleScheduledRetryCheckouts({
+      now,
+      thresholdMs,
+      companyId: options?.companyId,
+      limit: options?.limit,
+      includeAll: false,
+    });
+
+    const reapedRunIds: string[] = [];
+    const reapedIssueIds: string[] = [];
+
+    for (const candidate of candidates) {
+      const cleared = await db.transaction(async (tx) => {
+        await tx.execute(
+          sql`select id from heartbeat_runs where id = ${candidate.runId} for update`,
+        );
+        const run = await tx
+          .select({
+            id: heartbeatRuns.id,
+            status: heartbeatRuns.status,
+            scheduledRetryAt: heartbeatRuns.scheduledRetryAt,
+          })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, candidate.runId))
+          .then((rows) => rows[0] ?? null);
+        if (!run || run.status !== "scheduled_retry") return null;
+        const scheduledRetryAtMs = run.scheduledRetryAt
+          ? new Date(run.scheduledRetryAt).getTime()
+          : null;
+        if (scheduledRetryAtMs === null || now.getTime() - scheduledRetryAtMs <= thresholdMs) {
+          return null;
+        }
+
+        await tx.execute(
+          sql`select id from issues where id = ${candidate.issueId} for update`,
+        );
+        const issue = await tx
+          .select({
+            id: issues.id,
+            checkoutRunId: issues.checkoutRunId,
+            executionRunId: issues.executionRunId,
+          })
+          .from(issues)
+          .where(eq(issues.id, candidate.issueId))
+          .then((rows) => rows[0] ?? null);
+        if (!issue) return null;
+        const holdsCheckout = issue.checkoutRunId === run.id;
+        const holdsExecution = issue.executionRunId === run.id;
+        if (!holdsCheckout && !holdsExecution) return null;
+
+        await tx
+          .update(heartbeatRuns)
+          .set({
+            status: "cancelled",
+            finishedAt: now,
+            error: `Reaped: stale scheduled_retry held issue ${candidate.issueIdentifier} checkout beyond ${thresholdMs}ms`,
+            errorCode: "reaper_stale_scheduled",
+            updatedAt: now,
+          })
+          .where(eq(heartbeatRuns.id, run.id));
+
+        const patch: Partial<typeof issues.$inferInsert> = {
+          executionRunId: null,
+          executionAgentNameKey: null,
+          executionLockedAt: null,
+          updatedAt: now,
+        };
+        if (holdsCheckout) {
+          patch.checkoutRunId = null;
+        }
+        await tx.update(issues).set(patch).where(eq(issues.id, issue.id));
+        return { runId: run.id, issueId: issue.id };
+      });
+
+      if (!cleared) continue;
+      reapedRunIds.push(cleared.runId);
+      reapedIssueIds.push(cleared.issueId);
+
+      const cancelledRun = await getRun(cleared.runId);
+      if (cancelledRun) {
+        await setWakeupStatus(cancelledRun.wakeupRequestId, "cancelled", {
+          finishedAt: now,
+          error: "Reaped: stale scheduled_retry holding issue checkout",
+        });
+        const seq = await nextRunEventSeq(cancelledRun.id);
+        await appendRunEvent(cancelledRun, seq, {
+          eventType: "lifecycle",
+          stream: "system",
+          level: "warn",
+          message: "run reaped: stale scheduled_retry holding issue checkout",
+          payload: {
+            reason: "reaper_stale_scheduled",
+            issueId: cleared.issueId,
+            issueIdentifier: candidate.issueIdentifier,
+            holdKind: candidate.holdKind,
+            scheduledRetryAt: candidate.scheduledRetryAt,
+            scheduledRetryAgeMs: candidate.scheduledRetryAgeMs,
+            checkoutHoldDurationMs: candidate.checkoutHoldDurationMs,
+            thresholdMs,
+          },
+        });
+      }
+    }
+
+    return {
+      reaped: reapedRunIds.length,
+      runIds: reapedRunIds,
+      issueIds: reapedIssueIds,
+    };
+  }
+
   async function getIssueRetryRun(
     companyId: string,
     issueId: string,
@@ -10949,6 +11200,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     reapOrphanedRuns,
 
     promoteDueScheduledRetries,
+    scanStaleScheduledRetryCheckouts,
+    reapStaleScheduledRetryCheckouts,
     retryScheduledRetryNow,
 
     resumeQueuedRuns,
