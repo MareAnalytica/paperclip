@@ -151,6 +151,7 @@ import {
 import { recoveryService } from "./recovery/service.js";
 import { productivityReviewService } from "./productivity-review.js";
 import { withAgentStartLock } from "./agent-start-lock.js";
+import { isSchedulerLeader, notifyLeaderOfQueuedRun } from "./scheduler-leadership.js";
 import {
   redactCurrentUserText,
   redactCurrentUserValue,
@@ -2884,6 +2885,19 @@ export type HeartbeatEnvironmentRuntime = ReturnType<typeof environmentRuntimeSe
 export interface HeartbeatServiceOptions {
   pluginWorkerManager?: PluginWorkerManager;
   environmentRuntime?: HeartbeatEnvironmentRuntime;
+  /**
+   * Whether THIS process may EXECUTE runs inline (DEE-700). Defaults to the
+   * process-global scheduler-leadership signal so every instance in the process
+   * is gated consistently regardless of which route constructed it; override in
+   * tests. On a follower, `startNextQueuedRunForAgent` enqueues-only.
+   */
+  isLeader?: () => boolean;
+  /**
+   * Signal the leader that a run was enqueued on a follower so it drains the
+   * queue without waiting one scheduler interval. Defaults to the process-global
+   * NOTIFY bus; override in tests.
+   */
+  notifyQueuedRun?: (agentId: string) => void | Promise<void>;
 }
 
 export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) {
@@ -2907,6 +2921,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     environmentRuntime,
   });
   const workspaceOperationsSvc = workspaceOperationService(db);
+  // DEE-700: run execution happens only on the scheduler leader. `activeRunExecutions`
+  // and `withAgentStartLock` are per-pod (in-memory) state; the leader gate below
+  // keeps them single-pod-correct under replicas>1 by ensuring no follower pod
+  // ever claims/executes a run inline.
+  const isLeader = options.isLeader ?? isSchedulerLeader;
+  const notifyQueuedRun = options.notifyQueuedRun ?? notifyLeaderOfQueuedRun;
   const activeRunExecutions = new Set<string>();
   const budgetHooks = {
     cancelWorkForScope: cancelBudgetScopeWork,
@@ -8087,6 +8107,23 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   }
 
   async function startNextQueuedRunForAgent(agentId: string) {
+    // DEE-700 leader gate. This is the single chokepoint to executeRun (its only
+    // caller), reached both from the leader's resumeQueuedRuns()/startup recovery
+    // and from inline HTTP dispatch on whatever pod the load balancer picked. On
+    // a follower we must NOT claim or execute: the run is already persisted
+    // `queued`, so we only NOTIFY the leader to drain promptly. This removes the
+    // cross-pod countRunningRunsForAgent TOCTOU (two pods can't each claim a
+    // different queued run for the same agent and blow past maxConcurrentRuns)
+    // and keeps the orphan reaper's per-pod activeRunExecutions Set authoritative,
+    // because in-flight runs now only ever live on the leader.
+    if (!isLeader()) {
+      try {
+        await notifyQueuedRun(agentId);
+      } catch (err) {
+        logger.warn({ err, agentId }, "follower queued-run NOTIFY failed; leader tick will still drain");
+      }
+      return [];
+    }
     return withAgentStartLock(agentId, async () => {
       const agent = await getAgent(agentId);
       if (!agent) return [];

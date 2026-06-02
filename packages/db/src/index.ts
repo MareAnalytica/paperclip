@@ -2,6 +2,8 @@ export {
   createDb,
   createAdvisoryLockSession,
   type AdvisoryLockSession,
+  createQueueNotifyChannel,
+  type QueueNotifyChannel,
   getPostgresDataDirectory,
   ensurePostgresDatabase,
   inspectMigrations,

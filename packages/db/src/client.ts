@@ -89,6 +89,54 @@ export function createAdvisoryLockSession(url: string): AdvisoryLockSession {
   };
 }
 
+export interface QueueNotifyChannel {
+  /** Emit a NOTIFY on the channel with a string payload (e.g. an agent id). */
+  notify(payload: string): Promise<void>;
+  /**
+   * Begin LISTENing on the channel; `onNotify` fires once per notification with
+   * its payload. Backed by a dedicated reserved backend session.
+   */
+  listen(onNotify: (payload: string) => void): Promise<void>;
+  /** Liveness probe over the send connection; rejects if it is unusable. */
+  ping(): Promise<void>;
+  /** Tear down both connections. */
+  end(): Promise<void>;
+}
+
+/**
+ * Cross-pod queue-wakeup signal over Postgres LISTEN/NOTIFY (DEE-700). Backs the
+ * run-execution leader gate: when a non-leader pod enqueues a run from an inline
+ * HTTP dispatch it does NOT execute it (only the leader may), so it NOTIFYs this
+ * channel and the leader — which LISTENs — drains the queue immediately instead
+ * of waiting up to one scheduler interval.
+ *
+ * Two dedicated connections (each `max: 1`): one reserved for the long-lived
+ * LISTEN (postgres-js binds a listener to a single backend), one for outgoing
+ * NOTIFY/ping. Splitting them avoids head-of-line blocking between an in-flight
+ * listen and an outgoing notify, and lets end() tear both down deterministically.
+ */
+export function createQueueNotifyChannel(url: string, channel: string): QueueNotifyChannel {
+  if (!isSafeIdentifier(channel)) throw new Error(`Unsafe NOTIFY channel: ${channel}`);
+  const sendSql = postgres(url, { max: 1, onnotice: () => {} });
+  const listenSql = postgres(url, { max: 1, onnotice: () => {} });
+  return {
+    async notify(payload) {
+      // pg_notify takes the channel and payload as bound values, so there is no
+      // identifier-injection surface; the isSafeIdentifier guard above is extra.
+      await sendSql`SELECT pg_notify(${channel}, ${payload})`;
+    },
+    async listen(onNotify) {
+      await listenSql.listen(channel, (payload) => onNotify(payload));
+    },
+    async ping() {
+      await sendSql`SELECT 1`;
+    },
+    async end() {
+      await Promise.allSettled([sendSql.end({ timeout: 5 }), listenSql.end({ timeout: 5 })]);
+    },
+  };
+}
+
 export async function getPostgresDataDirectory(url: string): Promise<string | null> {
   const sql = createUtilitySql(url);
   try {

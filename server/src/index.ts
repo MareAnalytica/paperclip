@@ -9,6 +9,8 @@ import type { Request as ExpressRequest, RequestHandler } from "express";
 import { and, eq } from "drizzle-orm";
 import {
   createDb,
+  createQueueNotifyChannel,
+  type QueueNotifyChannel,
   ensurePostgresDatabase,
   formatEmbeddedPostgresError,
   getPostgresDataDirectory,
@@ -41,6 +43,7 @@ import {
 } from "./services/index.js";
 import { ceoBlockedSweepService } from "./services/ceo-blocked-sweep.js";
 import { createSchedulerLeaderElection, type SchedulerLeaderElection } from "./services/leader-election.js";
+import { setSchedulerLeadership } from "./services/scheduler-leadership.js";
 import { createFeedbackTraceShareClientFromConfig } from "./services/feedback-share-client.js";
 import { ensureSystemPeerIssueUser } from "./services/peer-issue-system-user.js";
 import { initCeoFlowPolicy } from "./services/ceo-flow-policy.js";
@@ -727,6 +730,11 @@ export async function startServer(): Promise<StartedServer> {
     });
   
   let schedulerLeaderElection: SchedulerLeaderElection | null = null;
+  // DEE-700: cross-pod queued-run wakeup channel; only created when leader
+  // election is enabled (replicas>1). Followers NOTIFY here on enqueue, the
+  // leader LISTENs and drains.
+  const HEARTBEAT_QUEUE_NOTIFY_CHANNEL = "heartbeat_run_queued";
+  let queueNotifyChannel: QueueNotifyChannel | null = null;
   if (config.heartbeatSchedulerEnabled) {
     const heartbeat = heartbeatService(db as any, { pluginWorkerManager });
     const routines = routineService(db as any, { pluginWorkerManager });
@@ -938,13 +946,48 @@ export async function startServer(): Promise<StartedServer> {
           );
         },
       });
+
+      // DEE-700: gate the inline run-execution surface too. Run execution is also
+      // dispatched from HTTP handlers (heartbeat.wakeup -> enqueueWakeup ->
+      // startNextQueuedRunForAgent -> executeRun) on whichever pod served the
+      // request; the scheduler-tick guard above does not cover that path. Publish
+      // this pod's leadership to the process-global signal that every
+      // heartbeatService instance reads: followers enqueue-only and NOTIFY the
+      // leader, which LISTENs and drains immediately (no one-interval latency).
+      queueNotifyChannel = createQueueNotifyChannel(
+        activeDatabaseConnectionString,
+        HEARTBEAT_QUEUE_NOTIFY_CHANNEL,
+      );
+      setSchedulerLeadership({
+        isLeader: () => schedulerLeaderElection?.isLeader() ?? false,
+        notifyQueuedRun: (agentId) => queueNotifyChannel?.notify(agentId),
+      });
+      void queueNotifyChannel
+        .listen((agentId) => {
+          // NOTIFY broadcasts to every listener; only the leader may execute, so
+          // followers ignore it. resumeQueuedRuns() is idempotent (single indexed
+          // scan of queued runs) and is the same primitive the periodic tick uses.
+          if (!schedulerLeaderElection?.isLeader()) return;
+          void heartbeat.resumeQueuedRuns().catch((err) => {
+            logger.error({ err, agentId }, "leader queued-run NOTIFY drain failed");
+          });
+        })
+        .catch((err) => {
+          logger.error(
+            { err },
+            "failed to start queued-run NOTIFY listener; leader still drains on its periodic tick",
+          );
+        });
+
       schedulerLeaderElection.start();
       logger.info(
-        { pollIntervalMs: config.schedulerLeaderElectionPollMs },
-        "heartbeat scheduler leader-election enabled (replicas>1 safe)",
+        { pollIntervalMs: config.schedulerLeaderElectionPollMs, queueNotifyChannel: HEARTBEAT_QUEUE_NOTIFY_CHANNEL },
+        "heartbeat scheduler leader-election enabled (replicas>1 safe; inline run-execution leader-gated)",
       );
     } else {
-      // Single-replica behavior (default): this pod always runs the scheduler.
+      // Single-replica behavior (default): this pod always runs the scheduler and
+      // executes runs inline. The process-global leadership signal stays at its
+      // default (leader = true), so heartbeatService dispatch is unchanged.
       runSchedulerStartupRecovery();
     }
 
@@ -1059,6 +1102,16 @@ export async function startServer(): Promise<StartedServer> {
           await schedulerLeaderElection.stop();
         } catch (err) {
           logger.error({ err }, "Failed to release scheduler leadership on shutdown");
+        }
+      }
+
+      // DEE-700: close the queued-run NOTIFY/LISTEN connections (no-op when leader
+      // election is disabled and the channel was never created).
+      if (queueNotifyChannel) {
+        try {
+          await queueNotifyChannel.end();
+        } catch (err) {
+          logger.error({ err }, "Failed to close queued-run NOTIFY channel on shutdown");
         }
       }
 
