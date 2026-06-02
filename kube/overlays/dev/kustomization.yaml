@@ -47,11 +47,17 @@ patches:
       metadata:
         name: paperclip
       spec:
+        # ELI-903: zero-downtime rollout. With replicas:1, maxSurge:0+maxUnavailable:1
+        # tore the only pod down BEFORE its replacement bound :3100, leaving the
+        # Service endpoint empty on every rollout/restart -> external Traefik 502
+        # on all routes until the new pod's startup probe passed. maxSurge:1+
+        # maxUnavailable:0 brings up a new Ready pod before removing the old one,
+        # so the endpoint always has a serving backend.
         strategy:
           type: RollingUpdate
           rollingUpdate:
-            maxSurge: 0
-            maxUnavailable: 1
+            maxSurge: 1
+            maxUnavailable: 0
         template:
           spec:
             containers:
@@ -69,9 +75,21 @@ patches:
                   requests:
                     memory: "512Mi"
                     cpu: "50m"
+                    # ELI-903: account for the /tmp + /app/data emptyDir budget so
+                    # the scheduler reserves node ephemeral storage and a noisy /tmp
+                    # does not trip a node-level DiskPressure eviction.
+                    ephemeral-storage: "3Gi"
                   limits:
                     memory: "4Gi"
                     cpu: "1000m"
+                    ephemeral-storage: "5Gi"
+            # ELI-903: raise the /tmp emptyDir cap. Root fs is read-only, so the app
+            # must write scratch/uploads to /tmp; the old 1Gi cap evicted the pod
+            # (which, with replicas:1, caused the same external 502 gap).
+            volumes:
+              - name: tmp
+                emptyDir:
+                  sizeLimit: 3Gi
 
   # Reduce PostgreSQL StatefulSet resources for dev
   - target:
