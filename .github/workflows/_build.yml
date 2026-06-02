@@ -25,10 +25,20 @@ on:
         required: false
         type: string
         default: ""
+    outputs:
+      digests:
+        description: >
+          DEE-706: compact JSON map of { "<registry>/<name>": "<sha256:digest>" } for every
+          image actually built this run. A caller can feed this into _deploy.yml's
+          `image_digests` input to promote the exact, content-addressed build it just
+          produced (instead of relying on a static overlay pin that never moves).
+        value: ${{ jobs.build.outputs.digests }}
 
 jobs:
   build:
     runs-on: arc-runner-set
+    outputs:
+      digests: ${{ steps.build.outputs.digests }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -51,16 +61,28 @@ jobs:
           curl -sf --cacert /etc/ssl/certs/registry-ca.crt https://${{ inputs.registry }}/v2/ > /dev/null && echo "✓ Registry reachable"
 
       - name: Build and push images
+        id: build
         env:
           IMAGES_JSON: ${{ inputs.images }}
           REGISTRY: ${{ inputs.registry }}
           FILTER: ${{ inputs.filter }}
+          GIT_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
 
           mapfile -t NAMES       < <(echo "${IMAGES_JSON}" | jq -r '.[].name')
           mapfile -t CONTEXTS    < <(echo "${IMAGES_JSON}" | jq -r '.[].context')
           mapfile -t DOCKERFILES < <(echo "${IMAGES_JSON}" | jq -r '.[].dockerfile')
+
+          # DEE-706: immutable, content-addressed promotion.
+          # In addition to the mutable :latest tag (kept for backwards compat), tag
+          # and push an immutable sha-<gitsha> tag, and capture the registry digest
+          # returned by `docker push`. The digest map is emitted as a workflow output
+          # so a deploy job can pin the EXACT image it just built. Without this, a
+          # digest-pinned overlay (e.g. kube/overlays/dev) never sees new code:
+          # apply -k re-applies the same old digest and rollout restart re-pulls it.
+          SHORT_SHA="${GIT_SHA:0:12}"
+          DIGESTS_JSON='{}'
 
           for i in "${!NAMES[@]}"; do
             name="${NAMES[$i]}"
@@ -72,14 +94,30 @@ jobs:
               continue
             fi
 
-            tag="${REGISTRY}/${name}:latest"
+            tag_latest="${REGISTRY}/${name}:latest"
+            tag_sha="${REGISTRY}/${name}:sha-${SHORT_SHA}"
             echo "══════════════════════════════════════════"
-            echo "Building ${name} → ${tag}"
+            echo "Building ${name}"
+            echo "  → ${tag_latest}"
+            echo "  → ${tag_sha}"
             echo "  context:    ${context}"
             echo "  dockerfile: ${dockerfile}"
             echo "══════════════════════════════════════════"
-            docker build -t "${tag}" -f "${dockerfile}" "${context}"
-            docker push "${tag}"
-            echo "✓ ${name} pushed"
+            docker build -t "${tag_latest}" -t "${tag_sha}" -f "${dockerfile}" "${context}"
+
+            docker push "${tag_latest}"
+            # Push the immutable tag and capture the digest from push output.
+            push_out="$(docker push "${tag_sha}")"
+            echo "${push_out}"
+            digest="$(echo "${push_out}" | sed -n 's/.*[[:space:]]digest:[[:space:]]\(sha256:[0-9a-f]\{64\}\).*/\1/p' | head -1)"
+            if [ -z "${digest}" ]; then
+              echo "✗ Could not parse pushed digest for ${name}" >&2
+              exit 1
+            fi
+            echo "✓ ${name} pushed (digest: ${digest})"
+            DIGESTS_JSON="$(jq -c --arg k "${REGISTRY}/${name}" --arg v "${digest}" '. + {($k): $v}' <<<"${DIGESTS_JSON}")"
             echo ""
           done
+
+          echo "Image digests: ${DIGESTS_JSON}"
+          echo "digests=${DIGESTS_JSON}" >> "$GITHUB_OUTPUT"

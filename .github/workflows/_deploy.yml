@@ -33,6 +33,17 @@ on:
         required: false
         type: string
         default: "300s"
+      image_digests:
+        description: >
+          DEE-706: optional compact JSON map of { "<registry>/<name>": "<sha256:digest>" }
+          (typically the `digests` output of _build.yml). When non-empty, each entry is
+          pinned onto the overlay via `kustomize edit set image <name>@<digest>` BEFORE
+          `kubectl apply -k`, so the deploy promotes the exact image just built rather
+          than re-applying a stale static digest. Empty (default) = apply the overlay
+          as committed (unchanged legacy behaviour; e.g. prod promotion stays untouched).
+        required: false
+        type: string
+        default: ""
 
 jobs:
   deploy:
@@ -64,6 +75,34 @@ jobs:
             path="kube/overlays/${{ inputs.environment }}"
           fi
           echo "path=${path}" >> "$GITHUB_OUTPUT"
+
+      # DEE-706: pin freshly-built image digests onto the overlay before apply.
+      # Skipped entirely when image_digests is empty, so callers that do not pass
+      # it (e.g. prod) keep applying the overlay exactly as committed.
+      - name: Pin promoted image digests
+        if: ${{ inputs.image_digests != '' }}
+        env:
+          IMAGE_DIGESTS: ${{ inputs.image_digests }}
+          OVERLAY_PATH: ${{ steps.overlay.outputs.path }}
+        run: |
+          set -euo pipefail
+          KUSTOMIZE_VERSION=v5.4.3
+          echo "Installing kustomize ${KUSTOMIZE_VERSION}..."
+          curl -sLo /tmp/kustomize.tar.gz \
+            "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2F${KUSTOMIZE_VERSION}/kustomize_${KUSTOMIZE_VERSION}_linux_amd64.tar.gz"
+          tar -xzf /tmp/kustomize.tar.gz -C /tmp
+          sudo mv /tmp/kustomize /usr/local/bin/
+          kustomize version
+
+          cd "${OVERLAY_PATH}"
+          echo "Pinning promoted digests into ${OVERLAY_PATH}/kustomization.yaml:"
+          echo "${IMAGE_DIGESTS}" | jq -r 'to_entries[] | "\(.key) \(.value)"' | while read -r name digest; do
+            [ -z "${name}" ] && continue
+            echo "  → ${name}@${digest}"
+            kustomize edit set image "${name}@${digest}"
+          done
+          echo "--- effective image transformers ---"
+          kustomize cfg cat kustomization.yaml 2>/dev/null | sed -n '/^images:/,/^[^ -]/p' || sed -n '/^images:/,/^[^ -]/p' kustomization.yaml
 
       - name: Apply kustomize overlay (${{ inputs.environment }})
         run: |
