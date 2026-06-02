@@ -7,14 +7,25 @@ namespace: paperclip-dev
 
 resources:
   - ../../base
+  # DEE-696: PDB only applies in dev (replicas:2); meaningless at base replicas:1.
+  - poddisruptionbudget.yaml
 
 images:
-  # DEE-695 (DEE-694/DEE-692 class): pin the dev image to the running, verified digest
-  # instead of the mutable :latest tag. Removes nondeterministic rollouts and the
-  # ~1.3GB re-pull per restart (paired with base imagePullPolicy: IfNotPresent).
+  # DEE-695 (DEE-694/DEE-692 class): pin the dev image to a verified digest instead
+  # of the mutable :latest tag. Removes nondeterministic rollouts and the ~1.3GB
+  # re-pull per restart (paired with base imagePullPolicy: IfNotPresent).
   # Bump this digest deliberately when promoting a new dev build.
+  #
+  # DEE-696 (REQUIRED by this change): bumped from the previous digest sha256:b248220…
+  # which was built by #101 (DEE-695) BEFORE the leader-election code existed. Turning
+  # SCHEDULER_LEADER_ELECTION_ENABLED on against that binary would be inert (no leader
+  # machinery in it) and replicas:2 would run two unguarded schedulers — the exact
+  # double-run hazard this safety gate forbids. This digest is the CI build of main
+  # HEAD 827f960d (the #103/DEE-700 merge), which is a superset of #102/DEE-699
+  # (pg_advisory_lock leader election) + #103/DEE-700 (inline run-execution gate).
+  # Source: CI→Dev build job for 827f960d pushed `latest: digest: sha256:6436ef4…`.
   - name: registry.mareanalytica.com/paperclip
-    digest: sha256:b2482205344f5725ba4b38fbdfafe311e288dabd7c5bf253e778c8228516ab10
+    digest: sha256:6436ef4b8c8616aaef06c8341f2f0480e11223d989ad5b2406a394e470b6cb76
 
 patches:
   # Override namespace name for dev
@@ -51,6 +62,15 @@ patches:
       metadata:
         name: paperclip
       spec:
+        # DEE-696 (safety-gated on DEE-699/DEE-700): scale dev to 2 replicas for
+        # availability hardening so a rolling/hung pod never zeroes the Service
+        # endpoint (paired with the PodDisruptionBudget below, which is meaningless
+        # at replicas:1). SAFE only because the heartbeat scheduler now runs behind
+        # the SCHEDULER_LEADER_ELECTION_ENABLED pg_advisory_lock single-leader guard
+        # (DEE-699 #102) + the inline run-execution leader gate (DEE-700 #103): every
+        # pod serves HTTP+/api/health, but exactly one runs timers/reconcilers/
+        # dispatch, so a second replica cannot double-run heartbeat wakeups.
+        replicas: 2
         # ELI-903: zero-downtime rollout. With replicas:1, maxSurge:0+maxUnavailable:1
         # tore the only pod down BEFORE its replacement bound :3100, leaving the
         # Service endpoint empty on every rollout/restart -> external Traefik 502
@@ -75,6 +95,16 @@ patches:
                     value: "paperclip-dev.mareanalytica.com"
                   - name: BETTER_AUTH_BASE_URL
                     value: "https://paperclip-dev.mareanalytica.com"
+                  # DEE-696: turn ON the heartbeat-scheduler single-leader guard.
+                  # The flag defaults OFF in config.ts (per-pod gate); it MUST be
+                  # true wherever replicas>1 or a second pod would double-run the
+                  # non-issue timer path (e.g. CEO heartbeat) + reconcilers. With it
+                  # on, both pods serve HTTP but only the pg_advisory_lock holder runs
+                  # timers/reconcilers/dispatch; on leader loss a survivor is promoted
+                  # (session-scoped lock auto-releases on connection drop) and reaps
+                  # the dead leader's orphaned runs.
+                  - name: SCHEDULER_LEADER_ELECTION_ENABLED
+                    value: "true"
                 resources:
                   requests:
                     memory: "512Mi"
