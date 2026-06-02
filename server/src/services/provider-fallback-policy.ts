@@ -41,6 +41,23 @@ export interface ProviderFallbackBoardEscalation {
 export const PROVIDER_FALLBACK_RETRY_AFTER_MINUTES_MIN = 1;
 export const PROVIDER_FALLBACK_RETRY_AFTER_MINUTES_MAX = 1440;
 export const PROVIDER_FALLBACK_RETRY_AFTER_MINUTES_DEFAULT = 60;
+
+// Spec §2.1 default `limitDetection.limitMarkers` list. These are the engine's
+// advisory safety-net markers (ELI-902 / G2): case-insensitive substrings tested
+// against an adapter failure message/status *only when* the active adapter
+// returned no native limit classification of its own. Native per-adapter
+// detection always wins; this list catches limit strings an adapter missed so a
+// non-detecting adapter in the chain still hops instead of failing the run.
+export const PROVIDER_FALLBACK_DEFAULT_LIMIT_MARKERS: readonly string[] = [
+  "usage limit",
+  "rate limit",
+  "max reached",
+  "quota exceeded",
+  "insufficient_quota",
+  "429",
+  "529",
+  "overloaded",
+];
 const DEFAULT_BOARD_ESCALATION: ProviderFallbackBoardEscalation = {
   enabled: true,
   notifyKind: "approval",
@@ -64,6 +81,9 @@ export interface ResolvedProviderFallbackPolicy {
   // §4 exhaustion handling (spec ELI-382). Company-wide for v1; per-company
   // override of these is a documented follow-up.
   retryAfterMinutesDefault: number;
+  // Engine-level safety-net markers (spec §2.1, ELI-902 / G2). Lowercased,
+  // de-duplicated; defaults to PROVIDER_FALLBACK_DEFAULT_LIMIT_MARKERS.
+  limitMarkers: string[];
   boardEscalation: ProviderFallbackBoardEscalation;
   // Account/provider cooldown for new root runs (ticket ELI-855).
   accountCooldown: ProviderFallbackAccountCooldown;
@@ -269,6 +289,45 @@ function parseRetryAfterMinutes(limitDetection: unknown): number {
   return raw;
 }
 
+function parseLimitMarkers(limitDetection: unknown): string[] {
+  if (limitDetection === undefined || limitDetection === null) {
+    return [...PROVIDER_FALLBACK_DEFAULT_LIMIT_MARKERS];
+  }
+  if (typeof limitDetection !== "object" || Array.isArray(limitDetection)) {
+    throw new Error(
+      "[provider-fallback-policy] providerFallback.limitDetection must be an object",
+    );
+  }
+  const raw = (limitDetection as Record<string, unknown>).limitMarkers;
+  if (raw === undefined || raw === null) {
+    return [...PROVIDER_FALLBACK_DEFAULT_LIMIT_MARKERS];
+  }
+  if (!Array.isArray(raw)) {
+    throw new Error(
+      "[provider-fallback-policy] providerFallback.limitDetection.limitMarkers must be an array of non-empty strings",
+    );
+  }
+  const markers: string[] = [];
+  const seen = new Set<string>();
+  for (const item of raw) {
+    if (typeof item !== "string" || item.trim().length === 0) {
+      throw new Error(
+        "[provider-fallback-policy] providerFallback.limitDetection.limitMarkers must be an array of non-empty strings",
+      );
+    }
+    const normalized = item.trim().toLowerCase();
+    if (seen.has(normalized)) continue;
+    seen.add(normalized);
+    markers.push(normalized);
+  }
+  if (markers.length === 0) {
+    throw new Error(
+      "[provider-fallback-policy] providerFallback.limitDetection.limitMarkers must contain at least one non-empty marker",
+    );
+  }
+  return markers;
+}
+
 function parseBoardEscalation(boardEscalation: unknown): ProviderFallbackBoardEscalation {
   if (boardEscalation === undefined || boardEscalation === null) {
     return { ...DEFAULT_BOARD_ESCALATION };
@@ -369,6 +428,7 @@ export function parseProviderFallbackPolicy(
     default: { chain: defaultChain },
     overrides,
     retryAfterMinutesDefault: parseRetryAfterMinutes(block.limitDetection),
+    limitMarkers: parseLimitMarkers(block.limitDetection),
     boardEscalation: parseBoardEscalation(block.boardEscalation),
     accountCooldown: parseAccountCooldown(block.accountCooldown),
   };
@@ -396,6 +456,7 @@ export function builtinDefaultProviderFallbackPolicy(): ResolvedProviderFallback
     default: { chain: BUILTIN_DEFAULT_CHAIN.map((entry) => ({ ...entry })) },
     overrides: new Map(),
     retryAfterMinutesDefault: PROVIDER_FALLBACK_RETRY_AFTER_MINUTES_DEFAULT,
+    limitMarkers: [...PROVIDER_FALLBACK_DEFAULT_LIMIT_MARKERS],
     boardEscalation: { ...DEFAULT_BOARD_ESCALATION },
     accountCooldown: { ...DEFAULT_ACCOUNT_COOLDOWN },
   };
@@ -415,6 +476,34 @@ export function resolveProviderFallbackEscalation(
     retryAfterMinutesDefault: resolved.retryAfterMinutesDefault,
     boardEscalation: { ...resolved.boardEscalation },
   };
+}
+
+/**
+ * Resolve the engine-level safety-net `limitMarkers` for a company (ELI-902 /
+ * G2). Company-wide for v1; `companyId` is accepted now so callers do not change
+ * when per-company overrides land.
+ */
+export function resolveProviderFallbackLimitMarkers(
+  companyId: string,
+  resolved: ResolvedProviderFallbackPolicy = getProviderFallbackPolicy(),
+): string[] {
+  void companyId;
+  return [...resolved.limitMarkers];
+}
+
+/**
+ * Engine-level safety-net classifier (ELI-902 / G2). Returns true when the
+ * lowercased failure text contains any configured `limitMarker`. This is layered
+ * *under* each adapter's native limit detection: callers consult it only when the
+ * active adapter produced no native usage-limit classification of its own.
+ */
+export function matchesConfiguredLimitMarker(
+  failureText: string,
+  markers: readonly string[],
+): boolean {
+  if (!failureText || markers.length === 0) return false;
+  const haystack = failureText.toLowerCase();
+  return markers.some((marker) => haystack.includes(marker));
 }
 
 /**
