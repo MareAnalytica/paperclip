@@ -85,12 +85,92 @@ jobs:
 
       - name: Wait for rollout
         run: |
-          set -euo pipefail
+          set -uo pipefail
           NS="${{ inputs.namespace }}"
+          RAW_TIMEOUT="${{ inputs.rollout_timeout }}"
+          # Convert the kubectl-style duration (e.g. "600s", "10m") into seconds for our
+          # own bounded poll loop. Fall back to 300s if it cannot be parsed.
+          case "${RAW_TIMEOUT}" in
+            *m) DEADLINE_SECS=$(( ${RAW_TIMEOUT%m} * 60 )) ;;
+            *s) DEADLINE_SECS=${RAW_TIMEOUT%s} ;;
+            *[0-9]) DEADLINE_SECS=${RAW_TIMEOUT} ;;
+            *) DEADLINE_SECS=300 ;;
+          esac
           IFS=',' read -ra DEPS <<< "${{ inputs.deployments }}"
+
+          # Comma-joined label selector for a deployment's pods (generic — derived from
+          # the Deployment's own matchLabels, no hard-coded app= convention).
+          deploy_selector() {
+            kubectl -n "${NS}" get deploy "$1" \
+              -o go-template='{{range $k,$v := .spec.selector.matchLabels}}{{$k}}={{$v}},{{end}}' \
+              | sed 's/,$//'
+          }
+
+          # Print rollout/scheduling diagnostics so the failure cause (e.g.
+          # FailedScheduling / Insufficient memory) is captured inline in the job log and
+          # survives GitHub Actions log retention/GC — the exact gap that left DEE-704's
+          # historical failures un-diagnosable.
+          dump_diagnostics() {
+            local dep="$1" sel
+            sel="$(deploy_selector "${dep}")"
+            echo "::group::Diagnostics for deployment/${dep} (${NS})"
+            kubectl -n "${NS}" get deploy "${dep}" -o wide || true
+            kubectl -n "${NS}" get pods -l "${sel}" -o wide || true
+            echo "--- describe of non-Running pods (Events) ---"
+            kubectl -n "${NS}" get pods -l "${sel}" \
+              -o jsonpath='{range .items[?(@.status.phase!="Running")]}{.metadata.name}{"\n"}{end}' \
+              | while read -r pod; do
+                  [ -z "${pod}" ] && continue
+                  kubectl -n "${NS}" describe pod "${pod}" | sed -n '/Events:/,$p' || true
+                done
+            echo "--- recent namespace events ---"
+            kubectl -n "${NS}" get events --sort-by=.lastTimestamp | tail -25 || true
+            echo "::endgroup::"
+          }
+
+          # True when a pod is genuinely unschedulable (PodScheduled=False/Unschedulable),
+          # e.g. a surge replica that cannot fit on a saturated node. This is the
+          # fail-fast signal — distinct from a pod that is briefly Pending while being
+          # scheduled normally.
+          has_unschedulable_pod() {
+            local dep="$1" sel
+            sel="$(deploy_selector "${dep}")"
+            kubectl -n "${NS}" get pods -l "${sel}" \
+              -o jsonpath='{range .items[*]}{range .status.conditions[?(@.type=="PodScheduled")]}{.status}={.reason}{"\n"}{end}{end}' 2>/dev/null \
+              | grep -q '^False=Unschedulable$'
+          }
+
+          fail=0
           for dep in "${DEPS[@]}"; do
             dep="$(echo "${dep}" | xargs)"
-            echo "Waiting for ${dep}..."
-            kubectl -n "${NS}" rollout status "deployment/${dep}" --timeout=${{ inputs.rollout_timeout }}
+            echo "Waiting for ${dep} (deadline ${DEADLINE_SECS}s)..."
+            start=${SECONDS}
+            done_ok=0
+            while [ $(( SECONDS - start )) -lt "${DEADLINE_SECS}" ]; do
+              # Short, repeated bounded checks instead of one long blocking wait, so a
+              # fail-fast unschedulable check can be interleaved.
+              if kubectl -n "${NS}" rollout status "deployment/${dep}" --timeout=15s; then
+                echo "✓ ${dep} rolled out"
+                done_ok=1
+                break
+              fi
+              if has_unschedulable_pod "${dep}"; then
+                echo "::error::deployment/${dep}: a pod is Unschedulable (node capacity). Failing fast instead of waiting out ${RAW_TIMEOUT}. See DEE-705 (node memory) / DEE-696 (replicas:2)."
+                break
+              fi
+              sleep 5
+            done
+            if [ "${done_ok}" -ne 1 ]; then
+              if [ $(( SECONDS - start )) -ge "${DEADLINE_SECS}" ]; then
+                echo "::error::Rollout of deployment/${dep} did not complete within ${RAW_TIMEOUT}."
+              fi
+              dump_diagnostics "${dep}"
+              fail=1
+            fi
           done
+
+          if [ "${fail}" -ne 0 ]; then
+            echo "::error::One or more deployments failed to roll out in ${NS}."
+            exit 1
+          fi
           echo "✓ All deployments rolled out in ${NS}"
