@@ -93,7 +93,7 @@ describe("grok_local testEnvironment", () => {
       "grok",
       expect.arrayContaining([
         "--output-format",
-        "streaming-json",
+        "stream-json",
         "--always-approve",
         "--permission-mode",
         "dontAsk",

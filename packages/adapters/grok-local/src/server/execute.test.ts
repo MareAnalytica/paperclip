@@ -69,7 +69,7 @@ describe("grok_local execute", () => {
       expect(args).toEqual(
         expect.arrayContaining([
           "--output-format",
-          "streaming-json",
+          "stream-json",
           "--always-approve",
           "--permission-mode",
           "dontAsk",

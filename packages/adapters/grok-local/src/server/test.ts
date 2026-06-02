@@ -243,7 +243,7 @@ export async function testEnvironment(
   if (canRunProbe) {
     const probeArgs = [
       "--output-format",
-      "streaming-json",
+      "stream-json",
       "--always-approve",
       "--permission-mode",
       "dontAsk",

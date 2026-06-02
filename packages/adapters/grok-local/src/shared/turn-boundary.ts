@@ -1,4 +1,4 @@
-// Grok's `--output-format streaming-json` mode emits `thought` and `text` events
+// Grok's `--output-format stream-json` mode emits `thought` and `text` events
 // token-by-token. Between reasoning turns (around tool calls) it drops the `\n`
 // separator that the non-streaming `--output-format json` mode includes in the
 // aggregated `thought` field. This helper inserts a single `\n` when a new chunk

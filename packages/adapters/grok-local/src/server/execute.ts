@@ -429,7 +429,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     };
 
     const buildArgs = (resumeSessionId: string | null) => {
-      const args = ["--cwd", effectiveExecutionCwd, "--output-format", "streaming-json"];
+      const args = ["--cwd", effectiveExecutionCwd, "--output-format", "stream-json"];
       if (resumeSessionId) args.push("--resume", resumeSessionId);
       if (model && model !== DEFAULT_GROK_LOCAL_MODEL) args.push("--model", model);
       if (reasoningEffort) args.push("--reasoning-effort", reasoningEffort);

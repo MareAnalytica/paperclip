@@ -38,7 +38,7 @@ describe("createGrokStdoutParser", () => {
       .join("");
   }
 
-  it("inserts a newline between reasoning turns that grok streaming-json glues together", () => {
+  it("inserts a newline between reasoning turns that grok stream-json glues together", () => {
     // Reproduces PAPA-349: token stream "...using `ls`" then a new turn "The `ls` command returned"
     expect(thoughtTexts(["The user uses `", "ls", "`", "The", " `", "ls", "`", " returned"]))
       .toBe("The user uses `ls`\nThe `ls` returned");
