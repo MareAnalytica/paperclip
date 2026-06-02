@@ -7,6 +7,8 @@ namespace: paperclip-dev
 
 resources:
   - ../../base
+  # DEE-696: PDB only applies in dev (replicas:2); meaningless at base replicas:1.
+  - poddisruptionbudget.yaml
 
 images:
   # DEE-695 (DEE-694/DEE-692 class): pin the dev image to the running, verified digest
@@ -51,6 +53,15 @@ patches:
       metadata:
         name: paperclip
       spec:
+        # DEE-696 (safety-gated on DEE-699/DEE-700): scale dev to 2 replicas for
+        # availability hardening so a rolling/hung pod never zeroes the Service
+        # endpoint (paired with the PodDisruptionBudget below, which is meaningless
+        # at replicas:1). SAFE only because the heartbeat scheduler now runs behind
+        # the SCHEDULER_LEADER_ELECTION_ENABLED pg_advisory_lock single-leader guard
+        # (DEE-699 #102) + the inline run-execution leader gate (DEE-700 #103): every
+        # pod serves HTTP+/api/health, but exactly one runs timers/reconcilers/
+        # dispatch, so a second replica cannot double-run heartbeat wakeups.
+        replicas: 2
         # ELI-903: zero-downtime rollout. With replicas:1, maxSurge:0+maxUnavailable:1
         # tore the only pod down BEFORE its replacement bound :3100, leaving the
         # Service endpoint empty on every rollout/restart -> external Traefik 502
@@ -75,6 +86,16 @@ patches:
                     value: "paperclip-dev.mareanalytica.com"
                   - name: BETTER_AUTH_BASE_URL
                     value: "https://paperclip-dev.mareanalytica.com"
+                  # DEE-696: turn ON the heartbeat-scheduler single-leader guard.
+                  # The flag defaults OFF in config.ts (per-pod gate); it MUST be
+                  # true wherever replicas>1 or a second pod would double-run the
+                  # non-issue timer path (e.g. CEO heartbeat) + reconcilers. With it
+                  # on, both pods serve HTTP but only the pg_advisory_lock holder runs
+                  # timers/reconcilers/dispatch; on leader loss a survivor is promoted
+                  # (session-scoped lock auto-releases on connection drop) and reaps
+                  # the dead leader's orphaned runs.
+                  - name: SCHEDULER_LEADER_ELECTION_ENABLED
+                    value: "true"
                 resources:
                   requests:
                     memory: "512Mi"

@@ -1,0 +1,25 @@
+# kube/overlays/dev/poddisruptionbudget.yaml
+# DEE-696 (DEE-695 task 3): keep at least one paperclip pod serving during
+# voluntary disruptions (node drain, rolling update, eviction) so the Service
+# endpoint is never zeroed -> no external Traefik 502 on /api/health or any route.
+# Lives in the dev overlay only because a PDB is meaningless at replicas:1 (base
+# stays replicas:1); the dev overlay scales to replicas:2. The namespace
+# transformer rewrites this to paperclip-dev at build time.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: paperclip
+  namespace: paperclip
+  labels:
+    app: paperclip
+    app.kubernetes.io/name: paperclip
+    app.kubernetes.io/component: web
+spec:
+  # With replicas:2 and maxUnavailable:0 rolling strategy, minAvailable:1 lets a
+  # rollout surge a new pod and retire one old pod at a time while always keeping
+  # one Ready backend. minAvailable (not maxUnavailable) so the floor holds even
+  # if the replica count is later raised.
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: paperclip
