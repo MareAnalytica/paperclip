@@ -11,6 +11,7 @@ import {
   initProviderFallbackPolicy,
   loadProviderFallbackPolicyFromString,
   matchesConfiguredLimitMarker,
+  parseProviderAuthModes,
   parseProviderFallbackPolicy,
   policyForCompany,
   PROVIDER_FALLBACK_DEFAULT_LIMIT_MARKERS,
@@ -528,6 +529,38 @@ describe("provider-fallback-policy", () => {
         currentAdapterType: "claude_local",
       });
       expect(next?.id).toBe("codex-local");
+    });
+  });
+
+  describe("parseProviderAuthModes (ELI-901 / ELI-867)", () => {
+    it("parses comma-joined id:mode pairs in order, trimming whitespace", () => {
+      const modes = parseProviderAuthModes(
+        " claude-code-personal:oauth-session , acme-ci-key:raw-key ",
+      );
+      expect(modes.get("claude-code-personal")).toBe("oauth-session");
+      expect(modes.get("acme-ci-key")).toBe("raw-key");
+      expect(modes.size).toBe(2);
+    });
+
+    it("keeps the first valid pair when an id repeats", () => {
+      const modes = parseProviderAuthModes("p:oauth-session,p:raw-key");
+      expect(modes.get("p")).toBe("oauth-session");
+      expect(modes.size).toBe(1);
+    });
+
+    it("skips blank, separator-less, and unrecognised-mode pairs without throwing", () => {
+      const modes = parseProviderAuthModes(
+        "good:raw-key,,no-sep,blank-mode:,:no-id,bad:bogus-mode",
+      );
+      expect(modes.get("good")).toBe("raw-key");
+      expect(modes.size).toBe(1);
+    });
+
+    it("returns an empty map for non-string / empty input", () => {
+      expect(parseProviderAuthModes(undefined).size).toBe(0);
+      expect(parseProviderAuthModes(null).size).toBe(0);
+      expect(parseProviderAuthModes("").size).toBe(0);
+      expect(parseProviderAuthModes(123).size).toBe(0);
     });
   });
 });

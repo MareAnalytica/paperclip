@@ -1,14 +1,17 @@
 import { afterEach, describe, expect, it } from "vitest";
 
 import {
+  isProviderFallbackEligibleError,
   mergeModelProfileAdapterConfig,
   parseProviderFallbackChainEnv,
   resolveEffectiveProviderFallbackChain,
+  resolveFailedProviderAuthMode,
   enforceFallbackAdapterModel,
 } from "../services/heartbeat.ts";
 import {
   __setProviderFallbackPolicyForTests,
   builtinDefaultProviderFallbackPolicy,
+  PROVIDER_FALLBACK_DEFAULT_LIMIT_MARKERS,
 } from "../services/provider-fallback-policy.ts";
 
 const FULL_RUNTIME_CHAIN = {
@@ -292,5 +295,125 @@ describe("provider fallback model boundary (merge integration)", () => {
       selectedFallbackAdapterType: "claude_local",
     });
     expect(merged.model).toBe("claude-opus-4-8");
+  });
+});
+
+describe("isProviderFallbackEligibleError — auth-model-aware detection precedence (ELI-901)", () => {
+  const run = (errorCode: string | null, resultJson: unknown = null, error: string | null = null) => ({
+    errorCode,
+    resultJson,
+    error,
+  });
+
+  it("oauth-session provider: a session cap / auth-session error is limit-like and hops", () => {
+    // Preserves the observed production recovery for the Claude/Codex/Grok locals.
+    expect(isProviderFallbackEligibleError(run("claude_session_limit"), "oauth-session")).toBe(true);
+    expect(isProviderFallbackEligibleError(run("codex_auth_session_expired"), "oauth-session")).toBe(true);
+  });
+
+  it("raw-key provider: an auth / session error is permanent and does NOT consume the chain", () => {
+    // Spec §3 precedence: a raw-key auth failure follows the normal failure path.
+    expect(isProviderFallbackEligibleError(run("provider_auth_failed"), "raw-key")).toBe(false);
+    expect(isProviderFallbackEligibleError(run("invalid_session_token"), "raw-key")).toBe(false);
+  });
+
+  it("defaults to the oauth-session (hop) behavior when no auth mode is supplied", () => {
+    // A missing/unknown mode must not change prior production behavior.
+    expect(isProviderFallbackEligibleError(run("provider_auth_failed"))).toBe(true);
+    expect(isProviderFallbackEligibleError(run("provider_auth_failed"), null)).toBe(true);
+  });
+
+  it("a usage-limit run hops regardless of auth model", () => {
+    // claude_usage_limit and the transient_upstream family are usage limits, not
+    // auth failures — the raw-key gate must never suppress them.
+    expect(isProviderFallbackEligibleError(run("claude_usage_limit"), "raw-key")).toBe(true);
+    expect(
+      isProviderFallbackEligibleError(run("whatever", { errorFamily: "transient_upstream" }), "raw-key"),
+    ).toBe(true);
+    expect(isProviderFallbackEligibleError(run("codex_transient_upstream"), "raw-key")).toBe(true);
+  });
+
+  it("a non-limit, non-auth error never consumes the chain", () => {
+    expect(isProviderFallbackEligibleError(run("network_unreachable"), "oauth-session")).toBe(false);
+    expect(isProviderFallbackEligibleError(run("bad_request"), "raw-key")).toBe(false);
+    expect(isProviderFallbackEligibleError(run(null), "oauth-session")).toBe(false);
+  });
+
+  // Composed precedence after the ELI-902 (G2) limitMarkers safety-net landed on
+  // main: the auth gate (arg 2) and the marker safety-net (arg 3) interact. These
+  // pin the resolution decision so a future edit can't silently flip it.
+  const MARKERS = [...PROVIDER_FALLBACK_DEFAULT_LIMIT_MARKERS];
+
+  it("raw-key auth errorCode short-circuits and is NOT rescued by the limitMarkers safety-net", () => {
+    // An `auth`/`session` errorCode IS the adapter's native classification, so the
+    // G2 safety-net's "no native classification" precondition is unmet — a raw-key
+    // permanent auth failure must not be flipped into a hop by a marker substring
+    // that happens to appear in the failure text.
+    const authFailWithLimitText = run(
+      "provider_auth_failed",
+      null,
+      "401 unauthorized — note: usage limit reached earlier in the session",
+    );
+    expect(isProviderFallbackEligibleError(authFailWithLimitText, "raw-key", MARKERS)).toBe(false);
+  });
+
+  it("raw-key NON-auth failure still hops when the failure text matches a limit marker", () => {
+    // No native classification (generic errorCode) → the safety-net runs and a real
+    // usage limit hops even for a raw-key provider; the auth gate only suppresses
+    // genuine auth classifications.
+    const limitText = run("adapter_error", { error: "Rate limit exceeded: 429 Too Many Requests" });
+    expect(isProviderFallbackEligibleError(limitText, "raw-key", MARKERS)).toBe(true);
+    // Without markers configured the same run does not hop.
+    expect(isProviderFallbackEligibleError(limitText, "raw-key", [])).toBe(false);
+  });
+
+  it("oauth-session auth error still hops and never reaches the safety-net (markers irrelevant)", () => {
+    expect(isProviderFallbackEligibleError(run("claude_session_limit"), "oauth-session", MARKERS)).toBe(true);
+    expect(isProviderFallbackEligibleError(run("claude_session_limit"), "oauth-session", [])).toBe(true);
+  });
+});
+
+describe("resolveFailedProviderAuthMode — threads PROVIDER_AUTH_MODES into the gate (ELI-901)", () => {
+  const agent = (env: Record<string, string>) => ({
+    runtimeConfig: FULL_RUNTIME_CHAIN,
+    adapterConfig: {
+      env: { PROVIDER_FALLBACK_CHAIN: "claude-code-personal,codex-local", ...env },
+    },
+    companyId: "co-1",
+    adapterType: "claude_local",
+  });
+  const AUTH_MODES = "claude-code-personal:oauth-session,codex-local:raw-key";
+
+  it("resolves the primary provider's mode on a first failure (no prior selection)", () => {
+    const mode = resolveFailedProviderAuthMode(
+      { contextSnapshot: {} },
+      agent({ PROVIDER_AUTH_MODES: AUTH_MODES }),
+    );
+    expect(mode).toBe("oauth-session");
+  });
+
+  it("resolves the active fallback selection's mode on a subsequent hop", () => {
+    const mode = resolveFailedProviderAuthMode(
+      { contextSnapshot: { providerFallbackSelection: { id: "codex-local" } } },
+      agent({ PROVIDER_AUTH_MODES: AUTH_MODES }),
+    );
+    expect(mode).toBe("raw-key");
+  });
+
+  it("returns null when the env declares no mode (caller defaults to oauth-session)", () => {
+    expect(resolveFailedProviderAuthMode({ contextSnapshot: {} }, agent({}))).toBeNull();
+  });
+
+  it("end-to-end: a raw-key provider's auth failure is gated out via the env surface", () => {
+    const authMode = resolveFailedProviderAuthMode(
+      { contextSnapshot: { providerFallbackSelection: { id: "codex-local" } } },
+      agent({ PROVIDER_AUTH_MODES: AUTH_MODES }),
+    );
+    expect(
+      isProviderFallbackEligibleError(
+        { errorCode: "provider_auth_failed", resultJson: null, error: null },
+        authMode,
+      ),
+    ).toBe(false);
   });
 });

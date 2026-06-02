@@ -173,11 +173,13 @@ import { environmentRunOrchestrator } from "./environment-run-orchestrator.js";
 import { isUnsafeSessionWorkspaceCwd } from "./session-workspace-cwd.js";
 import {
   getProviderFallbackPolicy,
+  parseProviderAuthModes,
   policyForCompany,
   resolveProviderFallbackEscalation,
   resolveProviderFallbackAccountCooldown,
   resolveProviderFallbackLimitMarkers,
   matchesConfiguredLimitMarker,
+  type ProviderAuthMode,
   type ProviderFallbackNotifyKind,
 } from "./provider-fallback-policy.js";
 import {
@@ -372,30 +374,77 @@ function readProviderFallbackFailureText(
     .join("\n");
 }
 
+// Detection precedence (provider-fallback-chain spec §3). Only a usage-limit
+// classification consumes the chain. The composed precedence (ELI-901 G1 +
+// ELI-902 G2) is, in order:
+//
+//   1. Native usage-limit class always hops — the adapter's `transient_upstream`
+//      family or a `claude_usage_limit` errorCode. This is checked *before* the
+//      auth gate so a raw-key auth model can never suppress a real limit.
+//   2. Native auth classification (`auth`/`session` errorCode): for an
+//      **oauth-session** provider this is a session cap/expiry — limit-like,
+//      self-clears on reset — so it hops (preserving observed production recovery
+//      for the Claude/Codex/Grok locals). For a **raw-key** provider the same
+//      error means bad/expired credentials: permanent, not a usage limit, so per
+//      §3 it follows the normal failure path and must NOT consume the chain. The
+//      provider's auth model (`authMode`) is threaded in by the caller from the
+//      agent's `PROVIDER_AUTH_MODES` surface; a missing/unknown mode defaults to
+//      oauth-session (DEFAULT_PROVIDER_AUTH_MODE), preserving the prior behavior.
+//      This branch SHORT-CIRCUITS: an `auth`/`session` errorCode is the adapter's
+//      definitive native classification, so the G2 marker safety-net's "no native
+//      classification" precondition is not met — a raw-key auth failure is not
+//      rescued into a hop by a substring match in its message text.
+//   3. Engine-level safety-net markers (ELI-902 / G2): consulted only when no
+//      native classification fired above (including an empty errorCode whose limit
+//      is surfaced in `run.error`/`resultJson`). Test the failure message/status
+//      against the configured markers so an adapter in the chain with no native
+//      detection still hops on a real usage limit.
 export function isProviderFallbackEligibleError(
   run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode" | "resultJson" | "error">,
-  // Engine-level safety-net markers (ELI-902 / G2). Consulted only when the
-  // active adapter produced no native usage-limit classification; native
-  // detection (transient_upstream / known errorCodes) always wins.
+  authMode?: ProviderAuthMode | null,
   limitMarkers: readonly string[] = [],
 ) {
   const errorCode = readNonEmptyString(run.errorCode);
+  // (1) Native usage-limit class — always hops, before the auth gate.
   if (readHeartbeatRunErrorFamily(run) === "transient_upstream") return true;
-  if (
-    errorCode &&
-    (errorCode.includes("auth") ||
-      errorCode.includes("session") ||
-      errorCode === "claude_usage_limit")
-  ) {
-    return true;
+  if (errorCode === "claude_usage_limit") return true;
+  // (2) Native auth classification — short-circuits on the auth model.
+  if (errorCode && (errorCode.includes("auth") || errorCode.includes("session"))) {
+    return authMode !== "raw-key";
   }
-  // Safety-net: the adapter missed it (no native limit classification above).
-  // Test the failure message/status against the configured markers so an adapter
-  // in the chain with no native detection still hops on a real usage limit.
+  // (3) Safety-net: no native classification above.
   if (matchesConfiguredLimitMarker(readProviderFallbackFailureText(run), limitMarkers)) {
     return true;
   }
   return false;
+}
+
+// The auth model of the provider that just failed on `run`, read from the agent's
+// `PROVIDER_AUTH_MODES` env surface (ELI-867 / ADR-0005). The failing provider is
+// the active fallback selection, or — on the first failure with no selection — the
+// agent's primary provider (mirrors `scheduleBoundedRetryForRun`/
+// `resolvePrimaryProviderId`). Returns null when the env declares no mode for that
+// provider; callers treat null as the oauth-session default. Never throws: a
+// misconfigured env yields an empty map and a null result.
+export function resolveFailedProviderAuthMode(
+  run: Pick<typeof heartbeatRuns.$inferSelect, "contextSnapshot">,
+  agent: {
+    runtimeConfig?: unknown;
+    adapterConfig?: unknown;
+    companyId: string;
+    adapterType: string;
+  },
+): ProviderAuthMode | null {
+  const adapterEnv = parseObject(parseObject(agent.adapterConfig).env);
+  const authModes = parseProviderAuthModes(adapterEnv.PROVIDER_AUTH_MODES);
+  if (authModes.size === 0) return null;
+  const enabledChain = resolveEffectiveProviderFallbackChain(agent).filter((entry) => entry.enabled);
+  const priorFallbackId = readNonEmptyString(
+    parseObject(parseObject(run.contextSnapshot).providerFallbackSelection).id,
+  );
+  const failedProviderId = priorFallbackId ?? resolvePrimaryProviderId(enabledChain, agent.adapterType);
+  if (!failedProviderId) return null;
+  return authModes.get(failedProviderId) ?? null;
 }
 
 function mergeAdapterRecoveryMetadata(input: {
@@ -5846,7 +5895,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const priorFallbackId = readNonEmptyString(priorFallbackSelection.id);
     const shouldAttemptProviderFallback =
       retryReason === BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON &&
-      isProviderFallbackEligibleError(run, resolveProviderFallbackLimitMarkers(agent.companyId));
+      isProviderFallbackEligibleError(
+        run,
+        resolveFailedProviderAuthMode(run, agent),
+        resolveProviderFallbackLimitMarkers(agent.companyId),
+      );
     const nextProviderFallback = shouldAttemptProviderFallback
       ? selectNextProviderFallbackEntry({
           chain: providerFallbackChain,
@@ -9397,6 +9450,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           (readTransientRecoveryContractFromRun(livenessRun) ||
             isProviderFallbackEligibleError(
               livenessRun,
+              resolveFailedProviderAuthMode(livenessRun, agent),
               resolveProviderFallbackLimitMarkers(agent.companyId),
             ))
         ) {

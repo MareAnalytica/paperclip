@@ -12,6 +12,47 @@ export const PROVIDER_FALLBACK_ADAPTER_TYPES = [
 
 export type ProviderFallbackAdapterType = (typeof PROVIDER_FALLBACK_ADAPTER_TYPES)[number];
 
+// Per-provider authentication model (ELI-867 / ADR-0005). It is an advisory,
+// secret-free routing fact — never a credential. The blueprint carries it to the
+// runtime as the `PROVIDER_AUTH_MODES` env value (comma-joined `id:mode`, in chain
+// order); see the provider-fallback-chain spec §2.1. The runtime uses it to make
+// detection precedence auth-model-aware (ELI-901): an oauth-session cap/expiry is
+// limit-like and self-clears on reset (hop), whereas a raw-key auth failure is a
+// permanent bad-credential error (normal failure path, do not consume the chain).
+export const PROVIDER_AUTH_MODES = ["oauth-session", "raw-key"] as const;
+
+export type ProviderAuthMode = (typeof PROVIDER_AUTH_MODES)[number];
+
+// The spec §2.1 default when a provider declares no explicit mode. The eli-board
+// blueprint's `DEFAULT_PROVIDER_AUTH_MODES` mirrors this; keeping the default here
+// means an absent/partial `PROVIDER_AUTH_MODES` env preserves the prior hop
+// behavior (every provider treated as oauth-session) rather than silently changing
+// production recovery.
+export const DEFAULT_PROVIDER_AUTH_MODE: ProviderAuthMode = "oauth-session";
+
+function isProviderAuthMode(value: unknown): value is ProviderAuthMode {
+  return PROVIDER_AUTH_MODES.includes(value as ProviderAuthMode);
+}
+
+// Parse the `PROVIDER_AUTH_MODES` env value — a comma-joined list of
+// `providerId:authMode` pairs (ELI-867) — into a provider-id → auth-model map.
+// Non-string input, blank/malformed pairs, and unrecognised modes are skipped so a
+// misconfigured env can never throw on the recovery path; the first valid pair for
+// a given id wins.
+export function parseProviderAuthModes(value: unknown): Map<string, ProviderAuthMode> {
+  const out = new Map<string, ProviderAuthMode>();
+  if (typeof value !== "string") return out;
+  for (const pair of value.split(",")) {
+    const sep = pair.indexOf(":");
+    if (sep < 0) continue;
+    const id = pair.slice(0, sep).trim();
+    const mode = pair.slice(sep + 1).trim();
+    if (!id || out.has(id) || !isProviderAuthMode(mode)) continue;
+    out.set(id, mode);
+  }
+  return out;
+}
+
 export interface ProviderFallbackEntry {
   id: string;
   adapter: ProviderFallbackAdapterType;
