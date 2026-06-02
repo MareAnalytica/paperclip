@@ -390,6 +390,12 @@ function sameRunLock(checkoutRunId: string | null, actorRunId: string | null) {
 }
 
 const TERMINAL_HEARTBEAT_RUN_STATUSES = new Set(["succeeded", "failed", "cancelled", "timed_out"]);
+/** After this many ms past a scheduled_retrys due time, treat it as stale for release/adopt guards.
+ * Prevents scheduled_retry runs that re-arm indefinitely (e.g. due to transient ingress/502s) from
+ * wedging issue checkouts forever. Healthy near-due scheduled retries remain protected.
+ * (ELI-907)
+ */
+const OVERDUE_SCHEDULED_RETRY_STALE_MS = 5 * 60 * 1000;
 const ISSUE_LIST_DESCRIPTION_MAX_CHARS = 1200;
 const ISSUE_LIST_DESCRIPTION_MAX_BYTES = ISSUE_LIST_DESCRIPTION_MAX_CHARS * 4;
 
@@ -3368,12 +3374,20 @@ export function issueService(db: Db) {
 
   async function isTerminalOrMissingHeartbeatRun(runId: string) {
     const run = await db
-      .select({ status: heartbeatRuns.status })
+      .select({
+        status: heartbeatRuns.status,
+        scheduledRetryAt: heartbeatRuns.scheduledRetryAt,
+      })
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.id, runId))
       .then((rows) => rows[0] ?? null);
     if (!run) return true;
-    return TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status);
+    if (TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status)) return true;
+    if (run.status === "scheduled_retry" && run.scheduledRetryAt) {
+      const due = new Date(run.scheduledRetryAt).getTime();
+      if (Date.now() - due > OVERDUE_SCHEDULED_RETRY_STALE_MS) return true;
+    }
+    return false;
   }
 
   async function adoptStaleCheckoutRun(input: {
@@ -4998,7 +5012,7 @@ export function issueService(db: Db) {
       return enriched;
     },
 
-    adminForceRelease: async (id: string, options: { clearAssignee?: boolean } = {}) =>
+    adminForceRelease: async (id: string, options: { clearAssignee?: boolean; clearReviewState?: boolean } = {}) =>
       db.transaction(async (tx) => {
         await tx.execute(
           sql`select ${issues.id} from ${issues} where ${issues.id} = ${id} for update`,
@@ -5006,14 +5020,17 @@ export function issueService(db: Db) {
         const existing = await tx
           .select({
             id: issues.id,
+            status: issues.status,
             checkoutRunId: issues.checkoutRunId,
             executionRunId: issues.executionRunId,
+            executionState: issues.executionState,
           })
           .from(issues)
           .where(eq(issues.id, id))
           .then((rows) => rows[0] ?? null);
         if (!existing) return null;
 
+        const clearReviewState = options.clearReviewState ?? true; // default true so board/CEO can unwedge review stages held by lost/scheduled runs (ELI-907)
         const patch: Partial<typeof issues.$inferInsert> = {
           checkoutRunId: null,
           executionRunId: null,
@@ -5023,6 +5040,12 @@ export function issueService(db: Db) {
         };
         if (options.clearAssignee) {
           patch.assigneeAgentId = null;
+        }
+        if (clearReviewState) {
+          patch.executionState = null;
+          if (existing.status === "in_review") {
+            patch.status = "todo";
+          }
         }
 
         const updated = await tx
@@ -5039,6 +5062,8 @@ export function issueService(db: Db) {
           previous: {
             checkoutRunId: existing.checkoutRunId,
             executionRunId: existing.executionRunId,
+            executionState: existing.executionState,
+            status: existing.status,
           },
         };
       }),

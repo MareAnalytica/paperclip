@@ -4762,7 +4762,8 @@ export function issueRoutes(
     assertCompanyAccess(req, existing.companyId);
 
     const clearAssignee = req.query.clearAssignee === "true";
-    const result = await svc.adminForceRelease(id, { clearAssignee });
+    const clearReviewState = req.query.clearReviewState !== "false"; // default true to allow CEO/board to force-unwedge in_review stages held by scheduled_retry/process-lost runs (ELI-907)
+    const result = await svc.adminForceRelease(id, { clearAssignee, clearReviewState });
     if (!result) {
       res.status(404).json({ error: "Issue not found" });
       return;
@@ -4783,7 +4784,10 @@ export function issueRoutes(
         actorUserId: req.actor.userId,
         prevCheckoutRunId: result.previous.checkoutRunId,
         prevExecutionRunId: result.previous.executionRunId,
+        prevStatus: result.previous.status,
+        prevExecutionStatePresent: !!result.previous.executionState,
         clearAssignee,
+        clearReviewState,
       },
     });
 

@@ -220,13 +220,15 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
       id: issueId,
       companyId,
       title: "Admin force release",
-      status: "in_progress",
+      status: "in_review",
       priority: "high",
       assigneeAgentId: agentId,
       checkoutRunId: currentRunId,
       executionRunId: failedRunId,
       executionAgentNameKey: "codexcoder",
       executionLockedAt: new Date(),
+      // simulate wedged review stage from a scheduled_retry reviewer run (ELI-907)
+      executionState: { status: "pending", currentStageId: "review-1", currentStageType: "review", currentParticipant: { type: "agent", agentId }, returnAssignee: { type: "user", userId: "board-user" }, completedStageIds: [], lastDecisionOutcome: null },
     });
 
     await request(createApp(agentActor(companyId, agentId, currentRunId)))
@@ -250,15 +252,19 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(res.body.issue).toMatchObject({
       id: issueId,
+      status: "todo", // downgraded from in_review because clearReviewState default (ELI-907)
       assigneeAgentId: null,
       checkoutRunId: null,
       executionRunId: null,
       executionLockedAt: null,
+      executionState: null, // cleared so CEO/board can advance past wedged review stage
     });
-    expect(res.body.previous).toEqual({
+    expect(res.body.previous).toMatchObject({
       checkoutRunId: currentRunId,
       executionRunId: failedRunId,
+      status: "in_review",
     });
+    expect(res.body.previous.executionState).toBeTruthy();
 
     const audit = await db
       .select({
@@ -279,8 +285,56 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
         actorUserId: "board-user",
         prevCheckoutRunId: currentRunId,
         prevExecutionRunId: failedRunId,
+        prevStatus: "in_review",
+        prevExecutionStatePresent: true,
         clearAssignee: true,
+        clearReviewState: true,
       },
     });
+  });
+
+  it("treats overdue scheduled_retry checkoutRunId as stale so assignee can release (prevents indefinite wedge)", async () => {
+    const { companyId, agentId, failedRunId, currentRunId } = await seedCompanyAgentAndRuns();
+    const issueId = randomUUID();
+    const overdueScheduledRunId = randomUUID();
+    const overdueAt = new Date(Date.now() - 10 * 60 * 1000); // 10min past due
+    await db.insert(heartbeatRuns).values({
+      id: overdueScheduledRunId,
+      companyId,
+      agentId,
+      status: "scheduled_retry",
+      invocationSource: "automation",
+      triggerDetail: "system",
+      scheduledRetryAt: overdueAt,
+      scheduledRetryAttempt: 5,
+      scheduledRetryReason: "process_lost",
+      finishedAt: null,
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Overdue scheduled retry wedge",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: overdueScheduledRunId,
+      executionRunId: overdueScheduledRunId,
+      executionAgentNameKey: "codexcoder",
+      executionLockedAt: new Date(),
+    });
+
+    // rightful assignee using a fresh run should now be able to release because overdue scheduled is stale (ELI-907)
+    const res = await request(createApp(agentActor(companyId, agentId, currentRunId)))
+      .post(`/api/issues/${issueId}/release`)
+      .send();
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+
+    const row = await db
+      .select({ status: issues.status, checkoutRunId: issues.checkoutRunId, executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row).toEqual({ status: "todo", checkoutRunId: null, executionRunId: null });
   });
 });
