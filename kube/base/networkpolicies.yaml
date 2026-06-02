@@ -13,11 +13,14 @@ spec:
     - Ingress
     - Egress
 ---
-# Allow ingress from ingress-nginx namespace to paperclip pods on port 3100
+# Allow ingress from the ingress controller (traefik in kube-system for this cluster;
+# ingress-nginx in some other setups) to paperclip pods on port 3100.
+# This is required for external ingress (traefik) to reach the paperclip Service
+# endpoints (podIPs) when default-deny-all is active. See ELI-910.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: allow-ingress-from-nginx
+  name: allow-ingress-from-traefik
   namespace: paperclip
   labels:
     app: paperclip
@@ -32,10 +35,31 @@ spec:
     - from:
         - namespaceSelector:
             matchLabels:
-              kubernetes.io/metadata.name: ingress-nginx
+              kubernetes.io/metadata.name: kube-system
       ports:
         - protocol: TCP
           port: 3100
+---
+# Allow ingress from same namespace (for in-ns service calls, tests, internal clients via ClusterIP)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-same-namespace-ingress
+  namespace: paperclip
+  labels:
+    app: paperclip
+    app.kubernetes.io/name: paperclip
+spec:
+  podSelector:
+    matchLabels:
+      app: paperclip
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: paperclip
 ---
 # Allow egress to kube-system for DNS (port 53 TCP+UDP)
 apiVersion: networking.k8s.io/v1

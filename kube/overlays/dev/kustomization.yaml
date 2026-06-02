@@ -112,3 +112,20 @@ patches:
                   limits:
                     memory: "512Mi"
                     cpu: "1000m"
+
+  # ELI-910: fix netpol for actual ingress (traefik in kube-system, not ingress-nginx)
+  # and provide same-namespace allow (the ns transformer does not rewrite nsSelector values).
+  - target:
+      kind: NetworkPolicy
+      name: allow-ingress-from-traefik
+    patch: |
+      - op: replace
+        path: /spec/ingress/0/from/0/namespaceSelector/matchLabels/kubernetes.io~1metadata.name
+        value: kube-system
+  - target:
+      kind: NetworkPolicy
+      name: allow-same-namespace-ingress
+    patch: |
+      - op: replace
+        path: /spec/ingress/0/from/0/namespaceSelector/matchLabels/kubernetes.io~1metadata.name
+        value: paperclip-dev
