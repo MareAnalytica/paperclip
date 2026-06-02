@@ -1,5 +1,7 @@
 export {
   createDb,
+  createAdvisoryLockSession,
+  type AdvisoryLockSession,
   getPostgresDataDirectory,
   ensurePostgresDatabase,
   inspectMigrations,

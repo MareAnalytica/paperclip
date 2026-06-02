@@ -50,6 +50,45 @@ export function createDb(url: string) {
   return drizzlePg(sql, { schema });
 }
 
+export interface AdvisoryLockSession {
+  /** Non-blocking attempt to grab the (classId,objId) lock on this session. */
+  tryAcquire(classId: number, objId: number): Promise<boolean>;
+  /** Best-effort release of the lock held by this session. */
+  release(classId: number, objId: number): Promise<void>;
+  /** Liveness probe; rejects if the connection is no longer usable. */
+  ping(): Promise<void>;
+  /** Tear down the connection (also releases any session-scoped locks). */
+  end(): Promise<void>;
+}
+
+/**
+ * Open a DEDICATED single connection for holding a session-scoped
+ * `pg_advisory_lock` in the two-int key space (distinct from the single-bigint
+ * key space used by plugin migrations, so there is no collision). The lock
+ * lives on this exact backend session for its lifetime and auto-releases if the
+ * connection drops. Backs the scheduler leader-election guard (DEE-699).
+ */
+export function createAdvisoryLockSession(url: string): AdvisoryLockSession {
+  const sql = postgres(url, { max: 1, onnotice: () => {} });
+  return {
+    async tryAcquire(classId, objId) {
+      const rows = await sql<{ locked: boolean }[]>`
+        SELECT pg_try_advisory_lock(${classId}, ${objId}) AS locked
+      `;
+      return rows[0]?.locked === true;
+    },
+    async release(classId, objId) {
+      await sql`SELECT pg_advisory_unlock(${classId}, ${objId})`;
+    },
+    async ping() {
+      await sql`SELECT 1`;
+    },
+    async end() {
+      await sql.end({ timeout: 5 });
+    },
+  };
+}
+
 export async function getPostgresDataDirectory(url: string): Promise<string | null> {
   const sql = createUtilitySql(url);
   try {
