@@ -125,6 +125,19 @@ type RecoveryWakeup = (
   opts?: RecoveryWakeupOptions,
 ) => Promise<typeof heartbeatRuns.$inferSelect | null>;
 
+// Liveness probes used by the orphaned-local-child classifier (§9 step 1). These
+// consult the host OS (pid identity via /proc, process-group signalling), so they
+// are injectable to keep the orphan/horizon branch deterministic under test
+// regardless of the runner. Production defaults to the real DEE-662-hardened
+// implementations; only tests override them. Defaulting preserves prod behavior.
+type OrphanLivenessProbe = {
+  isRecordedChildAlive: (
+    pid: number | null | undefined,
+    recordedStartedAt: Date | string | null | undefined,
+  ) => boolean;
+  isProcessGroupAlive: (processGroupId: number | null | undefined) => boolean;
+};
+
 type LatestIssueRun = Pick<
   typeof heartbeatRuns.$inferSelect,
   "id" | "agentId" | "status" | "error" | "errorCode" | "contextSnapshot" | "livenessState"
@@ -469,7 +482,15 @@ function buildLivenessOriginalIssueComment(finding: IssueLivenessFinding, escala
   ].join("\n");
 }
 
-export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup }) {
+export function recoveryService(
+  db: Db,
+  deps: { enqueueWakeup: RecoveryWakeup; orphanLiveness?: Partial<OrphanLivenessProbe> },
+) {
+  // Real host probes by default; tests inject deterministic ones (ELI-915). The
+  // orphan classifier (§9 step 1) is the only consumer — the signalling path keeps
+  // its direct probe calls since it never runs under the watchdog unit tests.
+  const probeRecordedChildAlive = deps.orphanLiveness?.isRecordedChildAlive ?? isRecordedChildAlive;
+  const probeProcessGroupAlive = deps.orphanLiveness?.isProcessGroupAlive ?? isProcessGroupAlive;
   const issuesSvc = issueService(db);
   const recoveryActionsSvc = issueRecoveryActionService(db);
   const treeControlSvc = issueTreeControlService(db);
@@ -902,8 +923,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     // reapOrphanedRuns — a recycled low PID after a pod restart must not mask an
     // orphaned run as "still alive". The group path keeps bare liveness: a live
     // group with a dead leader is a legitimate not-yet-orphaned descendant set.
-    if (run.processPid && isRecordedChildAlive(run.processPid, run.processStartedAt)) return false;
-    if (isProcessGroupAlive(run.processGroupId)) return false;
+    if (run.processPid && probeRecordedChildAlive(run.processPid, run.processStartedAt)) return false;
+    if (probeProcessGroupAlive(run.processGroupId)) return false;
     return true;
   }
 

@@ -1665,15 +1665,27 @@ describeEmbeddedPostgres("watchdog escalation horizon (§11)", () => {
 
   it("does NOT reap-defer a live-but-silent local run (recorded pid alive) — stays on horizon", async () => {
     const now = new Date();
-    // process.pid is this test process — definitively alive → not orphaned.
+    // ELI-915: a genuinely-live recorded child. We inject the orphan-liveness probe
+    // rather than relying on `process.pid` aliveness, because the DEE-662 pid-identity
+    // gate (boot-epoch + /proc start-time) reads the seeded `processStartedAt` (~8h in
+    // the past, needed to drive critical silence) as predating this process's boot and
+    // flags it as a reused pid → "dead". That host-pid coupling is what made this lane
+    // flake on the arc-runner. The gate's own behavior is unit-tested in
+    // heartbeat-process-recovery.test.ts; here we assert only the integration branch:
+    // an alive recorded child is NOT reap-deferred and stays on the §11 horizon.
+    const livePid = 4242;
     const { companyId } = await seedSilentLocalRun({
       now,
-      processPid: process.pid,
+      processPid: livePid,
       priorReArmWindows: 8,
     });
 
     const recovery = recoveryService(db, {
       enqueueWakeup: vi.fn(async () => null),
+      orphanLiveness: {
+        isRecordedChildAlive: (pid) => pid === livePid,
+        isProcessGroupAlive: () => false,
+      },
     });
     const result = await recovery.scanSilentActiveRuns({ now, companyId });
 
