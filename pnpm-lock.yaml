@@ -106,10 +106,6 @@ importers:
         version: 5.9.3
 
   packages/adapter-utils:
-    dependencies:
-      '@paperclipai/paperclip-cost-client':
-        specifier: workspace:*
-        version: link:../paperclip-cost-client
     devDependencies:
       '@types/node':
         specifier: ^24.6.0
@@ -338,22 +334,6 @@ importers:
       zod:
         specifier: ^3.24.2
         version: 3.25.76
-    devDependencies:
-      '@types/node':
-        specifier: ^24.6.0
-        version: 24.12.0
-      typescript:
-        specifier: ^5.7.3
-        version: 5.9.3
-      vitest:
-        specifier: ^3.0.5
-        version: 3.2.4(@types/debug@4.1.12)(@types/node@24.12.0)(jiti@2.6.1)(jsdom@28.1.0(@noble/hashes@2.0.1))(lightningcss@1.30.2)(tsx@4.21.0)(yaml@2.9.0)
-
-  packages/paperclip-cost-client:
-    dependencies:
-      '@paperclipai/shared':
-        specifier: workspace:*
-        version: link:../shared
     devDependencies:
       '@types/node':
         specifier: ^24.6.0
