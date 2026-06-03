@@ -81,7 +81,7 @@ describe("provider-fallback limitMarkers safety-net + chain-coverage (ELI-902 / 
     it("auth/session/claude_usage_limit errorCodes stay eligible (native path unchanged)", () => {
       for (const errorCode of ["claude_auth_required", "codex_session_expired", "claude_usage_limit"]) {
         expect(
-          isProviderFallbackEligibleError({ errorCode, error: null, resultJson: null }, null, []),
+          isProviderFallbackEligibleError({ errorCode, error: null, resultJson: null, contextSnapshot: null }, null, []),
         ).toBe(true);
       }
     });

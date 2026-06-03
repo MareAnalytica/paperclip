@@ -299,10 +299,11 @@ describe("provider fallback model boundary (merge integration)", () => {
 });
 
 describe("isProviderFallbackEligibleError — auth-model-aware detection precedence (ELI-901)", () => {
-  const run = (errorCode: string | null, resultJson: unknown = null, error: string | null = null) => ({
+  const run = (errorCode: string | null, resultJson: unknown = null, error: string | null = null, contextSnapshot: unknown = null) => ({
     errorCode,
     resultJson,
     error,
+    contextSnapshot,
   });
 
   it("oauth-session provider: a session cap / auth-session error is limit-like and hops", () => {
@@ -371,6 +372,49 @@ describe("isProviderFallbackEligibleError — auth-model-aware detection precede
     expect(isProviderFallbackEligibleError(run("claude_session_limit"), "oauth-session", MARKERS)).toBe(true);
     expect(isProviderFallbackEligibleError(run("claude_session_limit"), "oauth-session", [])).toBe(true);
   });
+
+  // ELI-951 Contract B: no-output kill (from Contract A idle deadline) on fallback hop
+  // is provider-fallback-eligible so the chain advances; primary no_output/timeout is not.
+  it("Contract A no-output kill on non-primary fallback hop is fallback-eligible (Contract B)", () => {
+    const hopKill = run(
+      "timeout",
+      { errorCode: "adapter_no_output_timeout", errorMessage: "Adapter invocation killed by idle no-output deadline after 600s (no new output observed).", errorMeta: { noOutput: true, noOutputKillSec: 600 } },
+      "Adapter invocation killed by idle no-output deadline after 600s (no new output observed).",
+      { providerFallbackSelection: { id: "grok-local", adapter: "grok_local" } },
+    );
+    expect(isProviderFallbackEligibleError(hopKill, "oauth-session")).toBe(true);
+    // Also eligible independent of raw-key (internal kill, not auth classification).
+    expect(isProviderFallbackEligibleError(hopKill, "raw-key")).toBe(true);
+    // Without markers etc, still hops because of the explicit no_output rule.
+    expect(isProviderFallbackEligibleError(hopKill, "raw-key", [])).toBe(true);
+  });
+
+  it("Contract A no-output kill (or bare timeout) on primary adapter is NOT fallback-eligible", () => {
+    const primaryTimeout = run("timeout", null, "Timed out after 30s", {});
+    expect(isProviderFallbackEligibleError(primaryTimeout, "oauth-session")).toBe(false);
+
+    const primaryNoOutputKill = run(
+      "timeout",
+      { errorCode: "adapter_no_output_timeout", errorMeta: { noOutput: true } },
+      "idle no-output deadline after 600s",
+      null, // no prior selection → primary
+    );
+    expect(isProviderFallbackEligibleError(primaryNoOutputKill, "oauth-session")).toBe(false);
+    expect(isProviderFallbackEligibleError(primaryNoOutputKill, "raw-key")).toBe(false);
+  });
+
+  it("no_output kill on hop still respects later marker safety-net for non-no_output cases (precedence preserved)", () => {
+    // The no_output early return for hops must not change behavior for other hop failures:
+    // non-no_output hop errors still require marker (or native) to hop; no silent auto-hop.
+    const hopNonNoOutput = run(
+      "adapter_error",
+      { error: "rate limit exceeded on fallback hop (non no-output)" },
+      "rate limit exceeded on fallback hop (non no-output)",
+      { providerFallbackSelection: { id: "grok-local", adapter: "grok_local" } },
+    );
+    expect(isProviderFallbackEligibleError(hopNonNoOutput, "oauth-session", [])).toBe(false);
+    expect(isProviderFallbackEligibleError(hopNonNoOutput, "oauth-session", MARKERS)).toBe(true);
+  });
 });
 
 describe("resolveFailedProviderAuthMode — threads PROVIDER_AUTH_MODES into the gate (ELI-901)", () => {
@@ -411,7 +455,7 @@ describe("resolveFailedProviderAuthMode — threads PROVIDER_AUTH_MODES into the
     );
     expect(
       isProviderFallbackEligibleError(
-        { errorCode: "provider_auth_failed", resultJson: null, error: null },
+        { errorCode: "provider_auth_failed", resultJson: null, error: null, contextSnapshot: null },
         authMode,
       ),
     ).toBe(false);

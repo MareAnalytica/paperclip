@@ -363,7 +363,10 @@ function readTransientRecoveryContractFromRun(
 // and the errorCode — not full stdout/stderr, so unrelated agent output mentioning
 // "rate limit" cannot spuriously trigger a hop.
 function readProviderFallbackFailureText(
-  run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode" | "resultJson" | "error">,
+  run: Pick<
+    typeof heartbeatRuns.$inferSelect,
+    "errorCode" | "resultJson" | "error" | "contextSnapshot"
+  >,
 ): string {
   const resultJson = parseObject(run.resultJson);
   return [
@@ -376,14 +379,44 @@ function readProviderFallbackFailureText(
     .join("\n");
 }
 
+// Contract B (ELI-951): detect the specific Contract-A idle no-output kill surfaced by
+// local adapters (grok-local etc) so we can gate eligibility on "was this a fallback hop".
+// Distinguishes from bare wall-clock timeout (different message, no noOutput marker).
+// The kill produces timedOut:true + errorCode in adapter layer, but heartbeat normalizes
+// run.errorCode="timeout" for any timedOut; we rely on distinctive message + result fields.
+function isNoOutputKillFromContractA(
+  run: Pick<
+    typeof heartbeatRuns.$inferSelect,
+    "errorCode" | "resultJson" | "error" | "contextSnapshot"
+  >,
+): boolean {
+  const errorCode = readNonEmptyString(run.errorCode);
+  if (errorCode !== "timeout") return false;
+  const text = readProviderFallbackFailureText(run).toLowerCase();
+  if (text.includes("idle no-output deadline") || text.includes("adapter_no_output_timeout")) {
+    return true;
+  }
+  const rj = parseObject(run.resultJson);
+  if (rj.noOutput === true) return true;
+  if (readNonEmptyString(rj.errorCode) === "adapter_no_output_timeout") return true;
+  const meta = parseObject(rj.errorMeta);
+  if (meta.noOutput === true) return true;
+  return false;
+}
+
 // Detection precedence (provider-fallback-chain spec §3). Only a usage-limit
 // classification consumes the chain. The composed precedence (ELI-901 G1 +
-// ELI-902 G2) is, in order:
+// ELI-902 G2 + ELI-951 Contract B) is, in order:
 //
 //   1. Native usage-limit class always hops — the adapter's `transient_upstream`
 //      family or a `claude_usage_limit` errorCode. This is checked *before* the
 //      auth gate so a raw-key auth model can never suppress a real limit.
-//   2. Native auth classification (`auth`/`session` errorCode): for an
+//   2. (ELI-951) Contract-A no-output idle kill on a *non-primary fallback hop*
+//      (prior providerFallbackSelection present in run contextSnapshot) is
+//      eligible — advances the chain instead of failing. Primary-adapter no_output
+//      or bare wall timeout is deliberately *not* eligible. This is independent of
+//      authMode (internal engine kill, not provider auth/session classification).
+//   3. Native auth classification (`auth`/`session` errorCode): for an
 //      **oauth-session** provider this is a session cap/expiry — limit-like,
 //      self-clears on reset — so it hops (preserving observed production recovery
 //      for the Claude/Codex/Grok locals). For a **raw-key** provider the same
@@ -396,13 +429,16 @@ function readProviderFallbackFailureText(
 //      definitive native classification, so the G2 marker safety-net's "no native
 //      classification" precondition is not met — a raw-key auth failure is not
 //      rescued into a hop by a substring match in its message text.
-//   3. Engine-level safety-net markers (ELI-902 / G2): consulted only when no
+//   4. Engine-level safety-net markers (ELI-902 / G2): consulted only when no
 //      native classification fired above (including an empty errorCode whose limit
 //      is surfaced in `run.error`/`resultJson`). Test the failure message/status
 //      against the configured markers so an adapter in the chain with no native
 //      detection still hops on a real usage limit.
 export function isProviderFallbackEligibleError(
-  run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode" | "resultJson" | "error">,
+  run: Pick<
+    typeof heartbeatRuns.$inferSelect,
+    "errorCode" | "resultJson" | "error" | "contextSnapshot"
+  >,
   authMode?: ProviderAuthMode | null,
   limitMarkers: readonly string[] = [],
 ) {
@@ -410,6 +446,21 @@ export function isProviderFallbackEligibleError(
   // (1) Native usage-limit class — always hops, before the auth gate.
   if (readHeartbeatRunErrorFamily(run) === "transient_upstream") return true;
   if (errorCode === "claude_usage_limit") return true;
+
+  // (Contract B / ELI-951) A Contract-A no-output kill on a *non-primary fallback adapter*
+  // (i.e. a hop that was already selected via the provider chain) is fallback-eligible:
+  // the chain advances (e.g. grok-local → codex-local) instead of failing the run.
+  // Primary-adapter no_output / bare timeout must remain ineligible (preserve prod behavior,
+  // do not mask primary adapter problems). Composes with ELI-901/902 auth gating (no_output
+  // is an internal kill, not an auth/session classification, so authMode does not gate it).
+  if (isNoOutputKillFromContractA(run)) {
+    const ctx = parseObject((run as any).contextSnapshot);
+    const priorSelection = parseObject(ctx.providerFallbackSelection);
+    const onNonPrimaryFallbackHop = !!readNonEmptyString(priorSelection.id);
+    if (onNonPrimaryFallbackHop) return true;
+    // Primary (no prior selection) → fall through to ineligible.
+  }
+
   // (2) Native auth classification — short-circuits on the auth model.
   if (errorCode && (errorCode.includes("auth") || errorCode.includes("session"))) {
     return authMode !== "raw-key";
