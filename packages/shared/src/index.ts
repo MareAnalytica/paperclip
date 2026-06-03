@@ -997,6 +997,10 @@ export {
   updateMemberPermissionsSchema,
   searchAdminUsersQuerySchema,
   updateUserCompanyAccessSchema,
+  preflightRequestSchema,
+  chargeRequestSchema,
+  type PreflightRequest,
+  type ChargeRequest,
   type CreateCostEvent,
   type CreateFinanceEvent,
   type UpdateBudget,
@@ -1213,3 +1217,16 @@ export type {
   FiringGate,
   CapResolution,
 } from "./budget/cap-precedence.js";
+export {
+  PREFLIGHT_DECISIONS,
+  capBand,
+  capFiringAction,
+  enforcementResponse,
+  preflightDecision,
+} from "./budget/enforcement.js";
+export type {
+  PreflightDecision,
+  CapBand,
+  CapThresholds,
+  EnforcementResponse,
+} from "./budget/enforcement.js";

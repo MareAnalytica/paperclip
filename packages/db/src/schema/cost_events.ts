@@ -32,12 +32,13 @@ export const costEvents = pgTable(
   {
     id: uuid("id").primaryKey().defaultRandom(),
     companyId: uuid("company_id").notNull().references(() => companies.id),
-    // NOTE: §2.1 specifies agentId as nullable (null for human-initiated or
-    // source-less system/timer charges). Kept NOT NULL here to keep this
-    // migration purely additive — relaxing it changes the inferred type for
-    // existing consumers (costs/budgets/finance). The nullable relaxation lands
-    // with the charge writer (ELI-72), which updates those call sites together.
-    agentId: uuid("agent_id").notNull().references(() => agents.id),
+    // §2.1: agentId is nullable — null for human-initiated actions and for
+    // source-less system/timer charges (e.g. a provider-health probe), which are
+    // first-class in the run-health / auditability model, not an exception path.
+    // Relaxed from NOT NULL by the charge writer (ELI-75); existing consumers
+    // (costs/budgets/finance) read it as `string | null` and group/join cleanly
+    // on null.
+    agentId: uuid("agent_id").references(() => agents.id),
     userId: text("user_id").references(() => authUsers.id),
     issueId: uuid("issue_id").references(() => issues.id),
     projectId: uuid("project_id").references(() => projects.id),
