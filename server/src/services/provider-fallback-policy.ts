@@ -115,6 +115,53 @@ const DEFAULT_ACCOUNT_COOLDOWN: ProviderFallbackAccountCooldown = {
   enabled: true,
 };
 
+// Provider-health fail-fast + recovery loop-breaker policy (blueprint spec
+// `eli-board.provider-health.v1`, ELI-961 / PR #208; runtime enforcement is the
+// ELI-947 Contract A–C tree). The block carries only ms durations, counts, and
+// public provider-id slugs — no secrets, hosts, or paths — so the posture stays
+// portable across clusters. The whole block is OPTIONAL: when omitted the
+// disabled default below preserves pre-ELI-961 behavior (no client-side
+// deadline, no unresponsive→cooldown coupling, no loop-breaker bound).
+export const PROVIDER_HEALTH_INVOCATION_TIMEOUT_MS_MAX = 3_600_000; // ≤ 1h
+export const PROVIDER_HEALTH_COOLDOWN_MS_MAX = 86_400_000; // ≤ 24h
+export const PROVIDER_HEALTH_MAX_UNRESPONSIVE_RETRIES_MAX = 10;
+// Opt-in defaults applied only when the block IS present but a field is omitted
+// (spec §2) so a partial block is still safe. `invocationTimeoutMsDefault` has
+// NO opt-in default — it must be set explicitly to arm fail-fast.
+export const PROVIDER_HEALTH_DEFAULT_COOLDOWN_MS = 300_000; // 5 min
+export const PROVIDER_HEALTH_DEFAULT_MAX_UNRESPONSIVE_RETRIES = 2;
+
+// Slug shape for a fallback-chain provider id used as a per-provider key.
+const PROVIDER_ID_SLUG = /^[a-z0-9][a-z0-9-]*$/;
+
+export interface ProviderHealthPolicy {
+  // Global client-side adapter-invocation deadline (ms). `0` ⇒ no deadline.
+  invocationTimeoutMsDefault: number;
+  // Per-provider deadline override keyed by chain provider id; `0` for a
+  // provider ⇒ no deadline for it even when the global default is non-zero.
+  perProviderInvocationTimeoutMs: Map<string, number>;
+  // Cooldown applied to a (provider, account) on a `provider_unresponsive`
+  // demerit, in the SAME store as the ELI-855/856 cross-run breaker. `0` ⇒ the
+  // unresponsive→cooldown coupling is disabled (no behavior change).
+  cooldownMs: number;
+  recovery: {
+    // Loop-breaker bound: max consecutive `provider_unresponsive` recoveries for
+    // a single (issue, provider) pair before recovery must fail over / escalate
+    // instead of re-queuing the same pair. `0` ⇒ bound disabled.
+    maxUnresponsiveRetriesPerProvider: number;
+  };
+}
+
+// The disabled default (spec §2): an omitted block ⇒ pre-ELI-961 behavior.
+export function disabledProviderHealthPolicy(): ProviderHealthPolicy {
+  return {
+    invocationTimeoutMsDefault: 0,
+    perProviderInvocationTimeoutMs: new Map(),
+    cooldownMs: 0,
+    recovery: { maxUnresponsiveRetriesPerProvider: 0 },
+  };
+}
+
 export interface ResolvedProviderFallbackPolicy {
   schemaVersion: "1";
   default: ProviderFallbackPolicy;
@@ -128,6 +175,9 @@ export interface ResolvedProviderFallbackPolicy {
   boardEscalation: ProviderFallbackBoardEscalation;
   // Account/provider cooldown for new root runs (ticket ELI-855).
   accountCooldown: ProviderFallbackAccountCooldown;
+  // Provider-health fail-fast + recovery loop-breaker (spec
+  // `eli-board.provider-health.v1`, ELI-961 / ELI-947 Contracts A–C).
+  providerHealth: ProviderHealthPolicy;
 }
 
 export interface ProviderFallbackLoadOptions {
@@ -409,6 +459,106 @@ function parseAccountCooldown(accountCooldown: unknown): ProviderFallbackAccount
   return { enabled };
 }
 
+// Validate an optional bounded integer field. `undefined`/`null` ⇒ `fallback`.
+function parseBoundedInteger(
+  raw: unknown,
+  min: number,
+  max: number,
+  fallback: number,
+  ctx: string,
+): number {
+  if (raw === undefined || raw === null) return fallback;
+  if (typeof raw !== "number" || !Number.isInteger(raw) || raw < min || raw > max) {
+    throw new Error(
+      `[provider-fallback-policy] ${ctx} must be an integer in [${min}, ${max}]`,
+    );
+  }
+  return raw;
+}
+
+// Parse `providerFallback.providerHealth` (spec §2 / §6). Omitted ⇒ the disabled
+// default. Present-but-partial ⇒ conservative opt-in defaults per spec §2.
+function parseProviderHealth(providerHealth: unknown): ProviderHealthPolicy {
+  if (providerHealth === undefined || providerHealth === null) {
+    return disabledProviderHealthPolicy();
+  }
+  if (typeof providerHealth !== "object" || Array.isArray(providerHealth)) {
+    throw new Error(
+      "[provider-fallback-policy] providerFallback.providerHealth must be an object",
+    );
+  }
+  const o = providerHealth as Record<string, unknown>;
+
+  // No opt-in default: leaving this 0 keeps fail-fast off even with the block
+  // present (spec §2).
+  const invocationTimeoutMsDefault = parseBoundedInteger(
+    o.invocationTimeoutMsDefault,
+    0,
+    PROVIDER_HEALTH_INVOCATION_TIMEOUT_MS_MAX,
+    0,
+    "providerFallback.providerHealth.invocationTimeoutMsDefault",
+  );
+
+  const perProviderInvocationTimeoutMs = new Map<string, number>();
+  const rawPerProvider = o.perProviderInvocationTimeoutMs;
+  if (rawPerProvider !== undefined && rawPerProvider !== null) {
+    if (typeof rawPerProvider !== "object" || Array.isArray(rawPerProvider)) {
+      throw new Error(
+        "[provider-fallback-policy] providerFallback.providerHealth.perProviderInvocationTimeoutMs must be an object",
+      );
+    }
+    for (const [id, value] of Object.entries(rawPerProvider as Record<string, unknown>)) {
+      if (!PROVIDER_ID_SLUG.test(id)) {
+        throw new Error(
+          `[provider-fallback-policy] providerFallback.providerHealth.perProviderInvocationTimeoutMs key "${id}" must be a provider-id slug`,
+        );
+      }
+      perProviderInvocationTimeoutMs.set(
+        id,
+        parseBoundedInteger(
+          value,
+          0,
+          PROVIDER_HEALTH_INVOCATION_TIMEOUT_MS_MAX,
+          0,
+          `providerFallback.providerHealth.perProviderInvocationTimeoutMs.${id}`,
+        ),
+      );
+    }
+  }
+
+  const cooldownMs = parseBoundedInteger(
+    o.cooldownMs,
+    0,
+    PROVIDER_HEALTH_COOLDOWN_MS_MAX,
+    PROVIDER_HEALTH_DEFAULT_COOLDOWN_MS,
+    "providerFallback.providerHealth.cooldownMs",
+  );
+
+  let maxUnresponsiveRetriesPerProvider = PROVIDER_HEALTH_DEFAULT_MAX_UNRESPONSIVE_RETRIES;
+  const rawRecovery = o.recovery;
+  if (rawRecovery !== undefined && rawRecovery !== null) {
+    if (typeof rawRecovery !== "object" || Array.isArray(rawRecovery)) {
+      throw new Error(
+        "[provider-fallback-policy] providerFallback.providerHealth.recovery must be an object",
+      );
+    }
+    maxUnresponsiveRetriesPerProvider = parseBoundedInteger(
+      (rawRecovery as Record<string, unknown>).maxUnresponsiveRetriesPerProvider,
+      0,
+      PROVIDER_HEALTH_MAX_UNRESPONSIVE_RETRIES_MAX,
+      PROVIDER_HEALTH_DEFAULT_MAX_UNRESPONSIVE_RETRIES,
+      "providerFallback.providerHealth.recovery.maxUnresponsiveRetriesPerProvider",
+    );
+  }
+
+  return {
+    invocationTimeoutMsDefault,
+    perProviderInvocationTimeoutMs,
+    cooldownMs,
+    recovery: { maxUnresponsiveRetriesPerProvider },
+  };
+}
+
 export function parseProviderFallbackPolicy(
   raw: unknown,
   options: ProviderFallbackLoadOptions = {},
@@ -472,6 +622,7 @@ export function parseProviderFallbackPolicy(
     limitMarkers: parseLimitMarkers(block.limitDetection),
     boardEscalation: parseBoardEscalation(block.boardEscalation),
     accountCooldown: parseAccountCooldown(block.accountCooldown),
+    providerHealth: parseProviderHealth(block.providerHealth),
   };
 }
 
@@ -500,6 +651,7 @@ export function builtinDefaultProviderFallbackPolicy(): ResolvedProviderFallback
     limitMarkers: [...PROVIDER_FALLBACK_DEFAULT_LIMIT_MARKERS],
     boardEscalation: { ...DEFAULT_BOARD_ESCALATION },
     accountCooldown: { ...DEFAULT_ACCOUNT_COOLDOWN },
+    providerHealth: disabledProviderHealthPolicy(),
   };
 }
 
@@ -558,6 +710,42 @@ export function resolveProviderFallbackAccountCooldown(
 ): ProviderFallbackAccountCooldown {
   void companyId;
   return { ...resolved.accountCooldown };
+}
+
+/**
+ * Resolve the provider-health policy for a company (spec
+ * `eli-board.provider-health.v1`). Company-wide for v1; `companyId` is accepted
+ * now so callers do not change when per-company overrides land. Returns a deep
+ * copy so callers never mutate the shared registry value.
+ */
+export function resolveProviderHealthPolicy(
+  companyId: string,
+  resolved: ResolvedProviderFallbackPolicy = getProviderFallbackPolicy(),
+): ProviderHealthPolicy {
+  void companyId;
+  const ph = resolved.providerHealth;
+  return {
+    invocationTimeoutMsDefault: ph.invocationTimeoutMsDefault,
+    perProviderInvocationTimeoutMs: new Map(ph.perProviderInvocationTimeoutMs),
+    cooldownMs: ph.cooldownMs,
+    recovery: { ...ph.recovery },
+  };
+}
+
+/**
+ * Resolve the client-side invocation deadline (ms) for a provider (spec §5):
+ * the per-provider override else the global default. `0` ⇒ no deadline.
+ */
+export function resolveInvocationTimeoutMs(
+  providerId: string | null | undefined,
+  health: ProviderHealthPolicy,
+): number {
+  const id = providerId?.trim();
+  if (id) {
+    const override = health.perProviderInvocationTimeoutMs.get(id);
+    if (override !== undefined) return override;
+  }
+  return health.invocationTimeoutMsDefault;
 }
 
 export function policyForCompany(

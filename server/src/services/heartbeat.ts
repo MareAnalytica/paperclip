@@ -180,10 +180,12 @@ import {
   resolveProviderFallbackEscalation,
   resolveProviderFallbackAccountCooldown,
   resolveProviderFallbackLimitMarkers,
+  resolveProviderHealthPolicy,
   matchesConfiguredLimitMarker,
   type ProviderAuthMode,
   type ProviderFallbackNotifyKind,
 } from "./provider-fallback-policy.js";
+import { resolveProviderUnresponsiveRecovery } from "./provider-unresponsive-breaker.js";
 import {
   buildProviderFallbackExhaustedReport,
   computeProviderFallbackBackoff,
@@ -5934,6 +5936,92 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
   }
 
+  // Contract C (ELI-952, spec `eli-board.provider-health.v1` §3.2/§3.4/§3.5).
+  // A no-output adapter hang (`provider_unresponsive`) — including one on the
+  // PRIMARY adapter, which the Contract-B hop path never reaches — records a
+  // health demerit in the SAME ELI-855/856 cooldown store keyed off the typed
+  // `providerHealth.cooldownMs` window. The existing root-run skip
+  // (`pickRootRunProviderSelection`) then makes the NEXT run start on a healthy
+  // alternative instead of re-selecting the hung provider, bounding the
+  // detect→re-queue→hang loop. The breaker decision + its §4 audit event are
+  // emitted onto the run trail so the loop is observable without a watchdog dive.
+  //
+  // Fully config-gated: with no `providerHealth` block configured `cooldownMs`
+  // is `0` and this is a no-op (pre-ELI-961 behavior). The precise N-bound
+  // escalate arm (open a typed operator recovery action after
+  // `maxUnresponsiveRetriesPerProvider` consecutive hangs, sourced from the
+  // cross-run `issue_recovery_actions.attemptCount`) is the recovery-service
+  // follow-up (spec §7#1); here `attempt` is a first-vs-repeat proxy derived
+  // from whether the provider was already cooling down.
+  async function recordProviderUnresponsiveHealthDemerit(
+    run: typeof heartbeatRuns.$inferSelect,
+    agent: typeof agents.$inferSelect,
+    now = new Date(),
+  ): Promise<void> {
+    try {
+      const providerHealth = resolveProviderHealthPolicy(run.companyId);
+      if (providerHealth.cooldownMs <= 0) return; // coupling disabled — no-op.
+
+      const chain = resolveEffectiveProviderFallbackChain(agent);
+      const enabledChain = chain.filter((entry) => entry.enabled);
+      const priorFallbackId = readNonEmptyString(
+        parseObject(parseObject(run.contextSnapshot).providerFallbackSelection).id,
+      );
+      const failedProviderId =
+        priorFallbackId ?? resolvePrimaryProviderId(enabledChain, agent.adapterType);
+      if (!failedProviderId) return;
+
+      const failedEntry = findProviderFallbackEntry(chain, failedProviderId);
+      const cooledDownProviderIds = await getActiveProviderCooldownIds(db, run.companyId, now);
+      const model =
+        readNonEmptyString(
+          parseObject(parseObject(parseObject(run.contextSnapshot).providerFallbackSelection).adapterConfig).model,
+        ) ?? readNonEmptyString(parseObject(agent.adapterConfig).model);
+      const issueId = readNonEmptyString(parseObject(run.contextSnapshot).issueId);
+
+      const { decision, audit } = resolveProviderUnresponsiveRecovery({
+        provider: failedProviderId,
+        // First-vs-repeat proxy: a provider already cooling down that hangs again
+        // is at least the 2nd consecutive cross-run hang. Precise N is the
+        // recovery-service follow-up (spec §7#1).
+        attempt: cooledDownProviderIds.has(failedProviderId) ? 2 : 1,
+        maxUnresponsiveRetriesPerProvider: providerHealth.recovery.maxUnresponsiveRetriesPerProvider,
+        chainProviderIds: enabledChain.map((entry) => entry.id),
+        cooledDownProviderIds,
+        account: failedEntry?.account ?? null,
+        model,
+        issueId,
+      });
+
+      await upsertProviderAccountCooldown(db, {
+        providerId: failedProviderId,
+        adapterType: failedEntry?.adapter ?? agent.adapterType,
+        account: failedEntry?.account ?? null,
+        cooldownUntil: new Date(now.getTime() + providerHealth.cooldownMs),
+        source: "provider_unresponsive",
+        companyId: run.companyId,
+        reason: "provider_unresponsive",
+        lastRunId: run.id,
+        lastIssueId: issueId,
+        now,
+      });
+
+      await appendRunEvent(run, await nextRunEventSeq(run.id), {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "warn",
+        message: `Provider ${failedProviderId} marked unresponsive (no-output hang); cooled down ${providerHealth.cooldownMs}ms, next run will skip it — breaker decision: ${decision.actionTaken}`,
+        payload: { ...audit, cooldownMs: providerHealth.cooldownMs },
+      });
+    } catch (err) {
+      // Best-effort: a health-demerit write must never fail run finalization.
+      logger.warn(
+        { err, runId: run.id, companyId: run.companyId },
+        "[provider-unresponsive-breaker] failed to record health demerit",
+      );
+    }
+  }
+
   async function scheduleBoundedRetryForRun(
     run: typeof heartbeatRuns.$inferSelect,
     agent: typeof agents.$inferSelect,
@@ -9588,6 +9676,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           )
         ) {
           await scheduleBoundedRetryForRun(livenessRun, agent);
+        }
+        // Contract C (ELI-952): a no-output hang on ANY adapter (primary or a
+        // fallback hop) records a `provider_unresponsive` health demerit so the
+        // next root run skips the hung provider. Runs after the Contract-B hop
+        // branch above so a hop hang is both re-queued (Contract B) and
+        // cross-run-bounded (Contract C). Config-gated and best-effort.
+        if (
+          (outcome === "timed_out" || outcome === "failed") &&
+          isAdapterNoOutputKillRun(livenessRun)
+        ) {
+          await recordProviderUnresponsiveHealthDemerit(livenessRun, agent);
         }
         const issueCommentPolicyResult = await finalizeIssueCommentPolicy(livenessRun, agent);
         await releaseIssueExecutionAndPromote(livenessRun);

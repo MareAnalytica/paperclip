@@ -18,6 +18,10 @@ import {
   reloadProviderFallbackPolicy,
   resolveProviderFallbackEscalation,
   resolveProviderFallbackLimitMarkers,
+  resolveProviderHealthPolicy,
+  resolveInvocationTimeoutMs,
+  PROVIDER_HEALTH_DEFAULT_COOLDOWN_MS,
+  PROVIDER_HEALTH_DEFAULT_MAX_UNRESPONSIVE_RETRIES,
   selectNextProviderFallbackEntry,
 } from "../services/provider-fallback-policy.js";
 import { enforceFallbackAdapterCommand } from "../services/heartbeat.js";
@@ -100,6 +104,105 @@ describe("provider-fallback-policy", () => {
     expect(resolved.overrides.size).toBe(1);
     expect(policyForCompany(resolved, "company-1").chain[0].id).toBe("codex-only");
     expect(policyForCompany(resolved, "unknown").chain[0].id).toBe("claude-code-personal");
+  });
+
+  describe("providerHealth (ELI-952 / spec eli-board.provider-health.v1)", () => {
+    it("materialises the disabled default when the block is omitted", () => {
+      const resolved = loadProviderFallbackPolicyFromString(VALID_DOC, {
+        env: { TEST_COMPANY: "company-1" } as NodeJS.ProcessEnv,
+      });
+      const ph = resolveProviderHealthPolicy("company-1", resolved);
+      expect(ph).toEqual({
+        invocationTimeoutMsDefault: 0,
+        perProviderInvocationTimeoutMs: new Map(),
+        cooldownMs: 0,
+        recovery: { maxUnresponsiveRetriesPerProvider: 0 },
+      });
+      // The built-in default is likewise disabled (no behavior change).
+      expect(builtinDefaultProviderFallbackPolicy().providerHealth.cooldownMs).toBe(0);
+    });
+
+    it("applies conservative opt-in defaults when the block is present but partial", () => {
+      const doc = `
+schemaVersion: "1"
+providerFallback:
+  default:
+    chain:
+      - id: grok-local
+        adapter: grok_local
+  providerHealth:
+    invocationTimeoutMsDefault: 90000
+`;
+      const ph = resolveProviderHealthPolicy(
+        "c",
+        loadProviderFallbackPolicyFromString(doc, { env: {} as NodeJS.ProcessEnv }),
+      );
+      expect(ph.invocationTimeoutMsDefault).toBe(90000);
+      expect(ph.cooldownMs).toBe(PROVIDER_HEALTH_DEFAULT_COOLDOWN_MS);
+      expect(ph.recovery.maxUnresponsiveRetriesPerProvider).toBe(
+        PROVIDER_HEALTH_DEFAULT_MAX_UNRESPONSIVE_RETRIES,
+      );
+    });
+
+    it("parses the full block including per-provider timeout overrides and the loop-breaker bound", () => {
+      const doc = `
+schemaVersion: "1"
+providerFallback:
+  default:
+    chain:
+      - id: grok-local
+        adapter: grok_local
+  providerHealth:
+    invocationTimeoutMsDefault: 120000
+    perProviderInvocationTimeoutMs:
+      grok-local: 90000
+    cooldownMs: 300000
+    recovery:
+      maxUnresponsiveRetriesPerProvider: 3
+`;
+      const resolved = loadProviderFallbackPolicyFromString(doc, { env: {} as NodeJS.ProcessEnv });
+      const ph = resolveProviderHealthPolicy("c", resolved);
+      expect(ph.cooldownMs).toBe(300000);
+      expect(ph.recovery.maxUnresponsiveRetriesPerProvider).toBe(3);
+      // per-provider override wins; absent provider falls back to the global default.
+      expect(resolveInvocationTimeoutMs("grok-local", ph)).toBe(90000);
+      expect(resolveInvocationTimeoutMs("codex-local", ph)).toBe(120000);
+      expect(resolveInvocationTimeoutMs(null, ph)).toBe(120000);
+    });
+
+    it("rejects an out-of-range loop-breaker bound", () => {
+      const doc = `
+schemaVersion: "1"
+providerFallback:
+  default:
+    chain:
+      - id: grok-local
+        adapter: grok_local
+  providerHealth:
+    recovery:
+      maxUnresponsiveRetriesPerProvider: 99
+`;
+      expect(() =>
+        loadProviderFallbackPolicyFromString(doc, { env: {} as NodeJS.ProcessEnv }),
+      ).toThrow(/maxUnresponsiveRetriesPerProvider must be an integer in \[0, 10\]/);
+    });
+
+    it("rejects a non-slug per-provider timeout key", () => {
+      const doc = `
+schemaVersion: "1"
+providerFallback:
+  default:
+    chain:
+      - id: grok-local
+        adapter: grok_local
+  providerHealth:
+    perProviderInvocationTimeoutMs:
+      "Bad Key": 1000
+`;
+      expect(() =>
+        loadProviderFallbackPolicyFromString(doc, { env: {} as NodeJS.ProcessEnv }),
+      ).toThrow(/must be a provider-id slug/);
+    });
   });
 
   it("skips overrides whose env placeholder is unset (non-strict)", () => {

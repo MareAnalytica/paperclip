@@ -163,3 +163,70 @@ export function buildProviderHealthAuditEvent(input: {
 export function auditActionForDecision(action: ProviderUnresponsiveAction): ProviderHealthAuditAction {
   return action;
 }
+
+// ---------------------------------------------------------------------------
+// Runtime composer (spec §3.3 + §3.4). The pure core above decides given an
+// already-resolved `healthyAlternative`; this composer derives that alternative
+// from the live fallback chain and the ELI-855/856 cooldown set the runtime
+// hands it, then returns the decision paired with its §4 audit event. Still pure
+// and deterministic — the recovery service supplies the cross-run `attempt`
+// (from `issue_recovery_actions.attemptCount`) and the cooldown snapshot.
+// ---------------------------------------------------------------------------
+
+export interface ProviderUnresponsiveRecoveryComposeInput {
+  /** The hung (agent, provider) pair's provider id. */
+  provider: string;
+  /** Cross-run consecutive `provider_unresponsive` hang count (1-based, incl. current). */
+  attempt: number;
+  /** Loop-breaker bound from `recovery.maxUnresponsiveRetriesPerProvider`. */
+  maxUnresponsiveRetriesPerProvider: number;
+  /**
+   * Ordered enabled fallback-chain provider ids for the same model. The first
+   * entry that is neither the hung provider nor currently in cooldown is the
+   * healthy alternative. Order is preserved so failover follows chain priority.
+   */
+  chainProviderIds: readonly string[];
+  /** Provider ids currently unhealthy / cooling down (ELI-855/856 store). */
+  cooledDownProviderIds: ReadonlySet<string>;
+  // Non-secret audit routing identities; defaulted to null when unknown.
+  account?: string | null;
+  model?: string | null;
+  issueId?: string | null;
+  timeoutMs?: number | null;
+}
+
+/**
+ * Resolve the healthy alternative from the chain + cooldown set, decide the
+ * bounded recovery action, and build the matching §4 audit event. The chosen
+ * alternative is the first enabled chain provider that is neither the hung
+ * provider nor in cooldown — exactly the provider the ELI-855 root-run skip
+ * (`pickRootRunProviderSelection`) would land on next.
+ */
+export function resolveProviderUnresponsiveRecovery(
+  input: ProviderUnresponsiveRecoveryComposeInput,
+): { decision: ProviderUnresponsiveRecoveryDecision; audit: ProviderHealthAuditEvent } {
+  const hung = input.provider.trim();
+  const healthyAlternative =
+    input.chainProviderIds.find(
+      (id) => id && id !== hung && !input.cooledDownProviderIds.has(id),
+    ) ?? null;
+
+  const decision = decideUnresponsiveRecovery({
+    provider: input.provider,
+    attempt: input.attempt,
+    healthyAlternative,
+    maxUnresponsiveRetriesPerProvider: input.maxUnresponsiveRetriesPerProvider,
+  });
+
+  const audit = buildProviderHealthAuditEvent({
+    provider: input.provider,
+    account: input.account ?? null,
+    model: input.model ?? null,
+    attempt: decision.attempt,
+    actionTaken: auditActionForDecision(decision.actionTaken),
+    issueId: input.issueId ?? null,
+    timeoutMs: input.timeoutMs ?? null,
+  });
+
+  return { decision, audit };
+}

@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   buildProviderHealthAuditEvent,
   decideUnresponsiveRecovery,
+  resolveProviderUnresponsiveRecovery,
 } from "../services/provider-unresponsive-breaker.ts";
 
 // Contract C (ELI-952): the cross-run repeated-hang circuit breaker. The bound
@@ -152,5 +153,71 @@ describe("buildProviderHealthAuditEvent", () => {
       issueId: null,
     });
     expect(event).not.toHaveProperty("timeoutMs");
+  });
+});
+
+describe("resolveProviderUnresponsiveRecovery", () => {
+  const CHAIN = ["claude-code-personal", "codex-local", "grok-local"];
+
+  it("fails over to the first healthy chain provider, skipping the hung pair and cooled-down ones", () => {
+    const { decision, audit } = resolveProviderUnresponsiveRecovery({
+      provider: "claude-code-personal",
+      attempt: 1,
+      maxUnresponsiveRetriesPerProvider: BOUND,
+      chainProviderIds: CHAIN,
+      // claude (hung) + codex already cooling down ⇒ next healthy is grok.
+      cooledDownProviderIds: new Set(["codex-local"]),
+      account: "personal",
+      model: "claude-sonnet",
+      issueId: "ELI-952",
+    });
+    expect(decision).toEqual({
+      actionTaken: "failover",
+      targetProvider: "grok-local",
+      attempt: 1,
+    });
+    expect(audit).toEqual({
+      event: "provider_health_decision",
+      provider: "claude-code-personal",
+      account: "personal",
+      model: "claude-sonnet",
+      reason: "provider_unresponsive",
+      attempt: 1,
+      actionTaken: "failover",
+      issueId: "ELI-952",
+    });
+  });
+
+  // ELI-952 acceptance — the N+1th identical hang opens recovery (escalate)
+  // instead of re-routing, once every alternative is also unhealthy.
+  it("escalates the N+1th hang when every chain provider is the hung one or cooled down", () => {
+    const { decision, audit } = resolveProviderUnresponsiveRecovery({
+      provider: "grok-local",
+      attempt: BOUND + 1,
+      maxUnresponsiveRetriesPerProvider: BOUND,
+      chainProviderIds: CHAIN,
+      cooledDownProviderIds: new Set(["claude-code-personal", "codex-local"]),
+    });
+    expect(decision.actionTaken).toBe("escalate");
+    expect(decision.targetProvider).toBe("grok-local");
+    expect(audit.actionTaken).toBe("escalate");
+    expect(audit.attempt).toBe(BOUND + 1);
+    expect(audit.account).toBeNull();
+    expect(audit.model).toBeNull();
+  });
+
+  it("retries the same pair within the bound when no healthy alternative exists", () => {
+    const { decision } = resolveProviderUnresponsiveRecovery({
+      provider: "grok-local",
+      attempt: 1,
+      maxUnresponsiveRetriesPerProvider: BOUND,
+      chainProviderIds: ["grok-local"],
+      cooledDownProviderIds: new Set(),
+    });
+    expect(decision).toEqual({
+      actionTaken: "retry_same",
+      targetProvider: "grok-local",
+      attempt: 1,
+    });
   });
 });

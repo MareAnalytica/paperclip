@@ -18,7 +18,13 @@ import { and, eq, gt, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { providerAccountCooldowns } from "@paperclipai/db";
 
-export type ProviderCooldownSource = "provider_header" | "retryAfterMinutesDefault";
+export type ProviderCooldownSource =
+  | "provider_header"
+  | "retryAfterMinutesDefault"
+  // A `provider_unresponsive` health demerit (ELI-952 / spec §3.2): a no-output
+  // adapter hang cooled the provider down for `providerHealth.cooldownMs` so the
+  // next root run skips it. Distinct provenance from a usage-limit cooldown.
+  | "provider_unresponsive";
 
 // Structural shape of a fallback chain entry — kept local so this module does
 // not depend on heartbeat.ts internals.
