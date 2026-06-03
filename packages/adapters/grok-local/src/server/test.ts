@@ -19,6 +19,7 @@ import {
 } from "@paperclipai/adapter-utils/execution-target";
 import { DEFAULT_GROK_LOCAL_MODEL } from "../index.js";
 import { parseGrokJsonl } from "./parse.js";
+import { resolveGrokOutputFormat } from "./output-format.js";
 
 export interface GrokModelsProbe {
   authenticated: boolean;
@@ -241,9 +242,21 @@ export async function testEnvironment(
   }
 
   if (canRunProbe) {
+    const probeOutputFormat =
+      asString(config.outputFormat, "").trim() ||
+      (await resolveGrokOutputFormat({
+        runId,
+        target,
+        command,
+        cacheKey: command,
+        cwd,
+        env,
+        timeoutSec: Math.max(1, asNumber(config.helloProbeTimeoutSec, 45)),
+      }));
+
     const probeArgs = [
       "--output-format",
-      "stream-json",
+      probeOutputFormat,
       "--always-approve",
       "--permission-mode",
       "dontAsk",

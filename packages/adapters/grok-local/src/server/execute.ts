@@ -40,6 +40,7 @@ import {
 } from "@paperclipai/adapter-utils/server-utils";
 import { DEFAULT_GROK_LOCAL_MODEL } from "../index.js";
 import { isGrokUnknownSessionError, parseGrokJsonl } from "./parse.js";
+import { resolveGrokOutputFormat } from "./output-format.js";
 
 const __moduleDir = path.dirname(fileURLToPath(import.meta.url));
 
@@ -428,8 +429,20 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       heartbeatPromptChars: renderedPrompt.length,
     };
 
+    const grokOutputFormat =
+      asString(config.outputFormat, "").trim() ||
+      (await resolveGrokOutputFormat({
+        runId,
+        target: runtimeExecutionTarget,
+        command,
+        cacheKey: resolvedCommand,
+        cwd,
+        env: runtimeEnv,
+        timeoutSec,
+      }));
+
     const buildArgs = (resumeSessionId: string | null) => {
-      const args = ["--cwd", effectiveExecutionCwd, "--output-format", "stream-json"];
+      const args = ["--cwd", effectiveExecutionCwd, "--output-format", grokOutputFormat];
       if (resumeSessionId) args.push("--resume", resumeSessionId);
       if (model && model !== DEFAULT_GROK_LOCAL_MODEL) args.push("--model", model);
       if (reasoningEffort) args.push("--reasoning-effort", reasoningEffort);
