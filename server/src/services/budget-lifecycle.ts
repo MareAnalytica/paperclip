@@ -9,7 +9,9 @@ import {
 } from "@paperclipai/shared";
 import { HttpError } from "../errors.js";
 import { budgetCapsService, type ChargeAttribution } from "./budget-caps.js";
-import { loadPreflightConfig, type PreflightConfig } from "./budgeting-config.js";
+import { loadPreflightConfig, type PreflightConfig, loadEnforcementConfig } from "./budgeting-config.js";
+import { approvals, issueApprovals, issues } from "@paperclipai/db";
+import { issueService } from "./issues.js";
 
 // POST /cost/preflight and POST /cost/charge (agent-budgeting policy §4). The
 // preflight read is side-effect-free and bounded by evaluationBudgetMillis; the
@@ -26,8 +28,8 @@ export interface PreflightInput extends ChargeAttribution {
 export interface PreflightResult {
   decision: PreflightDecision;
   bindingCapId: string | null;
-  headroomMicros: number;
-  softHeadroomMicros: number;
+  headroomMicros: number | null;
+  softHeadroomMicros: number | null;
   warnings: Array<{ capId: string; percent: number }>;
   approvalIds: string[];
   // True when the evaluation exceeded evaluationBudgetMillis and the configured
@@ -58,7 +60,7 @@ export interface ChargeInput extends ChargeAttribution {
 export interface ChargeResult {
   id: string;
   costMicros: number;
-  headroomMicros: number;
+  headroomMicros: number | null;
   alertsFired: BudgetCapAction[];
   idempotent: boolean;
 }
@@ -108,8 +110,8 @@ export function budgetLifecycleService(
         return {
           decision,
           bindingCapId: null,
-          headroomMicros: 0,
-          softHeadroomMicros: 0,
+          headroomMicros: null,
+          softHeadroomMicros: null,
           warnings: [],
           approvalIds: [],
           evaluationTimedOut: true,

@@ -121,6 +121,7 @@ describeEmbeddedPostgres("budget lifecycle routes (POST /cost/preflight, /cost/c
     expect(res.status).toBe(201);
     expect(res.body.costMicros).toBe(15_000);
     expect(res.body.idempotent).toBe(false);
+    expect(res.body.headroomMicros).toBeNull(); // S2: null (not 0) when no binding cap applies
 
     const [row] = await db.select().from(costEvents).where(eq(costEvents.id, res.body.id));
     expect(row.costMicros).toBe(15_000);
@@ -139,6 +140,7 @@ describeEmbeddedPostgres("budget lifecycle routes (POST /cost/preflight, /cost/c
     expect(second.status).toBe(200);
     expect(second.body.idempotent).toBe(true);
     expect(second.body.id).toBe(first.body.id);
+    expect(second.body.headroomMicros).toBeNull(); // S2: null sentinel for no-cap case on idempotent retry too
 
     const rows = await db.select().from(costEvents).where(eq(costEvents.companyId, companyId));
     expect(rows).toHaveLength(1); // no double-charge
@@ -231,12 +233,34 @@ describeEmbeddedPostgres("budget lifecycle routes (POST /cost/preflight, /cost/c
     expect(deny.status).toBe(200);
     expect(deny.body.decision).toBe("deny");
     expect(deny.body.bindingCapId).toBeTruthy();
+    expect(typeof deny.body.headroomMicros).toBe("number"); // cap binds → number (not null)
+    expect(deny.body.softHeadroomMicros).not.toBeNull();
 
     const allow = await request(app)
       .post("/api/cost/preflight")
       .send({ companyId, agentId, provider: "anthropic", model: "claude-opus-4-7", kind: "tokens", estimatedCostMicros: 100_000 });
     expect(allow.status).toBe(200);
     expect(allow.body.decision).toBe("allow");
+    expect(typeof allow.body.headroomMicros).toBe("number");
+  });
+
+  it("returns null headroomMicros (and soft) for preflight/charge when no caps bind (S2 sentinel, not 0)", async () => {
+    const { companyId, agentId } = await seedCompany();
+    // no caps inserted for this company
+    const pf = await request(app)
+      .post("/api/cost/preflight")
+      .send({ companyId, agentId, provider: "anthropic", model: "claude-opus-4-7", kind: "tokens", estimatedCostMicros: 100_000 });
+    expect(pf.status).toBe(200);
+    expect(pf.body.decision).toBe("allow");
+    expect(pf.body.headroomMicros).toBeNull();
+    expect(pf.body.softHeadroomMicros).toBeNull();
+    expect(pf.body.bindingCapId).toBeNull();
+
+    const ch = await request(app)
+      .post("/api/cost/charge")
+      .send(chargeBody(companyId, { agentId, qty: 10, unitPriceMicros: 1000 }));
+    expect(ch.status).toBe(201);
+    expect(ch.body.headroomMicros).toBeNull();
   });
 
   it("rejects an agent actor charging under another agent's id (auth)", async () => {

@@ -66,9 +66,11 @@ export interface CapEvalResult {
   firing: CapFiring[];
   resolution: CapResolution;
   // Remaining budget to the cap limit, min across applicable caps (clamped ≥0).
-  headroomMicros: number;
+  // Null when no cap binds/applies (unbounded; 0 would be misleading "no budget").
+  headroomMicros: number | null;
   // Remaining budget to the hard-stop line, min across applicable caps (§4.4).
-  softHeadroomMicros: number;
+  // Null when no cap binds/applies.
+  softHeadroomMicros: number | null;
   warnings: Array<{ capId: string; percent: number }>;
 }
 
@@ -236,8 +238,9 @@ export function budgetCapsService(db: Db) {
         applicableCaps,
         firing,
         resolution,
-        headroomMicros: Number.isFinite(headroomMicros) ? headroomMicros : 0,
-        softHeadroomMicros: Number.isFinite(softHeadroomMicros) ? softHeadroomMicros : 0,
+        // Sentinel null (not 0) when no caps apply: 0 would misleadingly read as "no budget left".
+        headroomMicros: Number.isFinite(headroomMicros) ? headroomMicros : null,
+        softHeadroomMicros: Number.isFinite(softHeadroomMicros) ? softHeadroomMicros : null,
         warnings,
       };
     },
