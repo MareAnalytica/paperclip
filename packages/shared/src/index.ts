@@ -1183,3 +1183,33 @@ export type {
   EnvironmentProviderCapability,
   EnvironmentSupportStatus,
 } from "./environment-support.js";
+export {
+  CALENDAR_WINDOWS,
+  ROLLING_WINDOWS,
+  BUDGET_WINDOWS,
+  isCalendarWindow,
+  isRollingWindow,
+  calendarWindowBounds,
+  currentCalendarWindow,
+  rollingWindowBounds,
+} from "./budget/windows.js";
+export type {
+  CalendarWindow,
+  RollingWindow,
+  BudgetWindow,
+  WindowBounds,
+  RollingBounds,
+} from "./budget/windows.js";
+export {
+  BUDGET_CAP_ACTIONS,
+  actionSeverity,
+  hardestAction,
+  resolveBindingCap,
+} from "./budget/cap-precedence.js";
+export type {
+  BudgetCapAction,
+  ApprovalGate,
+  CapEvaluation,
+  FiringGate,
+  CapResolution,
+} from "./budget/cap-precedence.js";
