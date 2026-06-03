@@ -1419,6 +1419,121 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     expect(wakeSelection.id).toBe("claude-code-aflabox");
   });
 
+  it("Contract B: a no-output kill on a non-primary fallback hop advances the chain to the next provider", async () => {
+    // ELI-951: a Contract-A idle no-output kill (errorCode
+    // `adapter_no_output_timeout`, errorMeta.noOutput) is NOT a usage limit and
+    // carries no transient_upstream family. It is fallback-eligible *only*
+    // because it landed on a non-primary fallback hop (codex-local), so the chain
+    // advances past the wedged hop to grok-local instead of dead-ending.
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const now = new Date("2026-04-22T10:00:00.000Z");
+
+    await seedRetryFixture({
+      runId,
+      companyId,
+      agentId,
+      now,
+      errorCode: "adapter_no_output_timeout",
+      // No transient_upstream family and no limit markers: eligibility comes
+      // solely from Contract B (hang class on a hop).
+      resultJson: { errorMeta: { noOutput: true, noOutputKillSec: 600 } },
+      adapterType: "claude_local",
+      runtimeConfig: {
+        heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 },
+        providerFallback: {
+          chain: [
+            { id: "claude-code-personal", adapter: "claude_local", enabled: true, account: "personal" },
+            { id: "codex-local", adapter: "codex_local", enabled: true },
+            { id: "grok-local", adapter: "grok_local", enabled: true },
+          ],
+        },
+      },
+      contextSnapshot: {
+        issueId: randomUUID(),
+        wakeReason: "issue_assigned",
+        providerFallbackSelection: {
+          id: "codex-local",
+          adapter: "codex_local",
+        },
+      },
+    });
+
+    const scheduled = await heartbeat.scheduleBoundedRetry(runId, { now, random: () => 0.5 });
+    expect(scheduled.outcome).toBe("scheduled");
+    if (scheduled.outcome !== "scheduled") return;
+
+    const retryRun = await db
+      .select({ contextSnapshot: heartbeatRuns.contextSnapshot })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, scheduled.run.id))
+      .then((rows) => rows[0] ?? null);
+    const selection = (
+      ((retryRun?.contextSnapshot as Record<string, unknown> | null)?.providerFallbackSelection ?? null) as
+        | Record<string, unknown>
+        | null
+    ) ?? {};
+    expect(selection.id).toBe("grok-local");
+    expect(selection.adapter).toBe("grok_local");
+  });
+
+  it("Contract B: a bare wall-clock timeout on a fallback hop does NOT advance the chain", async () => {
+    // Only the no-output hang class hops. A plain wall-clock timeout (errorCode
+    // `timeout`, no errorMeta.noOutput) on the same hop is not fallback-eligible,
+    // so the chain is left on the current selection rather than advanced.
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const now = new Date("2026-04-22T10:00:00.000Z");
+
+    await seedRetryFixture({
+      runId,
+      companyId,
+      agentId,
+      now,
+      errorCode: "timeout",
+      resultJson: {},
+      adapterType: "claude_local",
+      runtimeConfig: {
+        heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 },
+        providerFallback: {
+          chain: [
+            { id: "claude-code-personal", adapter: "claude_local", enabled: true, account: "personal" },
+            { id: "codex-local", adapter: "codex_local", enabled: true },
+            { id: "grok-local", adapter: "grok_local", enabled: true },
+          ],
+        },
+      },
+      contextSnapshot: {
+        issueId: randomUUID(),
+        wakeReason: "issue_assigned",
+        providerFallbackSelection: {
+          id: "codex-local",
+          adapter: "codex_local",
+        },
+      },
+    });
+
+    const scheduled = await heartbeat.scheduleBoundedRetry(runId, { now, random: () => 0.5 });
+    expect(scheduled.outcome).toBe("scheduled");
+    if (scheduled.outcome !== "scheduled") return;
+
+    const retryRun = await db
+      .select({ contextSnapshot: heartbeatRuns.contextSnapshot })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, scheduled.run.id))
+      .then((rows) => rows[0] ?? null);
+    const selection = (
+      ((retryRun?.contextSnapshot as Record<string, unknown> | null)?.providerFallbackSelection ?? null) as
+        | Record<string, unknown>
+        | null
+    ) ?? {};
+    // Not advanced: a non-eligible retry preserves whatever selection the failed
+    // run carried (no chain consumption).
+    expect(selection.id).toBe("codex-local");
+  });
+
   it("rotates from Claude aflabox to Codex and then to Grok across retries", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();
