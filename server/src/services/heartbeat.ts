@@ -376,6 +376,36 @@ function readProviderFallbackFailureText(
     .join("\n");
 }
 
+// A Contract-A (ELI-950) idle no-output kill, as it lands on the persisted run.
+// The adapter surfaces errorCode `adapter_no_output_timeout` + `errorMeta.noOutput`
+// for a hung invocation that emitted nothing for the whole idle window; the run
+// finalizer preserves the distinct errorCode (rather than collapsing it into the
+// generic `timeout`) and persists `errorMeta`, so either signal identifies the
+// hang class downstream. Detecting both keeps classification robust whether the
+// caller passes a freshly-built adapter result or a re-read persisted run.
+const ADAPTER_NO_OUTPUT_TIMEOUT_ERROR_CODE = "adapter_no_output_timeout";
+function isAdapterNoOutputKillRun(
+  run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode" | "resultJson">,
+): boolean {
+  if (readNonEmptyString(run.errorCode) === ADAPTER_NO_OUTPUT_TIMEOUT_ERROR_CODE) return true;
+  const errorMeta = parseObject(parseObject(run.resultJson).errorMeta);
+  return errorMeta.noOutput === true;
+}
+
+// Whether `run` executed on a non-primary fallback adapter (a fallback hop)
+// rather than the agent's primary provider. The active hop is recorded as
+// `contextSnapshot.providerFallbackSelection.id` when a prior eligible failure
+// advanced the chain (mirrors resolveFailedProviderAuthMode and
+// scheduleBoundedRetryForRun's `priorFallbackId`). No selection ⇒ the run ran on
+// the primary adapter. This is the gate for Contract B (ELI-951).
+function runExecutedOnProviderFallbackHop(
+  run: Pick<typeof heartbeatRuns.$inferSelect, "contextSnapshot">,
+): boolean {
+  return Boolean(
+    readNonEmptyString(parseObject(parseObject(run.contextSnapshot).providerFallbackSelection).id),
+  );
+}
+
 // Detection precedence (provider-fallback-chain spec §3). Only a usage-limit
 // classification consumes the chain. The composed precedence (ELI-901 G1 +
 // ELI-902 G2) is, in order:
@@ -396,7 +426,17 @@ function readProviderFallbackFailureText(
 //      definitive native classification, so the G2 marker safety-net's "no native
 //      classification" precondition is not met — a raw-key auth failure is not
 //      rescued into a hop by a substring match in its message text.
-//   3. Engine-level safety-net markers (ELI-902 / G2): consulted only when no
+//   3. Contract B / hang class (ELI-951, execution-semantics §12): a Contract-A
+//      no-output kill (an idle-deadline hang, errorCode
+//      `adapter_no_output_timeout`) on a **non-primary fallback adapter** is
+//      eligible so the chain advances past the wedged hop instead of dead-ending
+//      on a typed timeout. Gated to the hang class AND to a fallback hop: a bare
+//      wall-clock timeout is not otherwise eligible, and a no-output kill on the
+//      **primary** adapter is not auto-eligible (preserves production behavior;
+//      a real primary hang is not masked as a routine hop). It composes with the
+//      auth precedence above — a raw-key auth failure short-circuits at (2) and
+//      still must not consume the chain; a no-output hang is a different class.
+//   4. Engine-level safety-net markers (ELI-902 / G2): consulted only when no
 //      native classification fired above (including an empty errorCode whose limit
 //      is surfaced in `run.error`/`resultJson`). Test the failure message/status
 //      against the configured markers so an adapter in the chain with no native
@@ -405,6 +445,7 @@ export function isProviderFallbackEligibleError(
   run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode" | "resultJson" | "error">,
   authMode?: ProviderAuthMode | null,
   limitMarkers: readonly string[] = [],
+  opts: { onFallbackHop?: boolean } = {},
 ) {
   const errorCode = readNonEmptyString(run.errorCode);
   // (1) Native usage-limit class — always hops, before the auth gate.
@@ -414,7 +455,11 @@ export function isProviderFallbackEligibleError(
   if (errorCode && (errorCode.includes("auth") || errorCode.includes("session"))) {
     return authMode !== "raw-key";
   }
-  // (3) Safety-net: no native classification above.
+  // (3) Contract B (ELI-951): a no-output hang on a non-primary fallback hop.
+  if (opts.onFallbackHop && isAdapterNoOutputKillRun(run)) {
+    return true;
+  }
+  // (4) Safety-net: no native classification above.
   if (matchesConfiguredLimitMarker(readProviderFallbackFailureText(run), limitMarkers)) {
     return true;
   }
@@ -453,14 +498,23 @@ function mergeAdapterRecoveryMetadata(input: {
   resultJson: Record<string, unknown> | null | undefined;
   errorFamily?: string | null;
   retryNotBefore?: string | null;
+  // Structured adapter failure metadata (e.g. Contract A's
+  // `{ noOutput, noOutputKillSec }`). Persisted onto the run's resultJson so a
+  // typed hang signal survives for Contract B classification and the audit trail.
+  errorMeta?: Record<string, unknown> | null;
 }) {
   const errorFamily = readNonEmptyString(input.errorFamily);
   const retryNotBefore = readNonEmptyString(input.retryNotBefore);
-  if (!input.resultJson && !errorFamily && !retryNotBefore) return input.resultJson ?? null;
+  const errorMeta =
+    input.errorMeta && Object.keys(input.errorMeta).length > 0 ? input.errorMeta : null;
+  if (!input.resultJson && !errorFamily && !retryNotBefore && !errorMeta) {
+    return input.resultJson ?? null;
+  }
 
   return {
     ...(input.resultJson ?? {}),
     ...(errorFamily ? { errorFamily } : {}),
+    ...(errorMeta ? { errorMeta } : {}),
     ...(retryNotBefore
       ? {
           retryNotBefore,
@@ -5923,6 +5977,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         run,
         resolveFailedProviderAuthMode(run, agent),
         resolveProviderFallbackLimitMarkers(agent.companyId),
+        // Contract B (ELI-951): a no-output kill is hop-eligible only when this
+        // run already executed on a fallback adapter. `priorFallbackId` is set
+        // iff a prior eligible failure advanced the chain onto a hop.
+        { onFallbackHop: Boolean(priorFallbackId) },
       );
     const nextProviderFallback = shouldAttemptProviderFallback
       ? selectNextProviderFallbackEntry({
@@ -9347,7 +9405,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               );
       const runErrorCode =
         outcome === "timed_out"
-          ? "timeout"
+          ? // Preserve a Contract-A (ELI-950) idle no-output kill's distinct
+            // errorCode instead of collapsing it into the generic `timeout`, so
+            // Contract B (ELI-951) and the audit trail can tell a deterministic
+            // adapter hang apart from a wall-clock timeout. Both surface as the
+            // `timed_out` outcome.
+            adapterResult.errorCode === ADAPTER_NO_OUTPUT_TIMEOUT_ERROR_CODE
+            ? ADAPTER_NO_OUTPUT_TIMEOUT_ERROR_CODE
+            : "timeout"
           : outcome === "cancelled"
             ? (latestRun?.errorCode ?? "cancelled")
             : outcome === "failed"
@@ -9408,6 +9473,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               resultJson: adapterResult.resultJson ?? null,
               errorFamily: adapterResult.errorFamily ?? null,
               retryNotBefore: adapterResult.retryNotBefore ?? null,
+              errorMeta: adapterResult.errorMeta ?? null,
             }),
             modelProfileApplication,
           ),
@@ -9500,7 +9566,26 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               livenessRun,
               resolveFailedProviderAuthMode(livenessRun, agent),
               resolveProviderFallbackLimitMarkers(agent.companyId),
+              { onFallbackHop: runExecutedOnProviderFallbackHop(livenessRun) },
             ))
+        ) {
+          await scheduleBoundedRetryForRun(livenessRun, agent);
+        } else if (
+          // Contract B (ELI-951, execution-semantics §12): a Contract-A no-output
+          // kill is surfaced as a `timed_out` outcome (the adapter sets
+          // `timedOut`), so it does not reach the `failed` branch above. When that
+          // kill landed on a non-primary fallback hop, advance the chain to the
+          // next provider instead of dead-ending on the typed timeout. Gated to
+          // the hang class on a hop: a wall-clock timeout, or a hang on the
+          // primary adapter, is left as a terminal timeout (not auto-eligible).
+          outcome === "timed_out" &&
+          runExecutedOnProviderFallbackHop(livenessRun) &&
+          isProviderFallbackEligibleError(
+            livenessRun,
+            resolveFailedProviderAuthMode(livenessRun, agent),
+            resolveProviderFallbackLimitMarkers(agent.companyId),
+            { onFallbackHop: true },
+          )
         ) {
           await scheduleBoundedRetryForRun(livenessRun, agent);
         }
