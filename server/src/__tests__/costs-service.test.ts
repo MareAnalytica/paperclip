@@ -843,4 +843,82 @@ describeEmbeddedPostgres("cost and finance aggregate overflow handling", () => {
     expect(byKindRow?.debitCents).toBe(4_000_000_000);
     expect(byKindRow?.netCents).toBe(4_000_000_000);
   });
+
+  // ELI-69 / budgeting policy §2.1: the unique idempotencyKey index must
+  // deduplicate retries on a non-null key while leaving legacy/backfilled rows
+  // (idempotencyKey IS NULL) free to coexist, and the new frozen-pricing /
+  // attribution columns must round-trip.
+  it("dedupes on idempotency_key, tolerates NULL keys, and round-trips §2.1 fields", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Cost Agent",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    const base = {
+      companyId,
+      agentId,
+      provider: "anthropic",
+      biller: "anthropic",
+      billingType: "metered_api",
+      model: "claude-opus-4-7",
+      costCents: 1,
+      occurredAt: new Date("2026-05-13T00:00:00.000Z"),
+    };
+
+    // Legacy/backfill rows: NULL idempotency_key must never collide.
+    await db.insert(costEvents).values([{ ...base }, { ...base }]);
+
+    // A §2.1 charge with the full new attribution + frozen-pricing surface.
+    await db.insert(costEvents).values({
+      ...base,
+      kind: "tokens",
+      qty: "1500.000000",
+      inputTokens: 1000,
+      cachedInputTokens: 200,
+      outputTokens: 500,
+      cacheWriteTokens: 50,
+      unitPriceMicros: 15,
+      costMicros: 22_500,
+      currency: "USD",
+      pricebookVersion: "2026-05-13.1",
+      requestId: "req_abc123",
+      idempotencyKey: "anthropic:req_abc123",
+      meta: { serviceTier: "standard", region: "us-east-1" },
+    });
+
+    // Retry with the same idempotency_key must be rejected by the unique index.
+    await expect(
+      db.insert(costEvents).values({ ...base, idempotencyKey: "anthropic:req_abc123" }),
+    ).rejects.toThrow();
+
+    const rows = await db.select().from(costEvents);
+    expect(rows).toHaveLength(3);
+    expect(rows.filter((r) => r.idempotencyKey === null)).toHaveLength(2);
+
+    const charged = rows.find((r) => r.idempotencyKey === "anthropic:req_abc123");
+    expect(charged?.kind).toBe("tokens");
+    expect(Number(charged?.qty)).toBe(1500);
+    expect(charged?.costMicros).toBe(22_500);
+    expect(charged?.unitPriceMicros).toBe(15);
+    expect(charged?.cacheWriteTokens).toBe(50);
+    expect(charged?.currency).toBe("USD");
+    expect(charged?.pricebookVersion).toBe("2026-05-13.1");
+    expect(charged?.meta).toEqual({ serviceTier: "standard", region: "us-east-1" });
+  });
 });
