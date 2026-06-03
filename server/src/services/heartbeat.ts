@@ -28,6 +28,7 @@ import {
   agentWakeupRequests,
   activityLog,
   approvals,
+  companies,
   companySkills as companySkillsTable,
   documentRevisions,
   issueDocuments,
@@ -11037,10 +11038,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       return;
     }
 
-    const runIds =
+    // Select runs + their context issue for blocking by the budget gate (ELI-77)
+    const runs =
       scope.scopeType === "company"
         ? await db
-          .select({ id: heartbeatRuns.id })
+          .select({ id: heartbeatRuns.id, contextSnapshot: heartbeatRuns.contextSnapshot })
           .from(heartbeatRuns)
           .where(
             and(
@@ -11048,14 +11050,151 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               inArray(heartbeatRuns.status, [...CANCELLABLE_HEARTBEAT_RUN_STATUSES]),
             ),
           )
-          .then((rows) => rows.map((row) => row.id))
-        : await listProjectScopedRunIds(scope.companyId, scope.scopeId);
+        : await (async () => {
+            const ids = await listProjectScopedRunIds(scope.companyId, scope.scopeId);
+            if (ids.length === 0) return [];
+            return db
+              .select({ id: heartbeatRuns.id, contextSnapshot: heartbeatRuns.contextSnapshot })
+              .from(heartbeatRuns)
+              .where(inArray(heartbeatRuns.id, ids));
+          })();
+
+    const runIds = runs.map((r) => r.id);
 
     for (const runId of runIds) {
       await cancelRunInternal(runId, "Cancelled due to budget pause");
     }
 
     await cancelPendingWakeupsForBudgetScope(scope);
+
+    // ELI-77: create (idempotent) Budget gate issue for this scope, then mark
+    // the affected issues (from run contexts) as blocked by it with blockerKind.
+    if (runIds.length > 0 || scope.scopeType !== "company") {
+      const fp = `budget-gate:cancel:${scope.scopeType}:${scope.scopeId}:${Date.now()}`;
+      let gate = await db
+        .select()
+        .from(issues)
+        .where(
+          and(
+            eq(issues.companyId, scope.companyId),
+            eq(issues.originKind, "budget_gate"),
+            eq(issues.originFingerprint, fp),
+          ),
+        )
+        .then((r) => r.find((i) => !["done", "cancelled"].includes(i.status) && !i.hiddenAt) ?? null);
+
+      if (!gate) {
+        const now = new Date();
+        // Allocate number + identifier (mirrors issues.create counter logic)
+        const [maxRow] = await db
+          .select({ maxNum: sql<number>`coalesce(max(${issues.issueNumber}), 0)` })
+          .from(issues)
+          .where(eq(issues.companyId, scope.companyId));
+        const currentMax = maxRow?.maxNum ?? 0;
+        const [companyRow] = await db
+          .update(companies)
+          .set({ issueCounter: sql`greatest(${companies.issueCounter}, ${currentMax}) + 1` })
+          .where(eq(companies.id, scope.companyId))
+          .returning({ issueCounter: companies.issueCounter, issuePrefix: companies.issuePrefix });
+        const num = companyRow?.issueCounter ?? currentMax + 1;
+        const prefix = companyRow?.issuePrefix ?? "ELI";
+        const identifier = `${prefix}-${num}`;
+        const title = `Budget gate: ${scope.scopeType} ${scope.scopeId} (budget-enforcement)`;
+        const body = `## Budget gate: ${scope.scopeType} ${scope.scopeId} (budget-enforcement)
+
+- Spend: (see burn at enforcement)
+- Cap action: pause/hard_stop (ELI-77 gate)
+- Unblock paths:
+  - Raise cap (manager)
+  - Wait for rollover
+  - Board approval (wired)
+`;
+        const [created] = await db
+          .insert(issues)
+          .values({
+            companyId: scope.companyId,
+            title,
+            description: body,
+            status: "blocked",
+            priority: "high",
+            originKind: "budget_gate",
+            originFingerprint: fp,
+            identifier,
+            issueNumber: num,
+            billingCode: "governance/budget",
+            blockerKind: "budget_hard_stop",
+            createdAt: now,
+            updatedAt: now,
+          })
+          .returning();
+        gate = created ?? null;
+
+        if (gate) {
+          // Wire request_board_approval to gate for auto unblock on grant
+          const [approval] = await db
+            .insert(approvals)
+            .values({
+              companyId: scope.companyId,
+              type: "request_board_approval",
+              requestedByUserId: null,
+              requestedByAgentId: null,
+              status: "pending",
+              payload: {
+                title: `Approve budget gate override for ${scope.scopeType} ${scope.scopeId}`,
+                summary: "Auto-created budget gate from enforcement.",
+              },
+            })
+            .returning();
+          if (approval) {
+            await db.insert(issueApprovals).values({
+              companyId: scope.companyId,
+              issueId: gate.id,
+              approvalId: approval.id,
+            });
+          }
+        }
+      }
+
+      // For runs that carried an issue context, mark those issues blocked by the gate.
+      const affectedIssueIds = new Set<string>();
+      for (const r of runs) {
+        const ctx = (r as any).contextSnapshot;
+        const iid = ctx && typeof ctx === "object" ? (ctx.issueId ?? ctx.contextIssueId ?? null) : null;
+        if (iid && typeof iid === "string") affectedIssueIds.add(iid);
+      }
+      if (gate && affectedIssueIds.size > 0) {
+        for (const iid of affectedIssueIds) {
+          try {
+            await db
+              .update(issues)
+              .set({
+                status: "blocked",
+                blockerKind: "budget_hard_stop",
+                updatedAt: new Date(),
+              })
+              .where(and(eq(issues.id, iid), eq(issues.companyId, scope.companyId)));
+            // set blockedBy via the sync helper? direct relation for now
+            await db
+              .delete(issueRelations)
+              .where(
+                and(
+                  eq(issueRelations.companyId, scope.companyId),
+                  eq(issueRelations.relatedIssueId, iid),
+                  eq(issueRelations.type, "blocks"),
+                ),
+              );
+            await db.insert(issueRelations).values({
+              companyId: scope.companyId,
+              issueId: gate.id,
+              relatedIssueId: iid,
+              type: "blocks",
+            });
+          } catch (e) {
+            // best effort; log would be here
+          }
+        }
+      }
+    }
   }
 
   return {

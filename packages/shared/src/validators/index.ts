@@ -354,6 +354,13 @@ export {
 } from "./cost.js";
 
 export {
+  preflightRequestSchema,
+  chargeRequestSchema,
+  type PreflightRequest,
+  type ChargeRequest,
+} from "./budget-lifecycle.js";
+
+export {
   createFinanceEventSchema,
   type CreateFinanceEvent,
 } from "./finance.js";
