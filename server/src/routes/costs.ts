@@ -4,17 +4,20 @@ import {
   chargeRequestSchema,
   createCostEventSchema,
   createFinanceEventSchema,
+  invoiceReconcileRequestSchema,
   normalizeIssueIdentifier,
   preflightRequestSchema,
   resolveBudgetIncidentSchema,
   updateBudgetSchema,
   upsertBudgetPolicySchema,
+  type InvoiceReconcileRequest,
 } from "@paperclipai/shared";
 import { validate } from "../middleware/validate.js";
 import { budgetLifecycleService } from "../services/budget-lifecycle.js";
 import {
   budgetService,
   costService,
+  invoiceReconcileService,
   financeService,
   companyService,
   agentService,
@@ -59,6 +62,7 @@ export function costRoutes(
     cancelWorkForScope: heartbeat.cancelBudgetScopeWork,
   };
   const costs = costService(db, budgetHooks);
+  const invoiceReconcile = invoiceReconcileService(db);
   const finance = financeService(db);
   const budgets = budgetService(db, budgetHooks);
   const companies = companyService(db);
@@ -188,6 +192,32 @@ export function costRoutes(
 
     res.status(201).json(event);
   });
+
+  // §6.3 vendor-invoice reconciliation (ELI-937). Accepts an uploaded vendor
+  // invoice (CSV/JSON text) + {vendor, format}; parses it, diffs it against the
+  // cost_events aggregate for the window, and opens an idempotent
+  // governance/billing review issue per over-threshold, day-locked cell.
+  router.post(
+    "/companies/:companyId/cost/invoice-reconcile",
+    validate(invoiceReconcileRequestSchema),
+    async (req, res) => {
+      const companyId = req.params.companyId as string;
+      assertCompanyAccess(req, companyId);
+      const body = req.body as InvoiceReconcileRequest;
+      const summary = await invoiceReconcile.reconcile(companyId, {
+        vendor: body.vendor,
+        format: body.format,
+        invoice: body.invoice,
+        from: body.from ? new Date(body.from) : undefined,
+        to: body.to ? new Date(body.to) : undefined,
+        thresholdPercent: body.thresholdPercent,
+        dayLockDelayHours: body.dayLockDelayHours,
+        sampleRequestIdLimit: body.sampleRequestIdLimit,
+        currency: body.currency,
+      });
+      res.status(201).json(summary);
+    },
+  );
 
   router.get("/companies/:companyId/costs/summary", async (req, res) => {
     const companyId = req.params.companyId as string;
