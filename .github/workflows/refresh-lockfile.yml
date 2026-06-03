@@ -131,21 +131,20 @@ jobs:
               );
               core.info(`Auto-merge enabled for ${pr.html_url}`);
             } catch (err) {
-              // If the PR has no required checks it may already be mergeable, in
-              // which case GitHub rejects the auto-merge request ("Pull request
-              // is in clean status"). Fall back to a direct squash merge so the
-              // refresh still lands without a manual step.
-              const msg = String(err && err.message);
-              if (/clean status|not in the correct state/i.test(msg)) {
-                core.info(`Auto-merge unavailable (${msg}); attempting direct squash merge.`);
-                await github.rest.pulls.merge({
-                  owner,
-                  repo,
-                  pull_number: pr.number,
-                  merge_method: 'squash',
-                });
-                core.info(`Squash-merged ${pr.html_url}`);
-              } else {
-                throw err;
-              }
+              // enablePullRequestAutoMerge fails in several benign-for-us cases:
+              //   - "in clean status" / "not in the correct state": the PR has no
+              //     required checks and is already mergeable;
+              //   - "Auto-merge is not allowed for this repository": repo-level
+              //     auto-merge is disabled (it is for this repo).
+              // In all of these the right outcome is the same — land the
+              // lockfile refresh now — so fall back to a direct squash merge and
+              // only surface an error if that direct merge also fails.
+              core.info(`Auto-merge unavailable (${err && err.message}); attempting direct squash merge.`);
+              await github.rest.pulls.merge({
+                owner,
+                repo,
+                pull_number: pr.number,
+                merge_method: 'squash',
+              });
+              core.info(`Squash-merged ${pr.html_url}`);
             }
