@@ -1,6 +1,15 @@
 import type { Request } from "express";
 import { forbidden, unauthorized } from "../errors.js";
 
+const UUID_REGEX =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function normalizeRunId(runId: string | null | undefined) {
+  const trimmed = runId?.trim();
+  if (!trimmed) return null;
+  return UUID_REGEX.test(trimmed) ? trimmed : null;
+}
+
 export function assertAuthenticated(req: Request) {
   if (req.actor.type === "none") {
     throw unauthorized();
@@ -70,7 +79,7 @@ export function getActorInfo(req: Request) {
       actorType: "agent" as const,
       actorId: req.actor.agentId ?? "unknown-agent",
       agentId: req.actor.agentId ?? null,
-      runId: req.actor.runId ?? null,
+      runId: normalizeRunId(req.actor.runId),
     };
   }
 
@@ -78,6 +87,6 @@ export function getActorInfo(req: Request) {
     actorType: "user" as const,
     actorId: req.actor.userId ?? "board",
     agentId: null,
-    runId: req.actor.runId ?? null,
+    runId: normalizeRunId(req.actor.runId),
   };
 }
