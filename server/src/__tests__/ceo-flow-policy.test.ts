@@ -5,8 +5,10 @@ import { describe, expect, it, beforeEach, afterEach } from "vitest";
 
 import {
   applyCeoFlowPolicyToAdapterConfig,
+  auditCeoPromptRender,
   builtinDefaultCeoFlowPolicy,
   computePolicyHash,
+  effectivePolicyResponse,
   initCeoFlowPolicy,
   loadCeoFlowPolicy,
   loadCeoFlowPolicyFromString,
@@ -161,6 +163,55 @@ describe("applyCeoFlowPolicyToAdapterConfig", () => {
     expect(result.resolvedHeartbeatSec).toBe(600);
     expect(result.adapterConfig.heartbeatSec).toBe(600);
     expect(result.promptFragment).toContain("600 seconds");
+  });
+});
+
+describe("auditCeoPromptRender (ELI-300)", () => {
+  beforeEach(() => {
+    __setCeoFlowPolicyForTests(builtinDefaultCeoFlowPolicy());
+  });
+  afterEach(() => {
+    __setCeoFlowPolicyForTests(builtinDefaultCeoFlowPolicy());
+  });
+
+  it("records companyId, policyHash, promptInsertKey and resolvedHeartbeatSec for the default policy", () => {
+    const audit = auditCeoPromptRender({ companyId: "company-default" });
+    expect(audit.companyId).toBe("company-default");
+    expect(audit.promptInsertKey).toBe("ceo-flow-ownership-v1");
+    expect(audit.resolvedHeartbeatSec).toBe(300);
+    expect(audit.policyHash).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it("logs a policyHash byte-identical to the effective-policy endpoint (default)", () => {
+    const resolved = builtinDefaultCeoFlowPolicy();
+    __setCeoFlowPolicyForTests(resolved);
+    const audit = auditCeoPromptRender({ companyId: "company-default" });
+    // The endpoint builds its body via effectivePolicyResponse; the prompt-render
+    // audit must produce the identical hash for the same policy state so
+    // operators can correlate the two (spec §5).
+    expect(audit.policyHash).toBe(effectivePolicyResponse(resolved, "company-default").policyHash);
+  });
+
+  it("resolves per-company overrides exactly as the endpoint does", () => {
+    const resolved = loadCeoFlowPolicyFromString(VALID_YAML);
+    __setCeoFlowPolicyForTests(resolved);
+    const audit = auditCeoPromptRender({ companyId: "company-prod", promptInsertTarget: "AGENTS.md" });
+    const endpoint = effectivePolicyResponse(resolved, "company-prod");
+    expect(endpoint.source).toBe("override");
+    expect(audit.resolvedHeartbeatSec).toBe(600);
+    expect(audit.policyHash).toBe(endpoint.policyHash);
+    // An override hash must differ from the default-company hash for the same state.
+    expect(audit.policyHash).not.toBe(
+      effectivePolicyResponse(resolved, "company-without-override").policyHash,
+    );
+  });
+
+  it("uses an explicitly passed resolved policy over the global registry", () => {
+    const override = loadCeoFlowPolicyFromString(VALID_YAML);
+    // Global registry is the built-in default; passing `override` must win.
+    const audit = auditCeoPromptRender({ companyId: "company-prod" }, override);
+    expect(audit.resolvedHeartbeatSec).toBe(600);
+    expect(audit.policyHash).toBe(effectivePolicyResponse(override, "company-prod").policyHash);
   });
 });
 

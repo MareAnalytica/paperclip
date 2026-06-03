@@ -735,3 +735,59 @@ export function applyCeoFlowPolicyToAdapterConfig(
     promptFragment,
   };
 }
+
+export interface CeoPromptRenderAuditInput {
+  companyId: string;
+  /**
+   * Where the fragment was rendered into (e.g. `"AGENTS.md"` or
+   * `"promptTemplate"`). Free-form; recorded for operator context only.
+   */
+  promptInsertTarget?: string;
+}
+
+export interface CeoPromptRenderAudit {
+  companyId: string;
+  policyHash: string;
+  promptInsertKey: string;
+  resolvedHeartbeatSec: number;
+}
+
+/**
+ * Emit the CEO prompt-render audit entry required by
+ * docs/specs/2026-05-25-effective-ceo-flow-policy-endpoint.md §5 (and
+ * docs/specs/2026-05-13-ceo-flow-policy.md §Audit & rollback). Call this at the
+ * point a CEO's flow-ownership fragment is rendered into the prompt the agent
+ * will run with, so the recorded `policyHash` documents which config version
+ * produced that prompt.
+ *
+ * The `policyHash` is computed with {@link computePolicyHash} against the live
+ * effective policy resolved exactly as the read endpoint resolves it
+ * ({@link policyForCompany}), so it is byte-identical to what
+ * `GET /api/companies/{id}/effective-ceo-flow-policy` returns for the same
+ * policy state. That parity is what lets operators correlate a rendered prompt
+ * with the dashboard view to confirm which config version was active at render
+ * time.
+ */
+export function auditCeoPromptRender(
+  input: CeoPromptRenderAuditInput,
+  resolved: ResolvedCeoFlowPolicy = getCeoFlowPolicy(),
+): CeoPromptRenderAudit {
+  const effective = policyForCompany(resolved, input.companyId);
+  const audit: CeoPromptRenderAudit = {
+    companyId: input.companyId,
+    policyHash: computePolicyHash(effective),
+    promptInsertKey: effective.promptInsertKey,
+    resolvedHeartbeatSec: effective.heartbeatSec,
+  };
+  logger.info(
+    {
+      companyId: audit.companyId,
+      policyHash: audit.policyHash,
+      promptInsertKey: audit.promptInsertKey,
+      resolvedHeartbeatSec: audit.resolvedHeartbeatSec,
+      ...(input.promptInsertTarget ? { promptInsertTarget: input.promptInsertTarget } : {}),
+    },
+    "[ceo-flow-policy] rendered CEO prompt",
+  );
+  return audit;
+}

@@ -100,7 +100,10 @@ import {
 import { getTelemetryClient } from "../telemetry.js";
 import { assertEnvironmentSelectionForCompany } from "./environment-selection.js";
 import { recoveryService } from "../services/recovery/service.js";
-import { applyCeoFlowPolicyToAdapterConfig } from "../services/ceo-flow-policy.js";
+import {
+  applyCeoFlowPolicyToAdapterConfig,
+  auditCeoPromptRender,
+} from "../services/ceo-flow-policy.js";
 import { buildDefaultRuntimeConfigBlock as buildDefaultProviderFallbackBlock } from "../services/provider-fallback-policy.js";
 
 const RUN_LOG_DEFAULT_LIMIT_BYTES = 256_000;
@@ -1142,6 +1145,11 @@ export function agentRoutes(
           ? ceoFlowFragment
           : `${existing.trimEnd()}\n\n${ceoFlowFragment}`,
       };
+      // ELI-300: record which effective-policy version produced this CEO prompt.
+      // The logged policyHash is byte-identical to the effective-policy endpoint
+      // (both via computePolicyHash), so operators can correlate the rendered
+      // prompt with the dashboard view.
+      auditCeoPromptRender({ companyId: agent.companyId, promptInsertTarget: "AGENTS.md" });
     }
     const materialized = await instructions.materializeManagedBundle(
       agent,
