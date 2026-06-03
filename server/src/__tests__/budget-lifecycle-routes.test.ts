@@ -172,11 +172,15 @@ describeEmbeddedPostgres("budget lifecycle routes (POST /cost/preflight, /cost/c
       scope: "company",
       scopeKey: companyId,
       window: "day",
+      windowAnchor: "calendar",
       limitMicros: 1_000_000,
+      currency: "USD",
       warnAtPercent: 60,
       criticalAtPercent: 80,
       hardStopAtPercent: 100,
       action: "hard_stop",
+      isActive: true,
+      graceMinutes: 5,
     });
 
     const res = await request(app)
@@ -220,11 +224,15 @@ describeEmbeddedPostgres("budget lifecycle routes (POST /cost/preflight, /cost/c
       scope: "company",
       scopeKey: companyId,
       window: "day",
+      windowAnchor: "calendar",
       limitMicros: 1_000_000,
+      currency: "USD",
       warnAtPercent: 60,
       criticalAtPercent: 80,
       hardStopAtPercent: 100,
       action: "hard_stop",
+      isActive: true,
+      graceMinutes: 5,
     });
 
     const deny = await request(app)
