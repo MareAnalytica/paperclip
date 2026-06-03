@@ -12,6 +12,12 @@ import {
   POLICY_ERROR,
   makeCostIdempotencyKey,
 } from "@paperclipai/paperclip-cost-client";
+import {
+  getBurnHint,
+  recordPreflightResult,
+  recordChargeResult,
+  BURN_HINT_DEFAULT_TTL_MS,
+} from "./burn-hint.js";
 
 /**
  * SDK surface (ELI-78): `withBudget(call)` wrapper + thin re-export of the
@@ -76,9 +82,21 @@ export async function withBudget<T>(
      * false preserves the existing non-fatal preflight behavior for every adapter.
      */
     enforceDeny?: boolean;
+    /**
+     * Cached burn/headroom hint (ELI-943). When enabled (default), withBudget feeds
+     * the most-binding cap's utilization from each preflight/charge response into a
+     * short-TTL in-process cache and supplies it as `capUsedPercent` (and, when the
+     * server previously flagged `preflightRequired`/an alert, `forcePreflight`) on the
+     * next preflight call — so a near-exhausted cap forces a real preflight even on a
+     * stream of cheap calls. Client-only hint; never sent in the request body.
+     * Safe-by-default: only fires once a cap is already near its critical percent.
+     */
+    burnHint?: { enabled?: boolean; ttlMs?: number };
   },
 ): Promise<T> {
   const enforceDeny = opts?.enforceDeny === true;
+  const burnHintEnabled = opts?.burnHint?.enabled !== false;
+  const burnHintTtlMs = opts?.burnHint?.ttlMs ?? BURN_HINT_DEFAULT_TTL_MS;
   const apiBase =
     opts?.apiBase ||
     (process.env.PAPERCLIP_API_URL as string | undefined) ||
@@ -108,12 +126,32 @@ export async function withBudget<T>(
       null,
   };
 
+  const companyId = baseAttribution.companyId ?? null;
+
   const handle: BudgetHandle = {
     async preflightIfRequired(partial) {
-      const result = await client.preflightIfRequired({
+      // ELI-943: supply a cached burn/headroom hint so a near-exhausted cap forces a
+      // real preflight even for cheap calls. Caller-supplied values always win; the
+      // hint only fills gaps the caller left and never appears in the request body.
+      const merged: PreflightCallParams = {
         ...baseAttribution,
         ...partial,
-      } as PreflightCallParams);
+      } as PreflightCallParams;
+      if (burnHintEnabled) {
+        const hint = getBurnHint(companyId);
+        if (hint) {
+          if (merged.capUsedPercent === undefined && hint.capUsedPercent !== null) {
+            merged.capUsedPercent = hint.capUsedPercent;
+          }
+          if (merged.forcePreflight === undefined && hint.preflightRequired) {
+            merged.forcePreflight = true;
+          }
+        }
+      }
+      const result = await client.preflightIfRequired(merged);
+      if (burnHintEnabled) {
+        recordPreflightResult(companyId, result, burnHintTtlMs);
+      }
       if (enforceDeny && result.decision === "deny") {
         throw new PaperclipCostError(
           402,
@@ -136,11 +174,17 @@ export async function withBudget<T>(
           actionIndex: (p.meta as any)?.actionIndex,
           kind: p.kind,
         });
-      return client.charge({
+      const result = await client.charge({
         ...baseAttribution,
         ...p,
         idempotencyKey: key,
       });
+      // ELI-943: if a cap action fired on this charge, force the next cheap call to
+      // preflight (it can then deny) — closes the overshoot window between charges.
+      if (burnHintEnabled) {
+        recordChargeResult(companyId, result, burnHintTtlMs);
+      }
+      return result;
     },
     makeIdempotencyKey(input) {
       return client.makeIdempotencyKey({

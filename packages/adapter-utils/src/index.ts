@@ -84,6 +84,14 @@ export {
   POLICY_ERROR,
   makeCostIdempotencyKey,
 } from "./cost.js";
+// ELI-943: cached burn/headroom hint that arms forcePreflightAbovePercent in prod.
+export {
+  getBurnHint,
+  recordPreflightResult,
+  recordChargeResult,
+  BURN_HINT_DEFAULT_TTL_MS,
+  type BurnHint,
+} from "./burn-hint.js";
 // Keep the root adapter-utils entry browser-safe because the UI imports it.
 // The sandbox callback bridge stays available via its dedicated subpath export.
 export type {

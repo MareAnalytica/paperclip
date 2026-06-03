@@ -946,6 +946,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   // ELI-78: when enabled (config-gated), a preflight `deny` hard-stops the run.
   // Default false preserves the existing non-fatal preflight behavior.
   const enforceBudgetDeny = asBoolean(config.budgetEnforceDeny, false);
+  // ELI-943: cached burn/headroom hint arms forcePreflightAbovePercent in prod. On by
+  // default (safe — only forces preflight once a cap is near critical); operators can
+  // disable via config.budgetBurnHint=false.
+  const burnHintEnabled = asBoolean(config.budgetBurnHint, true);
+  const budgetOpts = { burnHint: { enabled: burnHintEnabled } };
   try {
     // ELI-78: preflight via SDK helper before the (potentially costly) claude provider call.
     // Rough est from prompt size; non-fatal to preserve existing adapter error/timeout behavior.
@@ -958,7 +963,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           estimatedQty: estTokens,
           estimatedCostMicros: Math.ceil(estTokens * 3),
         });
-      }, { enforceDeny: enforceBudgetDeny });
+      }, { enforceDeny: enforceBudgetDeny, ...budgetOpts });
     } catch (preflightErr) {
       if (isPolicyCostError(preflightErr, POLICY_ERROR.BUDGET_HARD_STOPPED)) {
         await onLog("stderr", `[paperclip] budget preflight DENY hard-stop: ${preflightErr}\n`);
@@ -1010,7 +1015,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             idempotencyKey: `anthropic:${ps.sessionId || ctx.runId}`,
             qty: (u.inputTokens || 0) + (u.outputTokens || 0) || 0,
           });
-        });
+        }, budgetOpts);
       } catch (chargeErr) {
         await onLog("stderr", `[paperclip] cost charge note (non-fatal): ${chargeErr}\n`);
       }
@@ -1037,7 +1042,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           idempotencyKey: `anthropic:${ps.sessionId || ctx.runId}`,
           qty: (u.inputTokens || 0) + (u.outputTokens || 0) || 0,
         });
-      });
+      }, budgetOpts);
     } catch (chargeErr) {
       await onLog("stderr", `[paperclip] cost charge note (non-fatal): ${chargeErr}\n`);
     }
