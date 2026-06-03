@@ -67,6 +67,23 @@ export {
   extractProviderResetTimestamp,
   normalizeResetTimeZone,
 } from "./provider-reset-timestamp.js";
+
+// ELI-78: cost attribution SDK + standalone client re-export
+export {
+  withBudget,
+  createCostClientFromContext,
+  createCostClient,
+  type BudgetHandle,
+  type CreateCostClientResult,
+  type PreflightCallParams,
+  type ChargeCallParams,
+  type PreflightResult,
+  type ChargeResult,
+  PaperclipCostError,
+  isPolicyCostError,
+  POLICY_ERROR,
+  makeCostIdempotencyKey,
+} from "./cost.js";
 // Keep the root adapter-utils entry browser-safe because the UI imports it.
 // The sandbox callback bridge stays available via its dedicated subpath export.
 export type {

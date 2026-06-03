@@ -39,6 +39,9 @@
     "clean": "rm -rf dist",
     "typecheck": "tsc --noEmit"
   },
+  "dependencies": {
+    "@paperclipai/paperclip-cost-client": "workspace:*"
+  },
   "devDependencies": {
     "@types/node": "^24.6.0",
     "typescript": "^5.7.3"
