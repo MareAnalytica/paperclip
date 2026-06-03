@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { AdapterExecutionContext, AdapterExecutionResult } from "@paperclipai/adapter-utils";
+import { createCostClientFromContext } from "@paperclipai/adapter-utils";
 import type { RunProcessResult } from "@paperclipai/adapter-utils/server-utils";
 import {
   adapterExecutionTargetIsRemote,
@@ -878,6 +879,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         ...(workspaceRepoRef ? { repoRef: workspaceRepoRef } : {}),
       } as Record<string, unknown>)
       : null;
+
     const clearSessionForMaxTurns = isClaudeMaxTurnsResult(parsed);
     const parsedIsError = asBoolean(parsed.is_error, false);
     const failed = (proc.exitCode ?? 0) !== 0 || parsedIsError;
@@ -956,6 +958,33 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       );
       const retry = await runAttempt(null);
       return toAdapterResult(retry, { fallbackSessionId: null, clearSessionOnMissingSession: true });
+    }
+
+    // ELI-78: charge using the cost client for the (post-CLI provider call) result. Dims from ctx.
+    try {
+      const costClient = createCostClientFromContext(ctx);
+      const ps = initial.parsedStream || {};
+      const u = ps.usage || { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 };
+      const chCost = typeof ps.costUsd === "number"
+        ? Math.ceil(ps.costUsd * 1_000_000)
+        : Math.ceil(((u.inputTokens || 0) + (u.outputTokens || 0)) * 3);
+      await costClient.charge({
+        companyId: ctx.agent?.companyId!,
+        runId: ctx.runId,
+        agentId: ctx.agent?.id,
+        provider: "anthropic",
+        model: ps.model || "claude",
+        kind: "tokens",
+        inputTokens: u.inputTokens || 0,
+        cachedInputTokens: u.cachedInputTokens || 0,
+        outputTokens: u.outputTokens || 0,
+        costMicros: chCost,
+        requestId: ps.sessionId || undefined,
+        idempotencyKey: `anthropic:${ps.sessionId || ctx.runId}`,
+        qty: (u.inputTokens || 0) + (u.outputTokens || 0) || 0,
+      });
+    } catch (chargeErr) {
+      await onLog("stderr", `[paperclip] cost charge note (non-fatal): ${chargeErr}\n`);
     }
 
     return toAdapterResult(initial, { fallbackSessionId: runtimeSessionId || runtime.sessionId });
