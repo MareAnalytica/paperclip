@@ -49,6 +49,15 @@ export interface EffectivePolicyResponse {
   policy: CeoFlowPolicy;
 }
 
+/** One row in the cross-company policy dashboard. */
+export interface PolicyDashboardRow {
+  companyId: string;
+  source: EffectivePolicySource;
+  policyHash: string;
+  heartbeatSec: number;
+  promptInsertKey: string;
+}
+
 export interface CeoFlowLoadOptions {
   env?: NodeJS.ProcessEnv;
   strictEnv?: boolean;
@@ -424,6 +433,31 @@ export function effectivePolicyResponse(
     policyHash: computePolicyHash(policy),
     policy,
   };
+}
+
+/**
+ * Produce one dashboard row per company for the cross-company policy table.
+ * Pass the caller-supplied list of active company IDs (from the company
+ * registry); companies without an override entry use the default policy.
+ * Mirrors the eli-board blueprint helper of the same name
+ * (src/ceo-policy/loader.ts) so endpoint, dashboard, and reconciler agree on
+ * the resolved policy and its hash.
+ */
+export function allPolicyDashboardRows(
+  resolved: ResolvedCeoFlowPolicy,
+  companyIds: string[],
+): PolicyDashboardRow[] {
+  return companyIds.map((companyId) => {
+    const isOverride = resolved.overrides.has(companyId);
+    const policy = isOverride ? resolved.overrides.get(companyId)! : resolved.default;
+    return {
+      companyId,
+      source: isOverride ? "override" : "default",
+      policyHash: computePolicyHash(policy),
+      heartbeatSec: policy.heartbeatSec,
+      promptInsertKey: policy.promptInsertKey,
+    };
+  });
 }
 
 function stablePolicySerialize(value: unknown): string {
