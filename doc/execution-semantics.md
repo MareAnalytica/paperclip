@@ -452,7 +452,55 @@ A critical-silent run that never recovers must not loop in review forever. Once 
 
 In these cases Paperclip should leave a visible issue/comment trail instead of silently retrying.
 
-## 12. What This Does Not Mean
+## 12. Bounded Adapter Invocation and the Repeated-Hang Circuit Breaker
+
+§10 makes the silent active-run watchdog deliberately non-destructive: it classifies output silence, records `snooze`/`continue`/`dismissed_false_positive` decisions, and may block a source issue, but it never cancels or mutates the live run. That contract is correct for an ambiguous-but-possibly-productive run, but it is not a bound on a run that is *deterministically* hung at the adapter layer.
+
+A local adapter invocation can hang before it ever emits its first observable output — for example, a fallback hop into a local CLI that never returns its first event (last sequence stays at the lifecycle marker). Local and SSH adapters preserve a historical "0 means no adapter timeout" default (`resolveAdapterExecutionTargetTimeoutSec`), so a wall-clock cap does not save them, and the watchdog by design only observes. When the cause is stable — the same exhausted-primary → same fallback hop → same prompt — every re-pickup is a fresh run that hangs identically, and the per-stranding continuation bounds in §8.2 reset per run, so the loop never accumulates a stop. The watchdog recovers and re-queues, the agent re-picks-up, and it hangs again: recovery working as designed, but no layer bounding the hang.
+
+This section adds the three contracts that close that gap. They are the destructive complement to §10's non-destructive watchdog, and the cross-run complement to §8's per-run recovery. All thresholds are configuration, not hardcoded values, so the contract stays portable across companies.
+
+### Contract A — Bounded adapter invocation (no unbounded silent hang)
+
+A local adapter invocation that produces **no new observable output** for a bounded, config-driven idle window must be terminated by the **adapter/runtime layer** and surfaced as a typed `timedOut` / `no_output` result. This is distinct from §10: the watchdog stays signal-only; the *adapter invocation itself* gains a kill bound.
+
+- It is an **idle (no-output) deadline, not a wall-clock cap**: the timer resets on every output chunk (`onLog`). A healthy streaming run — for instance a local CLI emitting events continuously — never trips it; only an invoke that emits nothing for the whole window dies.
+- It is config-driven: `adapterNoOutputKillSec`, with a generous default (e.g. 600s) and `0` preserving today's unbounded behavior for explicit opt-out. The value is portable — it applies to all local adapters and carries no company-specific tuning.
+- The kill produces a **typed** result (`no_output` / `timedOut`), not a silent disappearance, so downstream classification (Contract B) and the audit trail both see a real signal rather than a pseudo-stop.
+
+This bound is per invocation. It guarantees each iteration ends in bounded time, but it does not by itself decide whether the run fails or advances (Contract B) or whether re-routing into the same hang should stop (Contract C).
+
+### Contract B — A no-output kill on a fallback hop is provider-fallback-eligible
+
+When a Contract A kill occurs on a **non-primary fallback adapter**, the result is classified as provider-fallback-eligible so the fallback chain **advances to the next provider** instead of failing the run.
+
+- It composes with the existing fallback-eligibility classifier (`isProviderFallbackEligibleError`) and the configurable limit markers (the ELI-902 safety-net), as an additional eligibility branch gated to the *hang / no-output* class on a fallback hop. Native classification still wins where it already applies.
+- It is gated to fallback hops on purpose. A bare invocation timeout is **not** otherwise fallback-eligible, and a kill on the **primary** adapter is **not** auto-eligible: that preserves production behavior and avoids masking a real primary-provider failure as a routine hop. This also composes with auth-model-aware precedence (ELI-901): a raw-key auth failure must still not consume the chain; a no-output *hang* of a hop is a different, hop-eligible class.
+- Advancing the chain is the mechanism that keeps the agent working when one hop is wedged: the run continues on the next healthy provider rather than dead-ending on a typed timeout.
+
+### Contract C — Repeated-identical-hang circuit breaker (cross-run bound)
+
+When the same `(agent, provider)` invocation is recovered and re-queued for an **invoke-stage hang N consecutive times with no forward progress**, recovery must stop re-routing into the identical hang. After the threshold, Paperclip must either:
+
+- mark that provider **unhealthy for that agent** and skip it in the fallback chain (the chain falls through to the next provider, e.g. the hop after the wedged one), or
+- move the source issue to `blocked` with a typed explicit recovery action (per §7 / §11) that names the operator action — provider/CLI health check, version pin, or token — following the DEE-709 operator-remediation pattern.
+
+The counter accumulates on the `(agent, provider, invoke-hang)` signal and **re-pickup must not reset it**. This is the decisive difference from §8.2: the per-stranding continuation bound is per run, so a fresh run on re-pickup resets it and the loop never stops; Contract C's accumulator survives re-pickup, so a deterministically-reproducing hang is bounded permanently rather than per iteration.
+
+- Thresholds are config-driven (e.g. `repeatedHang.maxConsecutiveHangs`) and portable. "No forward progress" means the re-queued run reproduced the same invoke-stage hang without advancing the source issue.
+- Contract C is the cross-run circuit breaker. Contracts A and B already keep each iteration bounded and forward-moving; C exists for the case where every iteration reproduces the same hang and the right answer is to stop routing into it at all.
+
+### How the three liveness invariants hold
+
+These contracts are constrained by the same three invariants that govern all recovery in this document.
+
+1. **Productive work continues.** Contract A's deadline resets on every output chunk, so a busy streaming run is never killed — only a genuinely silent invoke is. Contract B *advances* the fallback chain to a working provider rather than failing the run, so the agent keeps making progress. Contract C, when it skips a provider, falls through to the next healthy hop; it only stops work when no healthy path remains, and then it does so via a named, actionable blocker rather than a silent stall.
+2. **Only real blockers stop work.** A genuine hang now yields a typed `no_output` / `timedOut` result — a real signal — instead of a silent pseudo-stop that the watchdog can only observe. Contract C blocks **only after N identical hangs with no progress**, and the blocker is a first-class typed recovery action that names the operator action, so the stop is a real, surfaced blocker under §7's liveness contract, not an inferred or silent one.
+3. **No infinite loops.** Contract A bounds each invocation in time. Contract B turns a bounded kill on a hop into chain advancement, so a single wedged provider does not fail an otherwise-recoverable run. Contract C bounds *across* runs: because its counter does not reset on re-pickup, a deterministically-reproducing invoke hang can no longer loop through watchdog-recover → re-pickup → re-hang. The loop terminates either by skipping the provider or by surfacing a bounded operator escalation, consistent with the escalation-horizon discipline in §11.
+
+These are contracts, not an implementation. Implementation of A, B, and C is tracked as separate work items that block on ratification of this section.
+
+## 13. What This Does Not Mean
 
 These semantics do not change V1 into an auto-reassignment system.
 
@@ -469,7 +517,7 @@ The recovery model is intentionally conservative:
 - open an explicit recovery action when the system can identify a bounded recovery owner/action
 - escalate visibly when the system cannot safely keep going
 
-## 13. Practical Interpretation
+## 14. Practical Interpretation
 
 For a board operator, the intended meaning is:
 
