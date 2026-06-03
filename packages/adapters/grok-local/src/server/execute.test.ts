@@ -26,6 +26,12 @@ vi.mock("@paperclipai/adapter-utils/execution-target", () => ({
   readAdapterExecutionTarget: ({ executionTarget }: { executionTarget?: unknown }) => executionTarget ?? { kind: "local" },
   resolveAdapterExecutionTargetCommandForLogs: resolveCommandForLogsMock,
   resolveAdapterExecutionTargetTimeoutSec: (_target: unknown, timeoutSec: number) => timeoutSec,
+  resolveAdapterNoOutputKillSec: (configured: number | null | undefined) =>
+    typeof configured === "number" && Number.isFinite(configured)
+      ? configured > 0
+        ? Math.floor(configured)
+        : 0
+      : 600,
   runAdapterExecutionTargetProcess: runProcessMock,
 }));
 
@@ -147,6 +153,101 @@ describe("grok_local execute", () => {
     expect(await pathExists(path.join(root, "Agents.md"))).toBe(false);
     expect(await pathExists(path.join(root, ".claude", "skills", "paperclip"))).toBe(false);
     expect(logs.map((entry) => entry.chunk)).not.toEqual([]);
+  });
+
+  it("surfaces a typed no_output result when the idle deadline kills a hung invocation", async () => {
+    const root = await makeTempRoot();
+
+    runProcessMock.mockImplementation(async (_runId, _target, _command, args) => {
+      if (args.includes("--help")) {
+        return {
+          exitCode: 0,
+          signal: null,
+          timedOut: false,
+          stdout: "  -o, --output-format <OUTPUT_FORMAT>\n          [possible values: plain, json, streaming-json]\n",
+          stderr: "",
+        };
+      }
+      // Contract A: the invocation hung with no output and was idle-killed.
+      return {
+        exitCode: null,
+        signal: "SIGTERM",
+        timedOut: true,
+        noOutput: true,
+        stdout: "",
+        stderr: "",
+      };
+    });
+
+    const ctx: AdapterExecutionContext = {
+      runId: "run-no-output",
+      agent: {
+        id: "agent-1",
+        companyId: "company-1",
+        name: "Grok Agent",
+        adapterType: "grok_local",
+        adapterConfig: {},
+      },
+      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+      config: { cwd: root, adapterNoOutputKillSec: 600 },
+      context: {},
+      authToken: "run-token",
+      onLog: async () => {},
+    };
+
+    const result = await execute(ctx);
+
+    expect(result.timedOut).toBe(true);
+    expect(result.errorCode).toBe("adapter_no_output_timeout");
+    expect(result.errorMessage).toContain("idle no-output deadline");
+    expect(result.errorMessage).toContain("600s");
+    expect(result.errorMeta).toMatchObject({ noOutput: true, noOutputKillSec: 600 });
+  });
+
+  it("keeps the wall-clock timeout message distinct from a no_output kill", async () => {
+    const root = await makeTempRoot();
+
+    runProcessMock.mockImplementation(async (_runId, _target, _command, args) => {
+      if (args.includes("--help")) {
+        return {
+          exitCode: 0,
+          signal: null,
+          timedOut: false,
+          stdout: "  -o, --output-format <OUTPUT_FORMAT>\n          [possible values: plain, json, streaming-json]\n",
+          stderr: "",
+        };
+      }
+      // A wall-clock timeout (timedOut without noOutput) must not be relabeled.
+      return {
+        exitCode: null,
+        signal: "SIGTERM",
+        timedOut: true,
+        stdout: "",
+        stderr: "",
+      };
+    });
+
+    const ctx: AdapterExecutionContext = {
+      runId: "run-walltimeout",
+      agent: {
+        id: "agent-1",
+        companyId: "company-1",
+        name: "Grok Agent",
+        adapterType: "grok_local",
+        adapterConfig: {},
+      },
+      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+      config: { cwd: root, timeoutSec: 30 },
+      context: {},
+      authToken: "run-token",
+      onLog: async () => {},
+    };
+
+    const result = await execute(ctx);
+
+    expect(result.timedOut).toBe(true);
+    expect(result.errorMessage).toBe("Timed out after 30s");
+    expect(result.errorCode).toBeUndefined();
   });
 
   it("cleans up staged assets when setup fails before the Grok process starts", async () => {

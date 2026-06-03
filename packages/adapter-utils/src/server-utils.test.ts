@@ -353,6 +353,86 @@ describe("runChildProcess", () => {
     expect(result.stdout).toContain('"type":"result"');
   });
 
+  it.skipIf(process.platform === "win32")("kills a hung no-output child within the idle deadline window", async () => {
+    const startedAt = Date.now();
+    const result = await runChildProcess(
+      randomUUID(),
+      process.execPath,
+      // Emits nothing and never exits on its own — the only thing that can stop
+      // it is the idle (no-output) deadline.
+      ["-e", "setInterval(() => {}, 1000);"],
+      {
+        cwd: process.cwd(),
+        env: {},
+        timeoutSec: 0,
+        graceSec: 1,
+        noOutputKillSec: 0.4,
+        onLog: async () => {},
+      },
+    );
+    const elapsedMs = Date.now() - startedAt;
+
+    expect(result.timedOut).toBe(true);
+    expect(result.noOutput).toBe(true);
+    expect(result.stdout).toBe("");
+    // Killed by the idle window, not left to run unbounded.
+    expect(elapsedMs).toBeLessThan(3_000);
+  });
+
+  it.skipIf(process.platform === "win32")("lets a streaming child survive past the idle window when output keeps arriving", async () => {
+    const chunks: string[] = [];
+    const result = await runChildProcess(
+      randomUUID(),
+      process.execPath,
+      // Emits a chunk every 100ms for ~600ms, then exits cleanly. No single gap
+      // approaches the 0.4s idle window, so the deadline must never fire.
+      [
+        "-e",
+        [
+          "let n = 0;",
+          "const t = setInterval(() => { process.stdout.write(`tick ${n}\\n`); if (++n >= 6) { clearInterval(t); process.exit(0); } }, 100);",
+        ].join(" "),
+      ],
+      {
+        cwd: process.cwd(),
+        env: {},
+        timeoutSec: 0,
+        graceSec: 1,
+        noOutputKillSec: 0.4,
+        onLog: async (_stream, chunk) => {
+          chunks.push(chunk);
+        },
+      },
+    );
+
+    expect(result.timedOut).toBe(false);
+    expect(result.noOutput).toBeFalsy();
+    expect(result.exitCode).toBe(0);
+    expect(chunks.join("")).toContain("tick 5");
+  });
+
+  it.skipIf(process.platform === "win32")("treats noOutputKillSec=0 as legacy unbounded (no idle kill)", async () => {
+    const result = await runChildProcess(
+      randomUUID(),
+      process.execPath,
+      // Silent for 500ms — longer than any small idle window — then exits 0. With
+      // the deadline disabled (0) it must run to completion, not be killed.
+      ["-e", "setTimeout(() => process.exit(0), 500);"],
+      {
+        cwd: process.cwd(),
+        env: {},
+        timeoutSec: 0,
+        graceSec: 1,
+        noOutputKillSec: 0,
+        onLog: async () => {},
+      },
+    );
+
+    expect(result.timedOut).toBe(false);
+    expect(result.noOutput).toBeFalsy();
+    expect(result.exitCode).toBe(0);
+  });
+
   it.skipIf(process.platform === "win32")("does not clean up noisy runs that have no terminal output", async () => {
     const runId = randomUUID();
     let observed = "";

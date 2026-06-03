@@ -79,6 +79,15 @@ export interface AdapterExecutionTargetProcessOptions {
   stdin?: string;
   timeoutSec: number;
   graceSec: number;
+  /**
+   * Idle (no-output) deadline in seconds for local/SSH targets — Contract A
+   * (doc/execution-semantics.md §12). When > 0, the invocation is terminated
+   * (SIGTERM→grace→SIGKILL) and surfaced as a typed `timedOut`/`noOutput`
+   * result if it produces no output for the whole window; the timer resets on
+   * every output chunk. `0`/undefined preserves the legacy unbounded behavior.
+   * Resolve via {@link resolveAdapterNoOutputKillSec}.
+   */
+  noOutputKillSec?: number;
   onLog: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
   onSpawn?: (meta: { pid: number; processGroupId: number | null; startedAt: string }) => Promise<void>;
   terminalResultCleanup?: TerminalResultCleanupOptions;
@@ -100,6 +109,13 @@ export interface AdapterExecutionTargetPaperclipBridgeHandle {
 export { sanitizeRemoteExecutionEnv } from "./remote-execution-env.js";
 
 export const DEFAULT_REMOTE_SANDBOX_ADAPTER_TIMEOUT_SEC = 1_800;
+
+// Generous default idle (no-output) deadline for local adapter invocations —
+// Contract A (doc/execution-semantics.md §12). 600s of complete silence bounds
+// a hung invoke without tripping a healthy streaming run (which resets the
+// timer on every output chunk). Portable: applies to all local adapters and
+// carries no company-specific tuning. `0` explicitly opts out (unbounded).
+export const DEFAULT_ADAPTER_NO_OUTPUT_KILL_SEC = 600;
 
 function parseObject(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value)
@@ -242,6 +258,25 @@ export function resolveAdapterExecutionTargetTimeoutSec(
     return DEFAULT_REMOTE_SANDBOX_ADAPTER_TIMEOUT_SEC;
   }
   return 0;
+}
+
+/**
+ * Resolve the idle (no-output) deadline for a local adapter invocation —
+ * Contract A (doc/execution-semantics.md §12).
+ *
+ * - An explicit finite value `>= 0` is honored verbatim, so a configured `0`
+ *   means "explicitly unbounded" (legacy behavior). This is the only way to
+ *   opt out, mirroring the historical `timeoutSec: 0` contract.
+ * - `null` / `undefined` / non-finite (i.e. unconfigured) falls back to the
+ *   generous {@link DEFAULT_ADAPTER_NO_OUTPUT_KILL_SEC} default.
+ */
+export function resolveAdapterNoOutputKillSec(
+  configuredNoOutputKillSec: number | null | undefined,
+): number {
+  if (typeof configuredNoOutputKillSec === "number" && Number.isFinite(configuredNoOutputKillSec)) {
+    return configuredNoOutputKillSec > 0 ? Math.floor(configuredNoOutputKillSec) : 0;
+  }
+  return DEFAULT_ADAPTER_NO_OUTPUT_KILL_SEC;
 }
 
 function requireSandboxRunner(target: AdapterSandboxExecutionTarget): CommandManagedRuntimeRunner {
@@ -429,6 +464,7 @@ export async function runAdapterExecutionTargetProcess(
     stdin: options.stdin,
     timeoutSec: options.timeoutSec,
     graceSec: options.graceSec,
+    noOutputKillSec: options.noOutputKillSec,
     onLog: options.onLog,
     onSpawn: options.onSpawn,
     terminalResultCleanup: options.terminalResultCleanup,
