@@ -15,6 +15,7 @@ import {
   readAdapterExecutionTarget,
   resolveAdapterExecutionTargetCommandForLogs,
   resolveAdapterExecutionTargetTimeoutSec,
+  resolveAdapterNoOutputKillSec,
   runAdapterExecutionTargetProcess,
 } from "@paperclipai/adapter-utils/execution-target";
 import {
@@ -300,6 +301,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       executionTarget,
       asNumber(config.timeoutSec, 0),
     );
+    // Contract A (doc/execution-semantics.md §12): bound a hung grok invocation
+    // that emits no output (e.g. a fallback hop that never returns its first
+    // event). Read the raw config so an explicit `0` opts out (unbounded) while
+    // an unset value gets the generous portable default; never collapse unset→0.
+    const noOutputKillSec = resolveAdapterNoOutputKillSec(
+      typeof config.adapterNoOutputKillSec === "number" ? config.adapterNoOutputKillSec : null,
+    );
     const graceSec = asNumber(config.graceSec, 20);
     await ensureAdapterExecutionTargetRuntimeCommandInstalled({
       runId,
@@ -484,6 +492,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         env,
         timeoutSec,
         graceSec,
+        noOutputKillSec,
         onSpawn,
         onLog,
       });
@@ -499,6 +508,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           exitCode: number | null;
           signal: string | null;
           timedOut: boolean;
+          noOutput?: boolean;
           stdout: string;
           stderr: string;
         };
@@ -508,11 +518,24 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       isRetry = false,
     ): AdapterExecutionResult => {
       if (attempt.proc.timedOut) {
+        // Distinguish an idle no-output kill (Contract A) from a wall-clock
+        // timeout so downstream classification (Contract B / ELI-951) can treat
+        // a hung fallback hop as provider-fallback-eligible without masking a
+        // real wall-clock timeout. Both surface as `timedOut: true`.
+        const isNoOutputKill = attempt.proc.noOutput === true;
         return {
           exitCode: attempt.proc.exitCode,
           signal: attempt.proc.signal,
           timedOut: true,
-          errorMessage: `Timed out after ${timeoutSec}s`,
+          errorMessage: isNoOutputKill
+            ? `Grok produced no output for ${noOutputKillSec}s (idle no-output deadline)`
+            : `Timed out after ${timeoutSec}s`,
+          ...(isNoOutputKill
+            ? {
+                errorCode: "adapter_no_output_timeout",
+                errorMeta: { noOutput: true, noOutputKillSec },
+              }
+            : {}),
           clearSession: clearSessionOnMissingSession,
         };
       }

@@ -3,8 +3,10 @@ import * as ssh from "./ssh.js";
 import * as serverUtils from "./server-utils.js";
 import {
   adapterExecutionTargetUsesManagedHome,
+  DEFAULT_ADAPTER_NO_OUTPUT_KILL_SEC,
   ensureAdapterExecutionTargetRuntimeCommandInstalled,
   resolveAdapterExecutionTargetCwd,
+  resolveAdapterNoOutputKillSec,
   runAdapterExecutionTargetProcess,
   runAdapterExecutionTargetShellCommand,
 } from "./execution-target.js";
@@ -279,6 +281,61 @@ describe("runAdapterExecutionTargetProcess", () => {
         },
       }),
     );
+  });
+
+  it("forwards the idle no-output deadline to runChildProcess for local targets", async () => {
+    const runChildProcessSpy = vi.spyOn(serverUtils, "runChildProcess").mockResolvedValue({
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      stdout: "",
+      stderr: "",
+      pid: null,
+      startedAt: new Date().toISOString(),
+    });
+
+    await runAdapterExecutionTargetProcess(
+      "run-local-process",
+      { kind: "local" },
+      "agent-cli",
+      ["--json"],
+      {
+        cwd: "/tmp/local",
+        env: {},
+        timeoutSec: 0,
+        graceSec: 1,
+        noOutputKillSec: 600,
+        onLog: async () => {},
+      },
+    );
+
+    expect(runChildProcessSpy).toHaveBeenCalledWith(
+      "run-local-process",
+      "agent-cli",
+      ["--json"],
+      expect.objectContaining({ noOutputKillSec: 600 }),
+    );
+  });
+});
+
+describe("resolveAdapterNoOutputKillSec", () => {
+  it("falls back to the generous default when unconfigured", () => {
+    expect(resolveAdapterNoOutputKillSec(null)).toBe(DEFAULT_ADAPTER_NO_OUTPUT_KILL_SEC);
+    expect(resolveAdapterNoOutputKillSec(undefined)).toBe(DEFAULT_ADAPTER_NO_OUTPUT_KILL_SEC);
+    expect(resolveAdapterNoOutputKillSec(Number.NaN)).toBe(DEFAULT_ADAPTER_NO_OUTPUT_KILL_SEC);
+  });
+
+  it("honors an explicit 0 as unbounded (legacy opt-out)", () => {
+    expect(resolveAdapterNoOutputKillSec(0)).toBe(0);
+  });
+
+  it("honors a configured positive value and floors it to whole seconds", () => {
+    expect(resolveAdapterNoOutputKillSec(120)).toBe(120);
+    expect(resolveAdapterNoOutputKillSec(90.7)).toBe(90);
+  });
+
+  it("clamps a negative value to unbounded rather than arming a degenerate window", () => {
+    expect(resolveAdapterNoOutputKillSec(-5)).toBe(0);
   });
 });
 

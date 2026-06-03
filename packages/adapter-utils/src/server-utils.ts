@@ -15,6 +15,13 @@ export interface RunProcessResult {
   exitCode: number | null;
   signal: string | null;
   timedOut: boolean;
+  /**
+   * True when the process was terminated by the idle (no-output) deadline
+   * rather than completing or hitting the wall-clock `timeoutSec`. Implies
+   * `timedOut: true`. Optional so existing result literals stay valid; absence
+   * means "not a no-output kill". See Contract A in doc/execution-semantics.md §12.
+   */
+  noOutput?: boolean;
   stdout: string;
   stderr: string;
   pid: number | null;
@@ -1905,6 +1912,14 @@ export async function runChildProcess(
     env: Record<string, string>;
     timeoutSec: number;
     graceSec: number;
+    /**
+     * Idle (no-output) deadline in seconds. When > 0, the process is
+     * SIGTERM→grace→SIGKILL terminated if it produces no stdout/stderr for the
+     * whole window; the timer resets on every output chunk so a healthy
+     * streaming run never trips it. `0`/undefined preserves the legacy
+     * unbounded behavior. Contract A, doc/execution-semantics.md §12.
+     */
+    noOutputKillSec?: number;
     onLog: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
     onLogError?: (err: unknown, runId: string, message: string) => void;
     onSpawn?: (meta: { pid: number; processGroupId: number | null; startedAt: string }) => Promise<void>;
@@ -1961,6 +1976,7 @@ export async function runChildProcess(
         runningProcesses.set(runId, { child, graceSec: opts.graceSec, processGroupId });
 
         let timedOut = false;
+        let noOutput = false;
         let stdout = "";
         let stderr = "";
         let logChain: Promise<void> = Promise.resolve();
@@ -2025,9 +2041,45 @@ export async function runChildProcess(
               }, opts.timeoutSec * 1000)
             : null;
 
+        // Idle (no-output) deadline — Contract A (doc/execution-semantics.md §12).
+        // Distinct from the wall-clock `timeout` above: this fires only after a
+        // full window of silence and is reset on every output chunk, so a healthy
+        // streaming run never trips it. It exists to bound an invoke that hangs
+        // before (or between) emitting observable output — e.g. a fallback hop
+        // into a local CLI that never returns its first event.
+        const noOutputKillMs =
+          typeof opts.noOutputKillSec === "number" &&
+          Number.isFinite(opts.noOutputKillSec) &&
+          opts.noOutputKillSec > 0
+            ? opts.noOutputKillSec * 1000
+            : 0;
+        let idleTimer: NodeJS.Timeout | null = null;
+        const clearIdleTimer = () => {
+          if (idleTimer) clearTimeout(idleTimer);
+          idleTimer = null;
+        };
+        const resetIdleTimer = () => {
+          if (noOutputKillMs <= 0) return;
+          if (idleTimer) clearTimeout(idleTimer);
+          idleTimer = setTimeout(() => {
+            idleTimer = null;
+            if (timedOut) return;
+            timedOut = true;
+            noOutput = true;
+            clearTerminalCleanupTimers();
+            signalRunningProcess({ child, processGroupId }, "SIGTERM");
+            setTimeout(() => {
+              signalRunningProcess({ child, processGroupId }, "SIGKILL");
+            }, Math.max(1, opts.graceSec) * 1000);
+          }, noOutputKillMs);
+        };
+        // Start the window at spawn so an invoke that emits nothing at all dies.
+        resetIdleTimer();
+
         child.stdout?.on("data", (chunk: unknown) => {
           const readable = child.stdout;
           if (!readable) return;
+          resetIdleTimer();
           readable.pause();
           const text = String(chunk);
           stdout = appendWithCap(stdout, text);
@@ -2044,6 +2096,7 @@ export async function runChildProcess(
         child.stderr?.on("data", (chunk: unknown) => {
           const readable = child.stderr;
           if (!readable) return;
+          resetIdleTimer();
           readable.pause();
           const text = String(chunk);
           stderr = appendWithCap(stderr, text);
@@ -2068,6 +2121,7 @@ export async function runChildProcess(
 
         child.on("error", (err: Error) => {
           if (timeout) clearTimeout(timeout);
+          clearIdleTimer();
           clearTerminalCleanupTimers();
           runningProcesses.delete(runId);
           void target.cleanup?.();
@@ -2086,6 +2140,7 @@ export async function runChildProcess(
 
         child.on("close", (code: number | null, signal: NodeJS.Signals | null) => {
           if (timeout) clearTimeout(timeout);
+          clearIdleTimer();
           clearTerminalCleanupTimers();
           runningProcesses.delete(runId);
           void logChain.finally(() => {
@@ -2096,6 +2151,7 @@ export async function runChildProcess(
                 exitCode: code,
                 signal,
                 timedOut,
+                noOutput,
                 stdout,
                 stderr,
                 pid: child.pid ?? null,
