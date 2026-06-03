@@ -39,6 +39,16 @@ export interface ResolvedCeoFlowPolicy {
   overrides: Map<string, CeoFlowPolicy>;
 }
 
+export type EffectivePolicySource = "default" | "override";
+
+export interface EffectivePolicyResponse {
+  companyId: string;
+  source: EffectivePolicySource;
+  /** SHA-256 hex hash of the resolved policy fields. Stable across runs for the same config. */
+  policyHash: string;
+  policy: CeoFlowPolicy;
+}
+
 export interface CeoFlowLoadOptions {
   env?: NodeJS.ProcessEnv;
   strictEnv?: boolean;
@@ -394,6 +404,28 @@ export function policyForCompany(
   return resolved.overrides.get(companyId) ?? resolved.default;
 }
 
+/**
+ * Build the response body for
+ * `GET /api/companies/{companyId}/effective-ceo-flow-policy`. The `source`
+ * field is `"override"` when a per-company entry exists, `"default"`
+ * otherwise. Mirrors the eli-board blueprint helper of the same name
+ * (src/ceo-policy/loader.ts) so the endpoint, the dashboard, and the
+ * reconciler all agree on the resolved policy and its hash.
+ */
+export function effectivePolicyResponse(
+  resolved: ResolvedCeoFlowPolicy,
+  companyId: string,
+): EffectivePolicyResponse {
+  const isOverride = resolved.overrides.has(companyId);
+  const policy = isOverride ? resolved.overrides.get(companyId)! : resolved.default;
+  return {
+    companyId,
+    source: isOverride ? "override" : "default",
+    policyHash: computePolicyHash(policy),
+    policy,
+  };
+}
+
 function stablePolicySerialize(value: unknown): string {
   if (value === null || typeof value !== "object") return JSON.stringify(value);
   if (Array.isArray(value)) return `[${value.map(stablePolicySerialize).join(",")}]`;
@@ -435,6 +467,12 @@ interface CeoFlowPolicyRegistry {
   resolved: ResolvedCeoFlowPolicy;
   path: string | null;
   loadedAt: Date;
+  /**
+   * Non-null when the configured policy file failed to load and the server
+   * fell back to built-in defaults. Lets the effective-policy endpoint return
+   * `503` instead of silently serving defaults.
+   */
+  loadError: string | null;
   sighupListenerInstalled: boolean;
 }
 
@@ -444,23 +482,27 @@ function getGlobalRegistry(): { [REGISTRY_KEY]?: CeoFlowPolicyRegistry } {
 
 function loadFromEnv(
   env: NodeJS.ProcessEnv,
-): { resolved: ResolvedCeoFlowPolicy; path: string | null } {
+): { resolved: ResolvedCeoFlowPolicy; path: string | null; loadError: string | null } {
   const path = env.ELI_CEO_FLOW_POLICY_PATH?.trim() || null;
   if (!path) {
-    return { resolved: builtinDefaultCeoFlowPolicy(), path: null };
+    return { resolved: builtinDefaultCeoFlowPolicy(), path: null, loadError: null };
   }
   try {
     const resolved = loadCeoFlowPolicy(path, {
       env,
       onWarn: (m) => logger.warn(m),
     });
-    return { resolved, path };
+    return { resolved, path, loadError: null };
   } catch (err) {
     logger.error(
       { err, policyPath: path },
       "[ceo-flow-policy] failed to load policy file; falling back to built-in defaults",
     );
-    return { resolved: builtinDefaultCeoFlowPolicy(), path };
+    return {
+      resolved: builtinDefaultCeoFlowPolicy(),
+      path,
+      loadError: err instanceof Error ? err.message : String(err),
+    };
   }
 }
 
@@ -471,13 +513,14 @@ function loadFromEnv(
  */
 export function initCeoFlowPolicy(env: NodeJS.ProcessEnv = process.env): ResolvedCeoFlowPolicy {
   const registryHost = getGlobalRegistry();
-  const { resolved, path } = loadFromEnv(env);
+  const { resolved, path, loadError } = loadFromEnv(env);
   const existing = registryHost[REGISTRY_KEY];
   const sighupListenerInstalled = existing?.sighupListenerInstalled ?? false;
   registryHost[REGISTRY_KEY] = {
     resolved,
     path,
     loadedAt: new Date(),
+    loadError,
     sighupListenerInstalled,
   };
   if (!sighupListenerInstalled && typeof process.on === "function") {
@@ -507,12 +550,13 @@ export function reloadCeoFlowPolicy(
   env: NodeJS.ProcessEnv = process.env,
 ): ResolvedCeoFlowPolicy {
   const registryHost = getGlobalRegistry();
-  const { resolved, path } = loadFromEnv(env);
+  const { resolved, path, loadError } = loadFromEnv(env);
   const existing = registryHost[REGISTRY_KEY];
   registryHost[REGISTRY_KEY] = {
     resolved,
     path,
     loadedAt: new Date(),
+    loadError,
     sighupListenerInstalled: existing?.sighupListenerInstalled ?? false,
   };
   logger.info(
@@ -533,17 +577,47 @@ export function getCeoFlowPolicy(): ResolvedCeoFlowPolicy {
   return initCeoFlowPolicy();
 }
 
+export interface CeoFlowPolicyState {
+  resolved: ResolvedCeoFlowPolicy;
+  /**
+   * Non-null when the configured policy file failed to load and the server is
+   * serving built-in defaults. The effective-policy endpoint returns `503`
+   * when this is set so operators can distinguish a degraded config from an
+   * intentional default.
+   */
+  loadError: string | null;
+}
+
+/**
+ * Like {@link getCeoFlowPolicy} but also reports whether the configured policy
+ * file failed to load. Used by the effective-policy endpoint to honor the
+ * `503` contract instead of silently serving defaults.
+ */
+export function getCeoFlowPolicyState(): CeoFlowPolicyState {
+  const registryHost = getGlobalRegistry();
+  let existing = registryHost[REGISTRY_KEY];
+  if (!existing) {
+    initCeoFlowPolicy();
+    existing = registryHost[REGISTRY_KEY]!;
+  }
+  return { resolved: existing.resolved, loadError: existing.loadError };
+}
+
 /**
  * Test-only: replace the in-process policy registry with a specific resolved
  * policy. Returns a disposer that restores the previous value.
  */
-export function __setCeoFlowPolicyForTests(resolved: ResolvedCeoFlowPolicy): () => void {
+export function __setCeoFlowPolicyForTests(
+  resolved: ResolvedCeoFlowPolicy,
+  options: { loadError?: string | null } = {},
+): () => void {
   const registryHost = getGlobalRegistry();
   const previous = registryHost[REGISTRY_KEY];
   registryHost[REGISTRY_KEY] = {
     resolved,
     path: null,
     loadedAt: new Date(),
+    loadError: options.loadError ?? null,
     sighupListenerInstalled: previous?.sighupListenerInstalled ?? false,
   };
   return () => {

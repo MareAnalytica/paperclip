@@ -24,6 +24,10 @@ import {
   feedbackService,
   logActivity,
 } from "../services/index.js";
+import {
+  effectivePolicyResponse,
+  getCeoFlowPolicyState,
+} from "../services/ceo-flow-policy.js";
 import type { StorageService } from "../storage/types.js";
 import { assertBoard, assertCompanyAccess, assertInstanceAdmin, getActorInfo } from "./authz.js";
 import { COMPANY_IMPORT_ROUTE_PATH } from "./company-import-paths.js";
@@ -91,6 +95,24 @@ export function companyRoutes(db: Db, storage?: StorageService) {
     }
   }
 
+  // Effective CEO flow policy endpoint (spec:
+  // docs/specs/2026-05-25-effective-ceo-flow-policy-endpoint.md §2). Read path
+  // for board users and the company's own CEO agent to verify which policy is
+  // actually in effect.
+  async function assertBoardOrCeoOfCompany(req: Request, companyId: string) {
+    assertCompanyAccess(req, companyId);
+    if (req.actor.type === "board") return;
+    if (!req.actor.agentId) throw forbidden("Agent authentication required");
+
+    const actorAgent = await agents.getById(req.actor.agentId);
+    if (!actorAgent || actorAgent.companyId !== companyId) {
+      throw forbidden("Agent key cannot access another company");
+    }
+    if (actorAgent.role !== "ceo") {
+      throw forbidden("Only board users or the company CEO agent may read the effective CEO flow policy");
+    }
+  }
+
   router.get("/", async (req, res) => {
     assertBoard(req);
     const result = await svc.list();
@@ -136,6 +158,28 @@ export function companyRoutes(db: Db, storage?: StorageService) {
       return;
     }
     res.json(company);
+  });
+
+  router.get("/:companyId/effective-ceo-flow-policy", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    await assertBoardOrCeoOfCompany(req, companyId);
+
+    const company = await svc.getById(companyId);
+    if (!company) {
+      res.status(404).json({ error: "Company not found" });
+      return;
+    }
+
+    const { resolved, loadError } = getCeoFlowPolicyState();
+    if (loadError) {
+      res.status(503).json({
+        error: "CEO flow policy failed to load",
+        detail: loadError,
+      });
+      return;
+    }
+
+    res.json(effectivePolicyResponse(resolved, companyId));
   });
 
   router.get("/:companyId/feedback-traces", async (req, res) => {
