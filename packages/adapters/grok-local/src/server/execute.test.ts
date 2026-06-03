@@ -30,6 +30,7 @@ vi.mock("@paperclipai/adapter-utils/execution-target", () => ({
 }));
 
 import { execute } from "./execute.js";
+import { __resetGrokOutputFormatCacheForTests } from "./output-format.js";
 
 const tempRoots: string[] = [];
 
@@ -50,6 +51,7 @@ describe("grok_local execute", () => {
     prepareRuntimeMock.mockClear();
     resolveCommandForLogsMock.mockClear();
     runProcessMock.mockReset();
+    __resetGrokOutputFormatCacheForTests();
   });
 
   afterEach(async () => {
@@ -66,10 +68,19 @@ describe("grok_local execute", () => {
     await fs.writeFile(path.join(skillSource, "SKILL.md"), "---\nname: paperclip\ndescription: test\n---\n", "utf8");
 
     runProcessMock.mockImplementation(async (_runId, _target, _command, args, options) => {
+      if (args.includes("--help")) {
+        return {
+          exitCode: 0,
+          signal: null,
+          timedOut: false,
+          stdout: "  -o, --output-format <OUTPUT_FORMAT>\n          [possible values: plain, json, streaming-json]\n",
+          stderr: "",
+        };
+      }
       expect(args).toEqual(
         expect.arrayContaining([
           "--output-format",
-          "stream-json",
+          "streaming-json",
           "--always-approve",
           "--permission-mode",
           "dontAsk",

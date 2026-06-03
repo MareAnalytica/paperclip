@@ -14,6 +14,15 @@ vi.mock("@paperclipai/adapter-utils/execution-target", () => ({
 }));
 
 import { parseGrokModelsOutput, testEnvironment } from "./test.js";
+import { __resetGrokOutputFormatCacheForTests } from "./output-format.js";
+
+const GROK_HELP_RESULT = {
+  exitCode: 0,
+  signal: null,
+  timedOut: false,
+  stdout: "  -o, --output-format <OUTPUT_FORMAT>\n          [possible values: plain, json, streaming-json]\n",
+  stderr: "",
+};
 
 describe("parseGrokModelsOutput", () => {
   it("extracts auth state and models from `grok models` output", () => {
@@ -38,6 +47,7 @@ describe("grok_local testEnvironment", () => {
     ensureDirectoryMock.mockClear();
     ensureCommandMock.mockClear();
     runProcessMock.mockReset();
+    __resetGrokOutputFormatCacheForTests();
   });
 
   it("reports a healthy authenticated host with a working hello probe", async () => {
@@ -56,6 +66,7 @@ describe("grok_local testEnvironment", () => {
         ].join("\n"),
         stderr: "",
       })
+      .mockResolvedValueOnce(GROK_HELP_RESULT)
       .mockResolvedValueOnce({
         exitCode: 0,
         signal: null,
@@ -87,13 +98,13 @@ describe("grok_local testEnvironment", () => {
       ]),
     );
     expect(runProcessMock).toHaveBeenNthCalledWith(
-      2,
+      3,
       expect.any(String),
       null,
       "grok",
       expect.arrayContaining([
         "--output-format",
-        "stream-json",
+        "streaming-json",
         "--always-approve",
         "--permission-mode",
         "dontAsk",
@@ -114,6 +125,7 @@ describe("grok_local testEnvironment", () => {
         stdout: "",
         stderr: "Not logged in. Run `grok login`.",
       })
+      .mockResolvedValueOnce(GROK_HELP_RESULT)
       .mockResolvedValueOnce({
         exitCode: 1,
         signal: null,
