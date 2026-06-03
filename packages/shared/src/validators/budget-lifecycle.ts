@@ -123,6 +123,19 @@ export interface CostAttributionDimensions {
 export interface PreflightCallParams extends CostAttributionDimensions {
   estimatedQty?: number;
   estimatedCostMicros?: number;
+  /**
+   * Caller-supplied hint of the most-binding cap's current utilization (0-100),
+   * e.g. from a cached burn/headroom lookup. When >= forcePreflightAbovePercent
+   * the client forces a real preflight roundtrip even for cheap calls so a
+   * critical cap can hard-stop the call (ELI-78 AC2). Client-only — never sent
+   * in the request body (the server recomputes utilization authoritatively).
+   */
+  capUsedPercent?: number;
+  /**
+   * Caller override that unconditionally forces a preflight roundtrip
+   * (e.g. when a prior response set preflightRequired=true). Client-only.
+   */
+  forcePreflight?: boolean;
 }
 
 export interface ChargeCallParams extends CostAttributionDimensions {

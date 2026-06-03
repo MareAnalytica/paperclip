@@ -10,7 +10,7 @@ import {
   type SDKMessage,
 } from "@cursor/sdk";
 import type { AdapterExecutionContext, AdapterExecutionResult, AdapterInvocationMeta } from "@paperclipai/adapter-utils";
-import { withBudget } from "@paperclipai/adapter-utils";
+import { withBudget, isPolicyCostError, POLICY_ERROR } from "@paperclipai/adapter-utils";
 import {
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   asBoolean,
@@ -363,6 +363,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const workOnCurrentBranch = asBoolean(config.workOnCurrentBranch, false);
   const autoCreatePR = asBoolean(config.autoCreatePR, false);
   const skipReviewerRequest = asBoolean(config.skipReviewerRequest, false);
+  // ELI-78: config-gated budget DENY hard-stop (default false → preflight stays advisory).
+  const enforceBudgetDeny = asBoolean(config.budgetEnforceDeny, false);
   const model = toModelSelection(asString(config.model, ""));
   const repos = [{
     url: repoUrl,
@@ -502,6 +504,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           estimatedCostMicros: estTokens * 5, // placeholder; full impl would resolve via pricebook
         });
       } catch (preflightErr) {
+        // A config-gated DENY hard-stop must abort the provider call: let it
+        // propagate to the outer handler. Other preflight errors stay non-fatal.
+        if (isPolicyCostError(preflightErr, POLICY_ERROR.BUDGET_HARD_STOPPED)) throw preflightErr;
         await onLog("stderr", `[paperclip] budget preflight note: ${preflightErr}\n`);
       }
 
@@ -554,7 +559,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       }
 
       return { agent: thisAgent, run: thisRun, result: thisResult, streamP: thisStreamP };
-    });
+    }, { enforceDeny: enforceBudgetDeny });
 
     sdkAgent = wrapped.agent;
     run = wrapped.run;
@@ -611,6 +616,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     };
   } catch (err) {
     const reason = formatRunError(err);
+    const budgetDenied = isPolicyCostError(err, POLICY_ERROR.BUDGET_HARD_STOPPED);
     if (run) {
       await onLog("stdout", eventLine({
         type: "cursor_cloud.result",
@@ -622,7 +628,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       exitCode: 1,
       signal: null,
       timedOut: false,
-      errorMessage: reason,
+      errorMessage: budgetDenied ? "Budget preflight denied this call (hard stop)." : reason,
+      ...(budgetDenied ? { errorCode: "budget_denied" } : {}),
       sessionId: session?.cursorAgentId ?? null,
       sessionDisplayId: session?.cursorAgentId ?? null,
       sessionParams: session,
