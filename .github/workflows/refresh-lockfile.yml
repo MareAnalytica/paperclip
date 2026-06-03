@@ -50,15 +50,12 @@ jobs:
             exit 1
           fi
 
-      - name: Create or update pull request
-        id: upsert-pr
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPO_OWNER: ${{ github.repository_owner }}
+      - name: Push refreshed lockfile branch
+        id: push-branch
         run: |
           if git diff --quiet -- pnpm-lock.yaml; then
             echo "Lockfile unchanged, nothing to do."
-            echo "pr_url=" >> "$GITHUB_OUTPUT"
+            echo "pushed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -71,26 +68,84 @@ jobs:
           git commit -m "chore(lockfile): refresh pnpm-lock.yaml"
           git push --force origin "$BRANCH"
 
-          # Only reuse an open PR from this repository owner, not a fork with the same branch name.
-          pr_url="$(
-            gh pr list --state open --head "$BRANCH" --json url,headRepositoryOwner \
-              --jq ".[] | select(.headRepositoryOwner.login == \"$REPO_OWNER\") | .url" |
-            head -n 1
-          )"
-          if [ -z "$pr_url" ]; then
-            pr_url="$(gh pr create \
-              --head "$BRANCH" \
-              --title "chore(lockfile): refresh pnpm-lock.yaml" \
-              --body "Auto-generated lockfile refresh after dependencies changed on master. This PR only updates pnpm-lock.yaml.")"
-            echo "Created new PR: $pr_url"
-          else
-            echo "PR already exists: $pr_url"
-          fi
-          echo "pr_url=$pr_url" >> "$GITHUB_OUTPUT"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+          echo "pushed=true" >> "$GITHUB_OUTPUT"
 
-      - name: Enable auto-merge for lockfile PR
-        if: steps.upsert-pr.outputs.pr_url != ''
+      # Replaces the previous `gh pr create` / `gh pr merge` steps so the
+      # workflow no longer depends on the GitHub CLI being installed in the ARC
+      # runner image (it is not — see ELI-939). actions/github-script bundles an
+      # authenticated Octokit client, so PR upsert + auto-merge run via the REST
+      # and GraphQL APIs directly with no runtime CLI dependency.
+      - name: Upsert PR and enable auto-merge
+        if: steps.push-branch.outputs.pushed == 'true'
+        uses: actions/github-script@v7
         env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh pr merge --auto --squash --delete-branch "${{ steps.upsert-pr.outputs.pr_url }}"
+          BRANCH: ${{ steps.push-branch.outputs.branch }}
+        with:
+          script: |
+            const branch = process.env.BRANCH;
+            const { owner, repo } = context.repo;
+            const base = context.payload.repository?.default_branch || 'main';
+
+            // Only reuse an open PR whose head branch lives in this repository
+            // (head filter is `owner:branch`), not a fork sharing the name.
+            const existing = await github.rest.pulls.list({
+              owner,
+              repo,
+              state: 'open',
+              head: `${owner}:${branch}`,
+            });
+
+            let pr = existing.data[0];
+            if (pr) {
+              core.info(`PR already exists: ${pr.html_url}`);
+            } else {
+              const created = await github.rest.pulls.create({
+                owner,
+                repo,
+                head: branch,
+                base,
+                title: 'chore(lockfile): refresh pnpm-lock.yaml',
+                body:
+                  'Auto-generated lockfile refresh after dependencies changed on ' +
+                  base +
+                  '. This PR only updates pnpm-lock.yaml.',
+              });
+              pr = created.data;
+              core.info(`Created new PR: ${pr.html_url}`);
+            }
+
+            // Enable squash auto-merge. There is no REST endpoint for this, so
+            // use the GraphQL enablePullRequestAutoMerge mutation.
+            try {
+              await github.graphql(
+                `mutation ($pullRequestId: ID!) {
+                  enablePullRequestAutoMerge(input: {
+                    pullRequestId: $pullRequestId,
+                    mergeMethod: SQUASH
+                  }) {
+                    pullRequest { autoMergeRequest { enabledAt } }
+                  }
+                }`,
+                { pullRequestId: pr.node_id },
+              );
+              core.info(`Auto-merge enabled for ${pr.html_url}`);
+            } catch (err) {
+              // If the PR has no required checks it may already be mergeable, in
+              // which case GitHub rejects the auto-merge request ("Pull request
+              // is in clean status"). Fall back to a direct squash merge so the
+              // refresh still lands without a manual step.
+              const msg = String(err && err.message);
+              if (/clean status|not in the correct state/i.test(msg)) {
+                core.info(`Auto-merge unavailable (${msg}); attempting direct squash merge.`);
+                await github.rest.pulls.merge({
+                  owner,
+                  repo,
+                  pull_number: pr.number,
+                  merge_method: 'squash',
+                });
+                core.info(`Squash-merged ${pr.html_url}`);
+              } else {
+                throw err;
+              }
+            }
