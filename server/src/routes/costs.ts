@@ -9,8 +9,10 @@ import {
   upsertBudgetPolicySchema,
 } from "@paperclipai/shared";
 import { validate } from "../middleware/validate.js";
+import { BUDGET_WINDOWS, type BudgetWindow } from "@paperclipai/shared";
 import {
   budgetService,
+  budgetReportService,
   costService,
   financeService,
   companyService,
@@ -19,6 +21,12 @@ import {
   heartbeatService,
   logActivity,
 } from "../services/index.js";
+import {
+  BURN_DIMENSIONS,
+  FORECAST_MODES,
+  type BurnDimension,
+  type ForecastMode,
+} from "../services/budget-reports.js";
 import { assertBoard, assertCompanyAccess, getActorInfo } from "./authz.js";
 import { fetchAllQuotaWindows } from "../services/quota-windows.js";
 import { badRequest } from "../errors.js";
@@ -44,6 +52,80 @@ export function parseCostLimit(query: Record<string, unknown>) {
   return limit;
 }
 
+function firstQueryValue(raw: unknown): string | undefined {
+  const value = Array.isArray(raw) ? raw[0] : raw;
+  if (value == null || value === "") return undefined;
+  return String(value);
+}
+
+function parseWindow(query: Record<string, unknown>, fallback: BudgetWindow): BudgetWindow {
+  const raw = firstQueryValue(query.window);
+  if (raw == null) return fallback;
+  if (!(BUDGET_WINDOWS as readonly string[]).includes(raw)) {
+    throw badRequest(`invalid 'window' (allowed: ${BUDGET_WINDOWS.join(", ")})`);
+  }
+  return raw as BudgetWindow;
+}
+
+export function parseBurnQuery(query: Record<string, unknown>) {
+  const window = parseWindow(query, "month");
+  const scope = firstQueryValue(query.scope) ?? "company";
+  const scopeKey = firstQueryValue(query.scopeKey);
+
+  let dimensions: BurnDimension[] | undefined;
+  const rawDimensions = firstQueryValue(query.dimensions);
+  if (rawDimensions != null) {
+    dimensions = rawDimensions.split(",").map((d) => d.trim()) as BurnDimension[];
+    for (const dimension of dimensions) {
+      if (!(BURN_DIMENSIONS as readonly string[]).includes(dimension)) {
+        throw badRequest(`invalid 'dimensions' (allowed: ${BURN_DIMENSIONS.join(", ")})`);
+      }
+    }
+  }
+
+  let topN = 1;
+  const rawTopN = firstQueryValue(query.topN);
+  if (rawTopN != null) {
+    topN = Number.parseInt(rawTopN, 10);
+    if (!Number.isFinite(topN) || topN <= 0 || topN > 50) {
+      throw badRequest("invalid 'topN' value (1..50)");
+    }
+  }
+
+  return { scope, scopeKey, window, dimensions, topN };
+}
+
+export function parseForecastQuery(query: Record<string, unknown>) {
+  let mode: ForecastMode | undefined;
+  const rawMode = firstQueryValue(query.mode);
+  if (rawMode != null) {
+    if (!(FORECAST_MODES as readonly string[]).includes(rawMode)) {
+      throw badRequest(`invalid 'mode' (allowed: ${FORECAST_MODES.join(", ")})`);
+    }
+    mode = rawMode as ForecastMode;
+  }
+
+  let minEvents: number | undefined;
+  const rawMinEvents = firstQueryValue(query.minEvents);
+  if (rawMinEvents != null) {
+    minEvents = Number.parseInt(rawMinEvents, 10);
+    if (!Number.isFinite(minEvents) || minEvents < 0) {
+      throw badRequest("invalid 'minEvents' value");
+    }
+  }
+
+  let recentWindowHours: number | undefined;
+  const rawRecent = firstQueryValue(query.recentWindowHours);
+  if (rawRecent != null) {
+    recentWindowHours = Number.parseFloat(rawRecent);
+    if (!Number.isFinite(recentWindowHours) || recentWindowHours <= 0) {
+      throw badRequest("invalid 'recentWindowHours' value");
+    }
+  }
+
+  return { mode, minEvents, recentWindowHours };
+}
+
 export function costRoutes(
   db: Db,
   options: { pluginWorkerManager?: PluginWorkerManager } = {},
@@ -58,6 +140,7 @@ export function costRoutes(
   const costs = costService(db, budgetHooks);
   const finance = financeService(db);
   const budgets = budgetService(db, budgetHooks);
+  const budgetReports = budgetReportService(db);
   const companies = companyService(db);
   const agents = agentService(db);
   const issues = issueService(db);
@@ -242,6 +325,26 @@ export function costRoutes(
     assertCompanyAccess(req, companyId);
     const overview = await budgets.overview(companyId);
     res.json(overview);
+  });
+
+  // §6.1 — current-window burn: spend / limit / percent + linear projection and
+  // top contributors by dimension. Read-only; company-scoped (agents may call to
+  // self-throttle per §7.3).
+  router.get("/companies/:companyId/budget/burn", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    const burn = await budgetReports.burn(companyId, parseBurnQuery(req.query));
+    res.json(burn);
+  });
+
+  // §6.4 — per-cap forecast: projected exhaustion using linear or recent-window
+  // run-rate. Caps with fewer than minEventsForForecast events return
+  // status "insufficient_history". Read-only; company-scoped.
+  router.get("/companies/:companyId/budget/forecast", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    const forecast = await budgetReports.forecast(companyId, parseForecastQuery(req.query));
+    res.json(forecast);
   });
 
   router.post(
