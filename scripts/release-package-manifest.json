@@ -5,6 +5,11 @@
     "publishFromCi": true
   },
   {
+    "dir": "packages/paperclip-cost-client",
+    "name": "@paperclipai/paperclip-cost-client",
+    "publishFromCi": false
+  },
+  {
     "dir": "packages/adapters/acpx-local",
     "name": "@paperclipai/adapter-acpx-local",
     "publishFromCi": true

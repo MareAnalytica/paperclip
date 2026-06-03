@@ -3032,6 +3032,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         originKind: issues.originKind,
         originId: issues.originId,
         originRunId: issues.originRunId,
+        billingCode: issues.billingCode,
+        parentId: issues.parentId,
+        goalId: issues.goalId,
       })
       .from(issues)
       .where(and(eq(issues.id, issueId), eq(issues.companyId, companyId)))
@@ -8409,6 +8412,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           projectWorkspaceId: issueContext.projectWorkspaceId,
           executionWorkspaceId: issueContext.executionWorkspaceId,
           executionWorkspacePreference: issueContext.executionWorkspacePreference,
+          billingCode: issueContext.billingCode ?? null,
+          parentId: issueContext.parentId ?? null,
+          goalId: issueContext.goalId ?? null,
         }
       : null;
     const continuationSummary = issueRef
@@ -8469,6 +8475,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         title: issueRef.title,
         description: issueRef.description,
         workMode: issueRef.workMode,
+        billingCode: issueRef.billingCode ?? null,
+        parentId: issueRef.parentId ?? null,
+        goalId: issueRef.goalId ?? null,
+        projectId: issueRef.projectId ?? null,
       };
     } else {
       delete context.paperclipIssue;

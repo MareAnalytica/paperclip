@@ -358,6 +358,17 @@ export {
   chargeRequestSchema,
   type PreflightRequest,
   type ChargeRequest,
+  // ELI-78 client + result types + error helper (policy §4/§7)
+  POLICY_ERROR,
+  type PolicyErrorCode,
+  type PreflightResult,
+  type ChargeResult,
+  type CostAttributionDimensions,
+  type PreflightCallParams,
+  type ChargeCallParams,
+  type CostClientOptions,
+  PaperclipCostError,
+  isPolicyCostError,
 } from "./budget-lifecycle.js";
 
 export {

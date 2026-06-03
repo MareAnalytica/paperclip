@@ -10,6 +10,7 @@ import {
   type SDKMessage,
 } from "@cursor/sdk";
 import type { AdapterExecutionContext, AdapterExecutionResult, AdapterInvocationMeta } from "@paperclipai/adapter-utils";
+import { withBudget } from "@paperclipai/adapter-utils";
 import {
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   asBoolean,
@@ -488,35 +489,77 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       );
     }
 
-    sdkAgent = canReuseSession && session
-      ? await Agent.resume(session.cursorAgentId, agentOptions)
-      : await Agent.create(agentOptions);
-    run = await sdkAgent.send(finalPrompt, {
-      ...(model ? { model } : {}),
-    });
-    await onLog("stdout", eventLine({
-      type: "cursor_cloud.init",
-      sessionId: sdkAgent.agentId,
-      agentId: sdkAgent.agentId,
-      runId: run.id,
-      ...(model?.id ? { model: model.id } : {}),
-    }));
-    await emitStatus(onLog, "running", `Started Cursor run ${run.id}.`);
+    // ELI-78: use withBudget to wrap the core provider call (Cursor SDK send) + preflight/charge
+    // This makes the SDK helper wrap a real provider interaction per AC.
+    const wrapped = await withBudget(ctx, async (b) => {
+      // preflight before the (potentially costly) provider call; rough estimate from prompt
+      const estTokens = Math.max(50, Math.ceil(finalPrompt.length / 3.5));
+      try {
+        await b.preflightIfRequired({
+          provider: "cursor",
+          model: model?.id || "cursor-default",
+          estimatedQty: estTokens,
+          estimatedCostMicros: estTokens * 5, // placeholder; full impl would resolve via pricebook
+        });
+      } catch (preflightErr) {
+        await onLog("stderr", `[paperclip] budget preflight note: ${preflightErr}\n`);
+      }
 
-    const streamPromise = streamRun(run, onLog).catch((err) => {
-      streamError = formatRunError(err);
+      const thisAgent = canReuseSession && session
+        ? await Agent.resume(session.cursorAgentId, agentOptions)
+        : await Agent.create(agentOptions);
+      const thisRun = await thisAgent.send(finalPrompt, {
+        ...(model ? { model } : {}),
+      });
+
+      await onLog("stdout", eventLine({
+        type: "cursor_cloud.init",
+        sessionId: thisAgent.agentId,
+        agentId: thisAgent.agentId,
+        runId: thisRun.id,
+        ...(model?.id ? { model: model.id } : {}),
+      }));
+      await emitStatus(onLog, "running", `Started Cursor run ${thisRun.id}.`);
+
+      const thisStreamP = streamRun(thisRun, onLog).catch((err) => {
+        streamError = formatRunError(err);
+      });
+      const thisResult = thisRun.supports("wait")
+        ? await thisRun.wait()
+        : {
+            id: thisRun.id,
+            status: thisRun.status === "running" ? "error" : thisRun.status,
+            result: thisRun.result,
+            model: thisRun.model,
+            durationMs: thisRun.durationMs,
+            git: thisRun.git,
+          };
+      await thisStreamP;
+
+      // charge after provider call (attribution + actuals). Cursor cloud bills via its own quota;
+      // we still record for Paperclip caps/audit (cost 0 or heuristic until SDK exposes usage).
+      try {
+        const chModel = thisResult.model?.id ?? model?.id ?? "cursor-default";
+        await b.charge({
+          provider: "cursor",
+          model: chModel,
+          kind: "requests",
+          qty: 1,
+          costMicros: 0, // TODO: map from cursor usage when available; costUsd in result is null today
+          requestId: thisRun.id,
+          idempotencyKey: `cursor:${thisRun.id}`,
+        });
+      } catch (chargeErr) {
+        await onLog("stderr", `[paperclip] budget charge note (non-fatal): ${chargeErr}\n`);
+      }
+
+      return { agent: thisAgent, run: thisRun, result: thisResult, streamP: thisStreamP };
     });
-    const result = run.supports("wait")
-      ? await run.wait()
-      : {
-          id: run.id,
-          status: run.status === "running" ? "error" : run.status,
-          result: run.result,
-          model: run.model,
-          durationMs: run.durationMs,
-          git: run.git,
-        };
-    await streamPromise;
+
+    sdkAgent = wrapped.agent;
+    run = wrapped.run;
+    const result = wrapped.result;
+    await wrapped.streamP;  // ensure stream done (was awaited inside too)
 
     const modelId = result.model?.id ?? model?.id ?? null;
     await onLog("stdout", eventLine({
