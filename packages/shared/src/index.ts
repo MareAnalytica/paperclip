@@ -1241,3 +1241,29 @@ export type {
   CapThresholds,
   EnforcementResponse,
 } from "./budget/enforcement.js";
+export {
+  reconcileInvoice,
+  invoiceVariance,
+  isDayLocked,
+  amountToMicros,
+  BILLING_REVIEW_CODE,
+  InvoiceReconcileError,
+} from "./budget/invoice-reconcile.js";
+export type {
+  InvoiceLine,
+  CostEventsCell,
+  ReconcileOptions,
+  ReconcileCell,
+  BillingReviewSubtask,
+  ReconcileResult,
+  InvoiceVariance,
+} from "./budget/invoice-reconcile.js";
+export {
+  parseInvoice,
+  vendorProvider,
+  isVendor,
+  isInvoiceFormat,
+  SUPPORTED_VENDORS,
+  SUPPORTED_FORMATS,
+} from "./budget/invoice-formats.js";
+export type { Vendor, InvoiceFormat } from "./budget/invoice-formats.js";
