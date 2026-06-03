@@ -365,6 +365,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const skipReviewerRequest = asBoolean(config.skipReviewerRequest, false);
   // ELI-78: config-gated budget DENY hard-stop (default false → preflight stays advisory).
   const enforceBudgetDeny = asBoolean(config.budgetEnforceDeny, false);
+  // ELI-943: cached burn/headroom hint arms forcePreflightAbovePercent in prod (on by
+  // default; safe — only forces preflight near a critical cap). config.budgetBurnHint=false to disable.
+  const burnHintEnabled = asBoolean(config.budgetBurnHint, true);
   const model = toModelSelection(asString(config.model, ""));
   const repos = [{
     url: repoUrl,
@@ -559,7 +562,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       }
 
       return { agent: thisAgent, run: thisRun, result: thisResult, streamP: thisStreamP };
-    }, { enforceDeny: enforceBudgetDeny });
+    }, { enforceDeny: enforceBudgetDeny, burnHint: { enabled: burnHintEnabled } });
 
     sdkAgent = wrapped.agent;
     run = wrapped.run;
