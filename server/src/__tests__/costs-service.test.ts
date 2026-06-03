@@ -104,10 +104,15 @@ const mockBudgetService = vi.hoisted(() => ({
   upsertPolicy: vi.fn(),
   resolveIncident: vi.fn(),
 }));
+const mockBudgetReportService = vi.hoisted(() => ({
+  burn: vi.fn().mockResolvedValue({}),
+  forecast: vi.fn().mockResolvedValue({}),
+}));
 
 function registerModuleMocks() {
   vi.doMock("../services/index.js", () => ({
     budgetService: () => mockBudgetService,
+    budgetReportService: () => mockBudgetReportService,
     costService: () => mockCostService,
     financeService: () => mockFinanceService,
     companyService: () => mockCompanyService,
