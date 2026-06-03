@@ -16,6 +16,25 @@ export { invites } from "./invites.js";
 export { joinRequests } from "./join_requests.js";
 export { budgetPolicies } from "./budget_policies.js";
 export { budgetIncidents } from "./budget_incidents.js";
+export {
+  budgetCaps,
+  BUDGET_CAP_WINDOWS,
+  BUDGET_CAP_CALENDAR_WINDOWS,
+  BUDGET_CAP_WINDOW_ANCHORS,
+  BUDGET_CAP_SCOPES,
+  BUDGET_CAP_ACTIONS,
+} from "./budget_caps.js";
+export type {
+  BudgetCap,
+  NewBudgetCap,
+  BudgetCapWindow,
+  BudgetCapCalendarWindow,
+  BudgetCapWindowAnchor,
+  BudgetCapScope,
+  BudgetCapAction,
+} from "./budget_caps.js";
+export { costEventsWindowAgg } from "./cost_events_window_agg.js";
+export type { CostEventsWindowAgg, NewCostEventsWindowAgg } from "./cost_events_window_agg.js";
 export { agentConfigRevisions } from "./agent_config_revisions.js";
 export { agentApiKeys } from "./agent_api_keys.js";
 export { agentRuntimeState } from "./agent_runtime_state.js";
