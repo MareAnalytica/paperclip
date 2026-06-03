@@ -69,6 +69,115 @@ describe("paperclip-cost-client + withBudget (ELI-78)", () => {
     expect(body.estimatedCostMicros).toBe(60000);
   });
 
+  it("forces preflight below threshold when capUsedPercent >= forcePreflightAbovePercent (AC2)", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      text: async () => JSON.stringify({
+        decision: "deny",
+        bindingCapId: "cap-1",
+        headroomMicros: 0,
+        softHeadroomMicros: 0,
+        warnings: [],
+        approvalIds: [],
+        evaluationTimedOut: false,
+        preflightRequired: true,
+      }),
+    });
+
+    const c = createCostClient({
+      apiBase: base,
+      fetchImpl: fetchMock as any,
+      preflight: { estimateThresholdMicros: 50_000, forcePreflightAbovePercent: 80 },
+    });
+
+    // Cheap call (below micros threshold) but cap is critical → must roundtrip.
+    const res = await c.preflightIfRequired({
+      companyId: "c1",
+      provider: "anthropic",
+      model: "claude",
+      estimatedCostMicros: 10,
+      capUsedPercent: 95,
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(res.decision).toBe("deny");
+    // capUsedPercent is a client-only hint and must not leak into the request body.
+    const [, init] = fetchMock.mock.calls[0];
+    expect(JSON.parse(init.body)).not.toHaveProperty("capUsedPercent");
+  });
+
+  it("does NOT force preflight when capUsedPercent below forcePreflightAbovePercent", async () => {
+    const fetchMock = vi.fn();
+    const c = createCostClient({
+      apiBase: base,
+      fetchImpl: fetchMock as any,
+      preflight: { estimateThresholdMicros: 50_000, forcePreflightAbovePercent: 80 },
+    });
+
+    const res = await c.preflightIfRequired({
+      companyId: "c1",
+      provider: "anthropic",
+      model: "claude",
+      estimatedCostMicros: 10,
+      capUsedPercent: 50,
+    });
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(res.preflightRequired).toBe(false);
+  });
+
+  it("explicit forcePreflight forces a roundtrip even for a cheap call", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      text: async () => JSON.stringify({
+        decision: "allow", bindingCapId: null, headroomMicros: 1, softHeadroomMicros: 1,
+        warnings: [], approvalIds: [], evaluationTimedOut: false, preflightRequired: true,
+      }),
+    });
+    const c = createCostClient({ apiBase: base, fetchImpl: fetchMock as any });
+
+    await c.preflightIfRequired({
+      companyId: "c1", provider: "anthropic", model: "claude",
+      estimatedCostMicros: 1, forcePreflight: true,
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("withBudget enforceDeny hard-stops on decision=deny; advisory otherwise", async () => {
+    const denyResponse = {
+      ok: true,
+      text: async () => JSON.stringify({
+        decision: "deny", bindingCapId: "cap-1", headroomMicros: 0, softHeadroomMicros: 0,
+        warnings: [], approvalIds: [], evaluationTimedOut: false, preflightRequired: true,
+      }),
+    };
+    const ctx = {
+      runId: "run-xyz",
+      agent: { id: "agent-1", companyId: "company-abc", name: "t", adapterType: null, adapterConfig: {} },
+      authToken: "ctx-tok",
+    } as unknown as AdapterExecutionContext;
+
+    // enforceDeny: true → throws BUDGET_HARD_STOPPED
+    await expect(
+      withBudget(ctx, async (b) => {
+        await b.preflightIfRequired({ provider: "anthropic", model: "claude", estimatedCostMicros: 99999 });
+        return "ran";
+      }, { apiBase: base, fetchImpl: vi.fn().mockResolvedValue(denyResponse) as any, enforceDeny: true }),
+    ).rejects.toSatisfy((e: any) => {
+      expect(e?.name).toBe("PaperclipCostError");
+      expect(e.code).toBe("policy.budget_hard_stopped");
+      return true;
+    });
+
+    // enforceDeny: false (default) → deny is advisory, callback still runs
+    const out = await withBudget(ctx, async (b) => {
+      const p = await b.preflightIfRequired({ provider: "anthropic", model: "claude", estimatedCostMicros: 99999 });
+      return p.decision;
+    }, { apiBase: base, fetchImpl: vi.fn().mockResolvedValue(denyResponse) as any });
+    expect(out).toBe("deny");
+  });
+
   it("throws 400 policy.cost_attribution_missing when required dims absent", async () => {
     const fetchMock = vi.fn();
     const c = createCostClient({ apiBase: base, fetchImpl: fetchMock as any });

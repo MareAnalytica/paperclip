@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { AdapterExecutionContext, AdapterExecutionResult } from "@paperclipai/adapter-utils";
-import { withBudget } from "@paperclipai/adapter-utils";
+import { withBudget, isPolicyCostError, POLICY_ERROR } from "@paperclipai/adapter-utils";
 import type { RunProcessResult } from "@paperclipai/adapter-utils/server-utils";
 import {
   adapterExecutionTargetIsRemote,
@@ -943,6 +943,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     };
   };
 
+  // ELI-78: when enabled (config-gated), a preflight `deny` hard-stops the run.
+  // Default false preserves the existing non-fatal preflight behavior.
+  const enforceBudgetDeny = asBoolean(config.budgetEnforceDeny, false);
   try {
     // ELI-78: preflight via SDK helper before the (potentially costly) claude provider call.
     // Rough est from prompt size; non-fatal to preserve existing adapter error/timeout behavior.
@@ -955,8 +958,22 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           estimatedQty: estTokens,
           estimatedCostMicros: Math.ceil(estTokens * 3),
         });
-      });
+      }, { enforceDeny: enforceBudgetDeny });
     } catch (preflightErr) {
+      if (isPolicyCostError(preflightErr, POLICY_ERROR.BUDGET_HARD_STOPPED)) {
+        await onLog("stderr", `[paperclip] budget preflight DENY hard-stop: ${preflightErr}\n`);
+        return {
+          exitCode: 1,
+          signal: null,
+          timedOut: false,
+          errorMessage: "Budget preflight denied this call (hard stop).",
+          errorCode: "budget_denied",
+          provider: "anthropic",
+          biller: isBedrockAuth(effectiveEnv) ? "aws_bedrock" : "anthropic",
+          billingType,
+          clearSession: false,
+        };
+      }
       await onLog("stderr", `[paperclip] budget preflight note: ${preflightErr}\n`);
     }
 

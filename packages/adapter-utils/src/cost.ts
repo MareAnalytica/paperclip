@@ -69,8 +69,16 @@ export async function withBudget<T>(
     authToken?: string;
     fetchImpl?: typeof fetch;
     preflight?: { estimateThresholdMicros?: number; forcePreflightAbovePercent?: number };
+    /**
+     * Config-gated hard stop (ELI-78). When true, a preflight `decision === "deny"`
+     * throws PaperclipCostError(POLICY_ERROR.BUDGET_HARD_STOPPED) instead of being
+     * advisory, so the call site can abort the provider call before it runs. Default
+     * false preserves the existing non-fatal preflight behavior for every adapter.
+     */
+    enforceDeny?: boolean;
   },
 ): Promise<T> {
+  const enforceDeny = opts?.enforceDeny === true;
   const apiBase =
     opts?.apiBase ||
     (process.env.PAPERCLIP_API_URL as string | undefined) ||
@@ -102,10 +110,19 @@ export async function withBudget<T>(
 
   const handle: BudgetHandle = {
     async preflightIfRequired(partial) {
-      return client.preflightIfRequired({
+      const result = await client.preflightIfRequired({
         ...baseAttribution,
         ...partial,
       } as PreflightCallParams);
+      if (enforceDeny && result.decision === "deny") {
+        throw new PaperclipCostError(
+          402,
+          POLICY_ERROR.BUDGET_HARD_STOPPED,
+          "budget preflight denied this call (hard stop)",
+          { result },
+        );
+      }
+      return result;
     },
     async charge(partial) {
       const p = partial as ChargeCallParams;

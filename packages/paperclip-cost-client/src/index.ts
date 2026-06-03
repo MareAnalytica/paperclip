@@ -90,12 +90,18 @@ export function createCostClient(opts: CostClientOptions): CreateCostClientResul
     requireDims(params);
 
     const est = params.estimatedCostMicros ?? 0;
+    // forcePreflightAbovePercent (ELI-78 AC2): the client cannot know the live cap %
+    // on its own, so callers pass a hint (capUsedPercent, from a cached burn/headroom
+    // lookup) or an explicit forcePreflight override (e.g. after a prior preflightRequired
+    // response). At/above the critical percent we force a real roundtrip even for cheap
+    // calls so a near-exhausted cap can deny. The server still enforces authoritatively.
+    const forceByPercent =
+      typeof params.capUsedPercent === "number" &&
+      params.capUsedPercent >= cfg.forcePreflightAbovePercent;
     const shouldPreflight =
+      params.forcePreflight === true ||
       est >= cfg.estimateThresholdMicros ||
-      // Without live cap % the client cannot know the "force above critical" case precisely.
-      // Callers that have a prior burn can pass a hint via a non-standard field or always call.
-      // The server will still enforce its own preflightRequired in the response.
-      false;
+      forceByPercent;
 
     if (!shouldPreflight) {
       // Return a synthetic allow result so caller can proceed without roundtrip for cheap calls.
@@ -142,7 +148,7 @@ export function createCostClient(opts: CostClientOptions): CreateCostClientResul
     if (params.requestId) {
       key = `${params.provider}:${params.requestId}`;
     } else if (!key) {
-      key = makeIdempotencyKeyImpl({
+      key = computeIdempotencyKey({
         provider: params.provider,
         requestId: params.requestId,
         runId: params.runId,
@@ -177,42 +183,40 @@ export function createCostClient(opts: CostClientOptions): CreateCostClientResul
       occurredAt: params.occurredAt,
     };
 
-    try {
-      return await doJson<ChargeResult>(fetchImpl, `${base}/cost/charge`, {
-        method: "POST",
-        headers,
-        body: JSON.stringify(body),
-      });
-    } catch (e) {
-      if (e instanceof PaperclipCostError) {
-        // Re-throw as-is (enforcement errors come back with result in details)
-        throw e;
-      }
-      throw e;
-    }
-  }
-
-  function makeIdempotencyKeyImpl(input: {
-    provider: string;
-    requestId?: string | null;
-    runId?: string | null;
-    actionIndex?: number;
-    kind?: string;
-  }): string {
-    if (input.requestId) {
-      return `${input.provider}:${input.requestId}`;
-    }
-    const run = input.runId ?? "no-run";
-    const idx = input.actionIndex ?? 0;
-    const k = input.kind ?? "tokens";
-    return `${input.provider}:${run}:${idx}:${k}`;
+    // doJson already throws PaperclipCostError on non-2xx (enforcement errors
+    // carry the result in details); no extra wrapping needed here.
+    return doJson<ChargeResult>(fetchImpl, `${base}/cost/charge`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+    });
   }
 
   return {
     preflightIfRequired,
     charge,
-    makeIdempotencyKey: makeIdempotencyKeyImpl,
+    makeIdempotencyKey: computeIdempotencyKey,
   };
+}
+
+/**
+ * Pure recommended-idempotency-key builder (§7.1): <provider>:<requestId> when a
+ * vendor requestId is present, else a stable <provider>:<run>:<idx>:<kind> fallback.
+ */
+function computeIdempotencyKey(input: {
+  provider: string;
+  requestId?: string | null;
+  runId?: string | null;
+  actionIndex?: number;
+  kind?: string;
+}): string {
+  if (input.requestId) {
+    return `${input.provider}:${input.requestId}`;
+  }
+  const run = input.runId ?? "no-run";
+  const idx = input.actionIndex ?? 0;
+  const k = input.kind ?? "tokens";
+  return `${input.provider}:${run}:${idx}:${k}`;
 }
 
 /**
@@ -225,8 +229,7 @@ export function makeCostIdempotencyKey(input: {
   actionIndex?: number;
   kind?: string;
 }): string {
-  const client = createCostClient({ apiBase: "http://unused" }); // only for the fn
-  return client.makeIdempotencyKey(input);
+  return computeIdempotencyKey(input);
 }
 
 // Re-export the client types + error surface from shared so consumers (adapter-utils, external SDK users) get everything from this thin package.
