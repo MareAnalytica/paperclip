@@ -156,6 +156,30 @@ export function detectClaudeLoginRequired(input: {
   };
 }
 
+// ELI-243: auth-class failure allowlist used by the claude-local multi-account
+// rotation loop. An attempt is "auth-class" (and therefore eligible to advance
+// to the next configured account) only when one of the documented signals fires:
+//   1. `detectClaudeLoginRequired` matches (covers `loginMeta.requiresLogin`
+//      and the documented "Not logged in" / "unauthorized" CLI wording).
+//   2. The parsed result carries a structured `error_subtype === "auth_required"`
+//      (forward-compat for a future CLI field).
+// Every other failure (timeout, transient_upstream, max_turns, quota, generic
+// non-zero exit) is NOT auth-class and terminates rotation with the existing
+// terminal error code.
+export function isClaudeAuthClassFailure(input: {
+  parsed: Record<string, unknown> | null;
+  stdout: string;
+  stderr: string;
+}): boolean {
+  if (detectClaudeLoginRequired(input).requiresLogin) return true;
+  const parsed = input.parsed;
+  if (parsed) {
+    const subtype = asString(parsed.error_subtype, "").trim().toLowerCase();
+    if (subtype === "auth_required") return true;
+  }
+  return false;
+}
+
 export function describeClaudeFailure(parsed: Record<string, unknown>): string | null {
   const subtype = asString(parsed.subtype, "");
   const resultText = asString(parsed.result, "").trim();
