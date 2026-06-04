@@ -150,6 +150,7 @@ import {
   withRecoveryModelProfileHint,
 } from "./recovery/model-profile-hint.js";
 import { recoveryService } from "./recovery/service.js";
+import { issueRecoveryActionService } from "./issue-recovery-actions.js";
 import { productivityReviewService } from "./productivity-review.js";
 import { withAgentStartLock } from "./agent-start-lock.js";
 import { isSchedulerLeader, notifyLeaderOfQueuedRun } from "./scheduler-leadership.js";
@@ -185,7 +186,10 @@ import {
   type ProviderAuthMode,
   type ProviderFallbackNotifyKind,
 } from "./provider-fallback-policy.js";
-import { resolveProviderUnresponsiveRecovery } from "./provider-unresponsive-breaker.js";
+import {
+  accumulateProviderUnresponsiveHang,
+  resolveProviderUnresponsiveAccumulatorOnRecovery as resolveProviderUnresponsiveAccumulator,
+} from "./provider-unresponsive-accumulator.js";
 import {
   buildProviderFallbackExhaustedReport,
   computeProviderFallbackBackoff,
@@ -2967,6 +2971,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   const secretsSvc = secretService(db);
   const companySkills = companySkillService(db);
   const issuesSvc = issueService(db);
+  // Contract C cross-run breaker accumulator (ELI-952/ELI-964): persists the
+  // consecutive provider-unresponsive hang count and the escalate→operator arm.
+  const recoveryActionsSvc = issueRecoveryActionService(db);
   const treeControlSvc = issueTreeControlService(db);
   const executionWorkspacesSvc = executionWorkspaceService(db);
   const environmentsSvc = environmentService(db);
@@ -5979,19 +5986,29 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         ) ?? readNonEmptyString(parseObject(agent.adapterConfig).model);
       const issueId = readNonEmptyString(parseObject(run.contextSnapshot).issueId);
 
-      const { decision, audit } = resolveProviderUnresponsiveRecovery({
-        provider: failedProviderId,
-        // First-vs-repeat proxy: a provider already cooling down that hangs again
-        // is at least the 2nd consecutive cross-run hang. Precise N is the
-        // recovery-service follow-up (spec §7#1).
-        attempt: cooledDownProviderIds.has(failedProviderId) ? 2 : 1,
-        maxUnresponsiveRetriesPerProvider: providerHealth.recovery.maxUnresponsiveRetriesPerProvider,
-        chainProviderIds: enabledChain.map((entry) => entry.id),
-        cooledDownProviderIds,
-        account: failedEntry?.account ?? null,
-        model,
-        issueId,
-      });
+      // ELI-964: source the PRECISE consecutive cross-run hang count from the
+      // `issue_recovery_actions` accumulator (cause `provider_unresponsive`,
+      // fingerprint = the (agent, provider) pair) and, on `escalate`, open a typed
+      // operator recovery action instead of re-queuing the hung pair. The
+      // accumulator orchestration (incl. the source-uniqueness coexistence model
+      // and the escalate arm) lives in `provider-unresponsive-accumulator.ts` so
+      // it is unit-testable against an embedded Postgres without the full
+      // heartbeat. Config-gated upstream by `cooldownMs > 0`.
+      const bound = providerHealth.recovery.maxUnresponsiveRetriesPerProvider;
+      const { decision, audit, attempt, attemptSource, escalated } =
+        await accumulateProviderUnresponsiveHang(recoveryActionsSvc, {
+          companyId: run.companyId,
+          issueId: issueId ?? null,
+          agentId: agent.id,
+          provider: failedProviderId,
+          account: failedEntry?.account ?? null,
+          model: model ?? null,
+          runId: run.id,
+          chainProviderIds: enabledChain.map((entry) => entry.id),
+          cooledDownProviderIds,
+          maxUnresponsiveRetriesPerProvider: bound,
+          now,
+        });
 
       await upsertProviderAccountCooldown(db, {
         providerId: failedProviderId,
@@ -6006,18 +6023,80 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         now,
       });
 
+      if (escalated && issueId) {
+        try {
+          await issuesSvc.addComment(
+            issueId,
+            [
+              "## Provider unresponsive — operator recovery required",
+              "",
+              escalated.nextAction,
+              "",
+              `- Recovery action: \`${escalated.id}\``,
+              `- Provider: \`${failedProviderId}\``,
+              `- Consecutive cross-run hangs: \`${attempt}\` (bound \`${bound}\`)`,
+              "- Routed to an operator decision; the live run is not auto-cancelled (ELI-776 §2).",
+            ].join("\n"),
+            { agentId: agent.id, runId: run.id },
+          );
+        } catch (commentErr) {
+          logger.warn(
+            { err: commentErr, runId: run.id, issueId },
+            "[provider-unresponsive-breaker] failed to post operator escalation comment",
+          );
+        }
+      }
+
       await appendRunEvent(run, await nextRunEventSeq(run.id), {
         eventType: "lifecycle",
         stream: "system",
         level: "warn",
-        message: `Provider ${failedProviderId} marked unresponsive (no-output hang); cooled down ${providerHealth.cooldownMs}ms, next run will skip it — breaker decision: ${decision.actionTaken}`,
-        payload: { ...audit, cooldownMs: providerHealth.cooldownMs },
+        message: `Provider ${failedProviderId} marked unresponsive (no-output hang); cooled down ${providerHealth.cooldownMs}ms, next run will skip it — breaker decision: ${decision.actionTaken} (attempt ${attempt}/${bound})`,
+        payload: { ...audit, cooldownMs: providerHealth.cooldownMs, attemptSource },
       });
     } catch (err) {
       // Best-effort: a health-demerit write must never fail run finalization.
       logger.warn(
         { err, runId: run.id, companyId: run.companyId },
         "[provider-unresponsive-breaker] failed to record health demerit",
+      );
+    }
+  }
+
+  // ELI-964: break the consecutive-hang streak when the provider recovers. A run
+  // that completes WITHOUT a no-output hang on the same (agent, provider) pair
+  // proves the provider is responsive again, so its active accumulator is
+  // resolved (outcome `restored`) — otherwise a stale count could survive a
+  // genuine recovery and let a later one-off hang escalate prematurely. Scoped to
+  // the provider this run actually used so a failover to a healthy alternative
+  // does not wrongly clear the hung provider's accumulator. Best-effort.
+  async function resolveProviderUnresponsiveAccumulatorOnRecovery(
+    run: typeof heartbeatRuns.$inferSelect,
+    agent: typeof agents.$inferSelect,
+  ): Promise<void> {
+    try {
+      const issueId = readNonEmptyString(parseObject(run.contextSnapshot).issueId);
+      if (!issueId) return;
+      const chain = resolveEffectiveProviderFallbackChain(agent);
+      const enabledChain = chain.filter((entry) => entry.enabled);
+      const priorFallbackId = readNonEmptyString(
+        parseObject(parseObject(run.contextSnapshot).providerFallbackSelection).id,
+      );
+      const ranProviderId =
+        priorFallbackId ?? resolvePrimaryProviderId(enabledChain, agent.adapterType);
+      if (!ranProviderId) return;
+
+      await resolveProviderUnresponsiveAccumulator(recoveryActionsSvc, {
+        companyId: run.companyId,
+        issueId,
+        agentId: agent.id,
+        provider: ranProviderId,
+        runId: run.id,
+      });
+    } catch (err) {
+      logger.warn(
+        { err, runId: run.id, companyId: run.companyId },
+        "[provider-unresponsive-breaker] failed to resolve accumulator on recovery",
       );
     }
   }
@@ -9687,6 +9766,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           isAdapterNoOutputKillRun(livenessRun)
         ) {
           await recordProviderUnresponsiveHealthDemerit(livenessRun, agent);
+        } else if (outcome === "succeeded") {
+          // ELI-964: a clean completion proves the provider recovered — clear any
+          // active consecutive-hang accumulator so the streak resets honestly.
+          await resolveProviderUnresponsiveAccumulatorOnRecovery(livenessRun, agent);
         }
         const issueCommentPolicyResult = await finalizeIssueCommentPolicy(livenessRun, agent);
         await releaseIssueExecutionAndPromote(livenessRun);
