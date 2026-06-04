@@ -44,6 +44,10 @@ import { BudgetPolicyCard } from "../components/BudgetPolicyCard";
 import { FileTree, buildFileTree } from "../components/FileTree";
 import { ScrollToBottom } from "../components/ScrollToBottom";
 import { SourceResolvedFoldCallout } from "../components/SourceResolvedFoldCallout";
+import {
+  ClaudeAccountRotationHistory,
+  readClaudeAccountAttempts,
+} from "../components/ClaudeAccountRotationHistory";
 import { SourceResolvedFoldBadge } from "../components/SourceResolvedFoldBadge";
 import { readSourceResolvedWatchdogFold } from "../lib/source-resolved-watchdog-fold";
 import { buildSameOriginWebSocketUrl } from "../lib/websocket-url";
@@ -3486,6 +3490,19 @@ function RunDetail({ run: initialRun, agentRouteId, adapterType, adapterConfig }
                 )}
               </div>
             )}
+            {/* ELI-245: multi-account failover rotation history (ELI-243 audit
+                trail). Renders near the claude_auth_required banner whenever the
+                run carries resultJson.claudeAccountAttempts; nothing otherwise. */}
+            {(() => {
+              const attempts = readClaudeAccountAttempts(run.resultJson);
+              if (!attempts) return null;
+              return (
+                <ClaudeAccountRotationHistory
+                  attempts={attempts}
+                  defaultOpen={run.errorCode === "claude_auth_required"}
+                />
+              );
+            })()}
             {hasNonZeroExit && (
               <div className="text-xs text-red-600 dark:text-red-400">
                 Exit code {run.exitCode}
