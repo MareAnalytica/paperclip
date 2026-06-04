@@ -48,7 +48,7 @@ export interface ProviderUnresponsiveAccumulatorStore {
     monitorPolicy?: Record<string, unknown> | null;
     maxAttempts?: number | null;
     lastAttemptAt?: Date | null;
-  }): Promise<IssueRecoveryAction>;
+  }, expectation: { expectCause: string; expectFingerprint: string }): Promise<IssueRecoveryAction | null>;
   escalateSourceScoped(input: {
     companyId: string;
     sourceIssueId: string;
@@ -157,6 +157,9 @@ export async function accumulateProviderUnresponsiveHang(
       attempt = existing.attemptCount;
       attemptSource = "accumulator";
     } else {
+      // Atomic re-arm: the predicate makes the write yield (return null) if a
+      // competing stranded action claimed the slot between the outer read above
+      // and this write, so we never clobber it (ELI-975).
       accumulator = await store.upsertSourceScoped({
         companyId: input.companyId,
         sourceIssueId: input.issueId,
@@ -180,9 +183,14 @@ export async function accumulateProviderUnresponsiveHang(
         monitorPolicy: null,
         maxAttempts: bound > 0 ? bound : null,
         lastAttemptAt: now,
-      });
-      attempt = accumulator.attemptCount;
-      attemptSource = "accumulator";
+      }, { expectCause: PROVIDER_UNRESPONSIVE_CAUSE, expectFingerprint: fingerprint });
+      if (accumulator) {
+        attempt = accumulator.attemptCount;
+        attemptSource = "accumulator";
+      } else {
+        // Raced into a competing recovery action — yield to it.
+        attempt = proxyAttempt;
+      }
     }
   }
 
@@ -235,6 +243,16 @@ export async function accumulateProviderUnresponsiveHang(
  * failover to a healthy alternative does not clear the hung provider's
  * accumulator. Returns the resolved action, or null when there was nothing to
  * clear.
+ *
+ * Escalated-action lifecycle (ELI-975 secondary item — decided: keep self-heal).
+ * `getActiveForIssue` returns both `active` and `escalated` rows, so when a row
+ * has already escalated to a board/operator owner and a later run then succeeds
+ * on the same (agent, provider), this self-heals it to `resolved`/`restored`.
+ * That is intentional: it is honest (the provider demonstrably recovered),
+ * avoids a stale operator escalation lingering on the board, and preserves the
+ * audit trail (the escalation + its resolution stay on the row, ELI-776 §3 —
+ * the row is resolved, never deleted). We deliberately do NOT require explicit
+ * operator closure once escalated; the resolutionNote records the auto-recovery.
  */
 export async function resolveProviderUnresponsiveAccumulatorOnRecovery(
   store: ProviderUnresponsiveAccumulatorStore,

@@ -114,6 +114,107 @@ describe("issueRecoveryActionService", () => {
     expect(fakeDb.update).toHaveBeenCalledTimes(1);
     expect(fakeDb.insert).toHaveBeenCalledTimes(1);
   });
+
+  // ELI-975: the atomic coexistence guard. The expectation predicate is checked
+  // on the inner re-read that sits inside `runExclusiveUpsert`'s per-key lock, so
+  // a competing different-cause action that appears between a caller's outer read
+  // and this write is observed here and the upsert yields without clobbering it.
+  function makeSelectQuery(rows: unknown[]) {
+    return {
+      from() {
+        return this;
+      },
+      where() {
+        return this;
+      },
+      orderBy() {
+        return this;
+      },
+      limit() {
+        return Promise.resolve(rows);
+      },
+    };
+  }
+
+  it("yields (null) without writing when a competing-cause action owns the slot and an expectation is given", async () => {
+    const competingRow = makeRecoveryActionRow({
+      id: "stranded-action",
+      kind: "stranded_assigned_issue",
+      cause: "stranded_assigned_issue",
+      fingerprint: "source_scoped_recovery:company-1:source-1:stranded_assigned_issue",
+    });
+    const selectResults = [[competingRow]];
+    const fakeDb = {
+      select: vi.fn(() => makeSelectQuery(selectResults.shift() ?? [])),
+      update: vi.fn(),
+      insert: vi.fn(),
+    };
+
+    const result = await issueRecoveryActionService(fakeDb as never).upsertSourceScoped(
+      {
+        companyId: "company-1",
+        sourceIssueId: "source-1",
+        kind: "provider_unhealthy",
+        ownerType: "agent",
+        ownerAgentId: "agent-1",
+        cause: "provider_unresponsive",
+        fingerprint: "provider_unresponsive:company-1:source-1:agent-1:grok-local",
+        nextAction: "Provider unresponsive.",
+      },
+      {
+        expectCause: "provider_unresponsive",
+        expectFingerprint: "provider_unresponsive:company-1:source-1:agent-1:grok-local",
+      },
+    );
+
+    expect(result).toBeNull();
+    expect(fakeDb.update).not.toHaveBeenCalled();
+    expect(fakeDb.insert).not.toHaveBeenCalled();
+  });
+
+  it("re-arms the active row in place when it matches the expectation identity", async () => {
+    const matchingRow = makeRecoveryActionRow({
+      id: "provider-action",
+      kind: "provider_unhealthy",
+      cause: "provider_unresponsive",
+      fingerprint: "provider_unresponsive:company-1:source-1:agent-1:grok-local",
+      attemptCount: 1,
+    });
+    const updatedRow = { ...matchingRow, attemptCount: 2 };
+    const selectResults = [[matchingRow]];
+    const fakeDb = {
+      select: vi.fn(() => makeSelectQuery(selectResults.shift() ?? [])),
+      update: vi.fn(() => ({
+        set: vi.fn(() => ({
+          where: vi.fn(() => ({
+            returning: vi.fn(async () => [updatedRow]),
+          })),
+        })),
+      })),
+      insert: vi.fn(),
+    };
+
+    const result = await issueRecoveryActionService(fakeDb as never).upsertSourceScoped(
+      {
+        companyId: "company-1",
+        sourceIssueId: "source-1",
+        kind: "provider_unhealthy",
+        ownerType: "agent",
+        ownerAgentId: "agent-1",
+        cause: "provider_unresponsive",
+        fingerprint: "provider_unresponsive:company-1:source-1:agent-1:grok-local",
+        nextAction: "Provider unresponsive.",
+      },
+      {
+        expectCause: "provider_unresponsive",
+        expectFingerprint: "provider_unresponsive:company-1:source-1:agent-1:grok-local",
+      },
+    );
+
+    expect(result).toMatchObject({ id: "provider-action", attemptCount: 2 });
+    expect(fakeDb.update).toHaveBeenCalledTimes(1);
+    expect(fakeDb.insert).not.toHaveBeenCalled();
+  });
 });
 
 if (!embeddedPostgresSupport.supported) {
@@ -263,6 +364,92 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(second.evidence).toMatchObject({ latestRunId: "run-2" });
     expect(await svc.getActiveForIssue(companyId, sourceIssueId)).toMatchObject({ id: first.id });
     expect(await svc.getActiveForIssue(randomUUID(), sourceIssueId)).toBeNull();
+  });
+
+  it("yields (ELI-975) to a competing-cause active row when an expectation is supplied, leaving it untouched", async () => {
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    const svc = issueRecoveryActionService(db);
+
+    // A stranded recovery action owns the single active per-issue slot.
+    const stranded = await svc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "stranded_assigned_issue",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "stranded_assigned_issue",
+      fingerprint: `source_scoped_recovery:${companyId}:${sourceIssueId}:stranded_assigned_issue`,
+      evidence: { latestRunId: "run-1" },
+      nextAction: "Restore a live execution path.",
+    });
+
+    // The provider arm tries to claim the slot for a different identity — it must
+    // yield rather than repurpose the stranded row.
+    const providerFingerprint = `provider_unresponsive:${companyId}:${sourceIssueId}:${managerId}:grok-local`;
+    const yielded = await svc.upsertSourceScoped(
+      {
+        companyId,
+        sourceIssueId,
+        kind: "provider_unhealthy",
+        ownerType: "agent",
+        ownerAgentId: managerId,
+        cause: "provider_unresponsive",
+        fingerprint: providerFingerprint,
+        evidence: { lastRunId: "run-2" },
+        nextAction: "Provider unresponsive.",
+      },
+      { expectCause: "provider_unresponsive", expectFingerprint: providerFingerprint },
+    );
+
+    expect(yielded).toBeNull();
+    const active = await svc.getActiveForIssue(companyId, sourceIssueId);
+    expect(active).toMatchObject({
+      id: stranded.id,
+      cause: "stranded_assigned_issue",
+      attemptCount: 1, // not incremented or repurposed by the provider attempt
+    });
+    expect(active?.evidence).toMatchObject({ latestRunId: "run-1" });
+  });
+
+  it("re-arms in place (ELI-975) when the active row matches the supplied expectation identity", async () => {
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    const svc = issueRecoveryActionService(db);
+    const fingerprint = `provider_unresponsive:${companyId}:${sourceIssueId}:${managerId}:grok-local`;
+
+    const first = await svc.upsertSourceScoped(
+      {
+        companyId,
+        sourceIssueId,
+        kind: "provider_unhealthy",
+        ownerType: "agent",
+        ownerAgentId: managerId,
+        cause: "provider_unresponsive",
+        fingerprint,
+        evidence: { lastRunId: "run-1" },
+        nextAction: "Provider unresponsive.",
+      },
+      { expectCause: "provider_unresponsive", expectFingerprint: fingerprint },
+    );
+    const second = await svc.upsertSourceScoped(
+      {
+        companyId,
+        sourceIssueId,
+        kind: "provider_unhealthy",
+        ownerType: "agent",
+        ownerAgentId: managerId,
+        cause: "provider_unresponsive",
+        fingerprint,
+        evidence: { lastRunId: "run-2" },
+        nextAction: "Provider unresponsive.",
+      },
+      { expectCause: "provider_unresponsive", expectFingerprint: fingerprint },
+    );
+
+    expect(first).not.toBeNull();
+    expect(second).not.toBeNull();
+    expect(second!.id).toBe(first!.id);
+    expect(second!.attemptCount).toBe(2);
+    expect(second!.evidence).toMatchObject({ lastRunId: "run-2" });
   });
 
   it("escalates stranded assigned work into a source action instead of a recovery issue", async () => {
