@@ -1,4 +1,4 @@
-import { and, desc, eq, gte, isNotNull, isNull, lt, lte, sql } from "drizzle-orm";
+import { and, desc, eq, gte, inArray, isNotNull, isNull, lt, lte, sql } from "drizzle-orm";
 import { alias } from "drizzle-orm/pg-core";
 import type { Db } from "@paperclipai/db";
 import { activityLog, agents, companies, costEvents, heartbeatRuns, issues, projects } from "@paperclipai/db";
@@ -453,6 +453,63 @@ export function costService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
           costEvents.model,
         )
         .orderBy(costEvents.provider, costEvents.biller, costEvents.billingType, costEvents.model);
+    },
+
+    /**
+     * Vendor-invoice reconciliation aggregate (budgeting policy §6.3). Groups
+     * `cost_events` into one cell per `(provider, model, UTC day)` and returns
+     * the cell's expected spend plus a bounded sample of contributing event ids.
+     *
+     * Contract notes (consumed by the eli-board reconcile driver, ELI-969):
+     *  - `expectedMicros = SUM(COALESCE(cost_micros, cost_cents * 10_000))` —
+     *    §2.1 charge rows carry authoritative `cost_micros` (1 unit = 1_000_000
+     *    micros); legacy rows carry only integer `cost_cents` (1 cent = 10_000
+     *    micros). Summed as double precision so totals above int32 never overflow.
+     *  - `requestId` sample is `COALESCE(request_id, id::text)` — prefers the
+     *    §2.1 vendor `request_id` when present, else the per-charge `cost_events`
+     *    row id — bounded, most-recent first.
+     *  - The window is closed-open: `[from, to)` (inclusive lower, exclusive
+     *    upper), so a caller can pass start-of-day / start-of-next-day bounds.
+     *  - Source-less system/timer charges (`agent_id` NULL, §2.1) are first-class
+     *    here: grouping is by (provider, model, day) only, so they aggregate in.
+     *
+     * Read-only: no writes, holds no vendor credentials, triggers no payments.
+     */
+    reconcileCells: async (
+      companyId: string,
+      range: CostDateRange | undefined,
+      opts: { providers?: string[]; sampleRequestIdLimit?: number } = {},
+    ) => {
+      const sampleLimit = Math.min(Math.max(Math.trunc(opts.sampleRequestIdLimit ?? 10), 1), 100);
+      const conditions: ReturnType<typeof eq>[] = [eq(costEvents.companyId, companyId)];
+      if (range?.from) conditions.push(gte(costEvents.occurredAt, range.from));
+      if (range?.to) conditions.push(lt(costEvents.occurredAt, range.to)); // exclusive upper bound
+      const providers = (opts.providers ?? []).map((p) => p.trim()).filter((p) => p.length > 0);
+      if (providers.length > 0) conditions.push(inArray(costEvents.provider, providers));
+
+      const dayExpr = sql<string>`to_char(date_trunc('day', ${costEvents.occurredAt} AT TIME ZONE 'UTC'), 'YYYY-MM-DD')`;
+      const rows = await db
+        .select({
+          provider: costEvents.provider,
+          model: costEvents.model,
+          day: dayExpr,
+          expectedMicros: sql<number>`coalesce(sum(coalesce(${costEvents.costMicros}, ${costEvents.costCents} * 10000)), 0)::double precision`,
+          requestIds: sql<
+            string[]
+          >`(array_agg(coalesce(${costEvents.requestId}, ${costEvents.id}::text) order by ${costEvents.occurredAt} desc))[1:${sampleLimit}]`,
+        })
+        .from(costEvents)
+        .where(and(...conditions))
+        .groupBy(costEvents.provider, costEvents.model, dayExpr)
+        .orderBy(dayExpr, costEvents.provider, costEvents.model);
+
+      return rows.map((r) => ({
+        provider: r.provider,
+        model: r.model,
+        day: r.day,
+        expectedMicros: Number(r.expectedMicros),
+        requestIds: r.requestIds ?? [],
+      }));
     },
 
     byProject: async (companyId: string, range?: CostDateRange) => {

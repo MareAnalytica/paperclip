@@ -84,6 +84,7 @@ const mockCostService = vi.hoisted(() => ({
   }),
   windowSpend: vi.fn().mockResolvedValue([]),
   byProject: vi.fn().mockResolvedValue([]),
+  reconcileCells: vi.fn().mockResolvedValue([]),
 }));
 const mockFinanceService = vi.hoisted(() => ({
   createEvent: vi.fn(),
@@ -155,8 +156,9 @@ async function createAppWithActor(actor: any) {
 }
 
 async function loadCostParsers() {
-  const { parseCostDateRange, parseCostLimit } = await import("../routes/costs.js");
-  return { parseCostDateRange, parseCostLimit };
+  const { parseCostDateRange, parseCostLimit, parseProviders, parseSampleRequestIdLimit } =
+    await import("../routes/costs.js");
+  return { parseCostDateRange, parseCostLimit, parseProviders, parseSampleRequestIdLimit };
 }
 
 beforeEach(() => {
@@ -220,6 +222,55 @@ describe("cost routes", () => {
   it("returns 400 for an invalid 'to' date string", async () => {
     const { parseCostDateRange } = await loadCostParsers();
     expect(() => parseCostDateRange({ to: "banana" })).toThrow(/invalid 'to' date/i);
+  });
+
+  it("parses a comma-separated providers filter, trimming blanks", async () => {
+    const { parseProviders } = await loadCostParsers();
+    expect(parseProviders({ providers: "anthropic, openai , " })).toEqual(["anthropic", "openai"]);
+    expect(parseProviders({})).toBeUndefined();
+    expect(parseProviders({ providers: "" })).toBeUndefined();
+    expect(parseProviders({ providers: " , " })).toBeUndefined();
+  });
+
+  it("parses sampleRequestIdLimit and rejects out-of-range values", async () => {
+    const { parseSampleRequestIdLimit } = await loadCostParsers();
+    expect(parseSampleRequestIdLimit({ sampleRequestIdLimit: "5" })).toBe(5);
+    expect(parseSampleRequestIdLimit({})).toBeUndefined();
+    expect(() => parseSampleRequestIdLimit({ sampleRequestIdLimit: "0" })).toThrow(/1-100/);
+    expect(() => parseSampleRequestIdLimit({ sampleRequestIdLimit: "101" })).toThrow(/1-100/);
+    expect(() => parseSampleRequestIdLimit({ sampleRequestIdLimit: "nope" })).toThrow(/1-100/);
+  });
+
+  it("returns invoice-reconcile cells and forwards range + filters to the service", async () => {
+    const app = await createApp();
+    mockCostService.reconcileCells.mockResolvedValueOnce([
+      { provider: "anthropic", model: "claude-opus-4-7", day: "2026-04-10", expectedMicros: 4_500_000, requestIds: ["vendor-req-7"] },
+    ]);
+    const res = await request(app)
+      .get("/api/companies/company-1/costs/invoice-reconcile")
+      .query({
+        from: "2026-04-10T00:00:00.000Z",
+        to: "2026-04-12T00:00:00.000Z",
+        providers: "anthropic",
+        sampleRequestIdLimit: "5",
+      });
+    expect(res.status).toBe(200);
+    expect(res.body.cells).toHaveLength(1);
+    expect(res.body.cells[0]).toMatchObject({ provider: "anthropic", day: "2026-04-10", expectedMicros: 4_500_000 });
+    expect(mockCostService.reconcileCells).toHaveBeenCalledWith(
+      "company-1",
+      { from: new Date("2026-04-10T00:00:00.000Z"), to: new Date("2026-04-12T00:00:00.000Z") },
+      { providers: ["anthropic"], sampleRequestIdLimit: 5 },
+    );
+  });
+
+  it("returns 400 from the invoice-reconcile route for an invalid sampleRequestIdLimit", async () => {
+    const app = await createApp();
+    const res = await request(app)
+      .get("/api/companies/company-1/costs/invoice-reconcile")
+      .query({ sampleRequestIdLimit: "999" });
+    expect(res.status).toBe(400);
+    expect(mockCostService.reconcileCells).not.toHaveBeenCalled();
   });
 
   it("returns finance summary rows for valid requests", async () => {
@@ -494,6 +545,83 @@ describeEmbeddedPostgres("cost and finance aggregate overflow handling", () => {
     expect(byAgentRow?.inputTokens).toBe(4_000_000_000);
     expect(byProjectRow?.costCents).toBe(4_000_000_000);
     expect(byAgentModelRow?.costCents).toBe(4_000_000_000);
+  });
+
+  it("reconcileCells groups by (provider, model, UTC day), converts cents→micros, samples ids", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Cost Agent",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    const base = {
+      companyId,
+      agentId,
+      biller: "anthropic",
+      billingType: "metered_api",
+      inputTokens: 0,
+      cachedInputTokens: 0,
+      outputTokens: 0,
+    };
+    await db.insert(costEvents).values([
+      // anthropic / claude-opus-4-7 / 2026-04-10 : two events => 300 cents = 3_000_000 micros.
+      { ...base, provider: "anthropic", model: "claude-opus-4-7", costCents: 100, occurredAt: new Date("2026-04-10T01:00:00.000Z") },
+      { ...base, provider: "anthropic", model: "claude-opus-4-7", costCents: 200, occurredAt: new Date("2026-04-10T05:00:00.000Z") },
+      // §2.1 charge row on the same day/cell: authoritative cost_micros wins over
+      // its (intentionally mismatched) cost_cents, and its vendor request_id is
+      // preferred for the sample. 1 cent here would be 10_000 micros, but
+      // cost_micros says 1_500_000 — so the cell must reflect the micros value.
+      { ...base, provider: "anthropic", model: "claude-opus-4-7", costCents: 1, costMicros: 1_500_000, requestId: "vendor-req-7", occurredAt: new Date("2026-04-10T06:00:00.000Z") },
+      // same model, next UTC day => separate cell (50 cents).
+      { ...base, provider: "anthropic", model: "claude-opus-4-7", costCents: 50, occurredAt: new Date("2026-04-11T00:30:00.000Z") },
+      // different provider in the window — excluded by the providers filter below.
+      { ...base, provider: "openai", biller: "openai", model: "gpt-4.1", costCents: 999, occurredAt: new Date("2026-04-10T02:00:00.000Z") },
+    ]);
+
+    const range = {
+      from: new Date("2026-04-10T00:00:00.000Z"),
+      to: new Date("2026-04-12T00:00:00.000Z"), // exclusive upper
+    };
+    const cells = await costs.reconcileCells(companyId, range, {
+      providers: ["anthropic"],
+      sampleRequestIdLimit: 5,
+    });
+
+    // openai excluded; two anthropic cells (one per UTC day), day-sorted.
+    expect(cells).toHaveLength(2);
+    // day-10: 100c + 200c (=3_000_000 micros) + the §2.1 row (1_500_000 micros,
+    // NOT its 1c=10_000) => 4_500_000.
+    expect(cells[0]).toMatchObject({ provider: "anthropic", model: "claude-opus-4-7", day: "2026-04-10", expectedMicros: 4_500_000 });
+    expect(cells[1]).toMatchObject({ day: "2026-04-11", expectedMicros: 500_000 });
+    // day 2026-04-10 sampled its three contributing ids (bounded by limit) and
+    // prefers the real vendor request_id when present.
+    expect(cells[0]!.requestIds).toHaveLength(3);
+    expect(cells[0]!.requestIds).toContain("vendor-req-7");
+    expect(cells[0]!.requestIds.every((id) => typeof id === "string" && id.length > 0)).toBe(true);
+
+    // Exclusive upper bound: shifting `to` back to the start of 2026-04-11 drops that day's cell.
+    const clipped = await costs.reconcileCells(
+      companyId,
+      { from: range.from, to: new Date("2026-04-11T00:00:00.000Z") },
+      { providers: ["anthropic"] },
+    );
+    expect(clipped).toHaveLength(1);
+    expect(clipped[0]!.day).toBe("2026-04-10");
   });
 
   it("aggregates issue costs across recursive descendants only", async () => {
