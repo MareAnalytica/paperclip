@@ -246,6 +246,12 @@ export const ISSUE_RECOVERY_ACTION_KINDS = [
   "stranded_assigned_issue",
   "active_run_watchdog",
   "issue_graph_liveness",
+  // Contract C (ELI-947 / ELI-964): the cross-run provider-unresponsive breaker
+  // accumulator. Records consecutive `provider_unresponsive` no-output hangs for
+  // an (agent, provider) pair so the N-bound escalate arm can open a typed
+  // operator recovery action (run adapter CLI health check / pin a healthy
+  // provider) instead of re-queuing the same hung pair.
+  "provider_unhealthy",
 ] as const;
 export type IssueRecoveryActionKind = (typeof ISSUE_RECOVERY_ACTION_KINDS)[number];
 

@@ -257,6 +257,63 @@ export function issueRecoveryActionService(db: Db) {
     return runExclusiveUpsert(input, () => upsertSourceScopedUnlocked(input));
   }
 
+  /**
+   * Promote an already-active recovery action to `escalated` and (re)route it to
+   * a typed operator owner. Used by the Contract C provider-unresponsive breaker
+   * (ELI-964): once the consecutive cross-run hang count exceeds the bound and no
+   * healthy alternative exists, the accumulator row stops re-queuing the hung
+   * pair and becomes an operator recovery action (run adapter CLI health check /
+   * pin a healthy provider). `escalated` stays inside the active status set, so
+   * the source-scoped slot keeps pointing at this row — the breaker never opens a
+   * second active row for the same issue, and a subsequent identical hang reads
+   * the same persisted `attemptCount` instead of resetting it.
+   *
+   * Never auto-cancels the live run (ELI-776 §2): it only re-owns the recovery
+   * action to a board/operator decision. The `where` clause is scoped to the
+   * active row id so it is idempotent across repeat hangs.
+   */
+  async function escalateSourceScoped(input: {
+    companyId: string;
+    sourceIssueId: string;
+    actionId: string;
+    ownerType?: IssueRecoveryActionOwnerType;
+    ownerAgentId?: string | null;
+    ownerUserId?: string | null;
+    previousOwnerAgentId?: string | null;
+    nextAction?: string;
+    wakePolicy?: Record<string, unknown> | null;
+    monitorPolicy?: Record<string, unknown> | null;
+    evidence?: Record<string, unknown>;
+  }): Promise<IssueRecoveryAction | null> {
+    const now = new Date();
+    const patch: Partial<IssueRecoveryActionRow> = {
+      status: "escalated",
+      updatedAt: now,
+    };
+    if (input.ownerType !== undefined) patch.ownerType = input.ownerType;
+    if (input.ownerAgentId !== undefined) patch.ownerAgentId = input.ownerAgentId;
+    if (input.ownerUserId !== undefined) patch.ownerUserId = input.ownerUserId;
+    if (input.previousOwnerAgentId !== undefined) patch.previousOwnerAgentId = input.previousOwnerAgentId;
+    if (input.nextAction !== undefined) patch.nextAction = input.nextAction;
+    if (input.wakePolicy !== undefined) patch.wakePolicy = input.wakePolicy;
+    if (input.monitorPolicy !== undefined) patch.monitorPolicy = input.monitorPolicy;
+    if (input.evidence !== undefined) patch.evidence = input.evidence;
+
+    const [updated] = await db
+      .update(issueRecoveryActions)
+      .set(patch)
+      .where(
+        and(
+          eq(issueRecoveryActions.companyId, input.companyId),
+          eq(issueRecoveryActions.sourceIssueId, input.sourceIssueId),
+          eq(issueRecoveryActions.id, input.actionId),
+          inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES]),
+        ),
+      )
+      .returning();
+    return updated ? toReadModel(updated) : null;
+  }
+
   async function resolveActiveForIssue(
     input: ResolveIssueRecoveryActionInput,
     dbOrTx: DbOrTransaction = db,
@@ -290,6 +347,7 @@ export function issueRecoveryActionService(db: Db) {
     getActiveForIssue,
     listActiveForIssues,
     resolveActiveForIssue,
+    escalateSourceScoped,
     upsertSourceScoped,
   };
 }
