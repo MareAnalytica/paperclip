@@ -37,6 +37,22 @@ export type UpsertIssueRecoveryActionInput = {
   lastAttemptAt?: Date | null;
 };
 
+/**
+ * Optional atomic coexistence guard for `upsertSourceScoped` (ELI-975). When
+ * supplied, the upsert only mutates the active per-issue row when that row
+ * already carries the same `(cause, fingerprint)` identity. If a competing
+ * different-cause action holds the single active slot, the upsert yields
+ * (returns `null`) instead of repurposing/clobbering the competing row, which
+ * preserves the ELI-776 §3 audit trail. The predicate is evaluated *inside*
+ * `runExclusiveUpsert`'s per-key lock (on the inner re-read and in the UPDATE
+ * `where` clause), so the read-then-act is atomic even if a competing row is
+ * inserted between a caller's outer read and this write.
+ */
+export type UpsertSourceScopedExpectation = {
+  expectCause: string;
+  expectFingerprint: string;
+};
+
 export type ResolveIssueRecoveryActionInput = {
   companyId: string;
   sourceIssueId: string;
@@ -160,25 +176,47 @@ export function issueRecoveryActionService(db: Db) {
   async function retryUpsertSourceScoped(
     input: UpsertIssueRecoveryActionInput,
     retryCount: number,
+    expectation?: UpsertSourceScopedExpectation,
     error?: unknown,
-  ): Promise<IssueRecoveryAction> {
+  ): Promise<IssueRecoveryAction | null> {
     if (retryCount >= MAX_UPSERT_RETRIES) {
       if (error) throw error;
       throw new Error(
         `Failed to upsert active recovery action for issue ${input.sourceIssueId} after ${MAX_UPSERT_RETRIES} retries`,
       );
     }
-    return upsertSourceScopedUnlocked(input, retryCount + 1);
+    return upsertSourceScopedUnlocked(input, retryCount + 1, expectation);
   }
 
   async function upsertSourceScopedUnlocked(
     input: UpsertIssueRecoveryActionInput,
     retryCount = 0,
-  ): Promise<IssueRecoveryAction> {
+    expectation?: UpsertSourceScopedExpectation,
+  ): Promise<IssueRecoveryAction | null> {
     const existing = await getActiveForIssue(input.companyId, input.sourceIssueId);
     const now = new Date();
     const ownerType = input.ownerType ?? (input.ownerAgentId ? "agent" : "board");
     if (existing) {
+      // Atomic coexistence guard (ELI-975): when the caller declares the
+      // identity it expects to own, refuse to repurpose a competing active row.
+      // This re-read sits inside the per-key lock, so a stranded action inserted
+      // between the caller's outer read and this write is observed here and the
+      // provider arm yields instead of clobbering it (and vice versa).
+      if (
+        expectation &&
+        (existing.cause !== expectation.expectCause ||
+          existing.fingerprint !== expectation.expectFingerprint)
+      ) {
+        return null;
+      }
+      const updateWhere = [
+        eq(issueRecoveryActions.id, existing.id),
+        inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES]),
+      ];
+      if (expectation) {
+        updateWhere.push(eq(issueRecoveryActions.cause, expectation.expectCause));
+        updateWhere.push(eq(issueRecoveryActions.fingerprint, expectation.expectFingerprint));
+      }
       const [updated] = await db
         .update(issueRecoveryActions)
         .set({
@@ -205,15 +243,10 @@ export function issueRecoveryActionService(db: Db) {
           resolvedAt: null,
           updatedAt: now,
         })
-        .where(
-          and(
-            eq(issueRecoveryActions.id, existing.id),
-            inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES]),
-          ),
-        )
+        .where(and(...updateWhere))
         .returning();
       if (!updated) {
-        return retryUpsertSourceScoped(input, retryCount);
+        return retryUpsertSourceScoped(input, retryCount, expectation);
       }
       return toReadModel(updated!);
     }
@@ -247,14 +280,32 @@ export function issueRecoveryActionService(db: Db) {
       return toReadModel(created!);
     } catch (error) {
       if (!isUniqueRecoveryActionConflict(error)) throw error;
-      return retryUpsertSourceScoped(input, retryCount, error);
+      return retryUpsertSourceScoped(input, retryCount, expectation, error);
     }
   }
 
-  async function upsertSourceScoped(
+  /**
+   * Upsert the single active source-scoped recovery action for an issue.
+   *
+   * Without an `expectation`, the active per-issue row (whatever its cause) is
+   * re-armed in place — the legacy single-slot behaviour. With an
+   * `expectation`, the write is gated on the row's `(cause, fingerprint)`
+   * identity and returns `null` when a competing different-cause action owns the
+   * slot, making the coexistence guard atomic for the provider / stranded arms
+   * (ELI-975).
+   */
+  function upsertSourceScoped(
     input: UpsertIssueRecoveryActionInput,
-  ): Promise<IssueRecoveryAction> {
-    return runExclusiveUpsert(input, () => upsertSourceScopedUnlocked(input));
+  ): Promise<IssueRecoveryAction>;
+  function upsertSourceScoped(
+    input: UpsertIssueRecoveryActionInput,
+    expectation: UpsertSourceScopedExpectation,
+  ): Promise<IssueRecoveryAction | null>;
+  function upsertSourceScoped(
+    input: UpsertIssueRecoveryActionInput,
+    expectation?: UpsertSourceScopedExpectation,
+  ): Promise<IssueRecoveryAction | null> {
+    return runExclusiveUpsert(input, () => upsertSourceScopedUnlocked(input, 0, expectation));
   }
 
   /**

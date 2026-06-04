@@ -2598,6 +2598,14 @@ export function recoveryService(
     const recoveryCause = input.recoveryCause ?? "stranded_assigned_issue";
     const ownerAgentId = await resolveStrandedIssueRecoveryOwnerAgentId(input.issue);
     const now = new Date();
+    const fingerprint = strandedRecoveryActionFingerprint({
+      issue: input.issue,
+      recoveryCause,
+    });
+    // Atomic coexistence guard (ELI-975): only re-arm the per-issue slot when it
+    // already holds this stranded identity. If a provider-unresponsive
+    // accumulator (or any different-cause action) owns it, yield (return null)
+    // instead of silently overwriting that competing row's audit trail.
     const action = await recoveryActionsSvc.upsertSourceScoped({
       companyId: input.issue.companyId,
       sourceIssueId: input.issue.id,
@@ -2607,10 +2615,7 @@ export function recoveryService(
       previousOwnerAgentId: input.issue.assigneeAgentId,
       returnOwnerAgentId: input.issue.assigneeAgentId,
       cause: recoveryCause,
-      fingerprint: strandedRecoveryActionFingerprint({
-        issue: input.issue,
-        recoveryCause,
-      }),
+      fingerprint,
       evidence: buildStrandedRecoveryActionEvidence({
         issue: input.issue,
         latestRun: input.latestRun,
@@ -2634,13 +2639,13 @@ export function recoveryService(
       monitorPolicy: null,
       maxAttempts: null,
       lastAttemptAt: now,
-    });
+    }, { expectCause: recoveryCause, expectFingerprint: fingerprint });
 
     return action;
   }
 
   async function enqueueSourceScopedStrandedRecoveryWake(input: {
-    action: Awaited<ReturnType<typeof recoveryActionsSvc.upsertSourceScoped>>;
+    action: NonNullable<Awaited<ReturnType<typeof recoveryActionsSvc.upsertSourceScoped>>>;
     issue: typeof issues.$inferSelect;
     latestRun: LatestIssueRun;
     recoveryCause: StrandedRecoveryCause;
@@ -2873,6 +2878,11 @@ export function recoveryService(
       recoveryCause,
       successfulRunHandoffEvidence: input.successfulRunHandoffEvidence,
     });
+    // A competing different-cause recovery action (e.g. a provider-unresponsive
+    // accumulator) already owns the single active per-issue slot — skip this
+    // stranded sweep rather than clobber it (ELI-975). A later sweep re-fires
+    // once that action resolves/escalates and the slot frees.
+    if (!recoveryAction) return null;
     const blockerIds = await existingUnresolvedBlockerIssueIds(input.issue.companyId, input.issue.id);
     const updated = await issuesSvc.update(input.issue.id, {
       status: "blocked",
