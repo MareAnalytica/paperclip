@@ -88,6 +88,43 @@ export function resolveSharedClaudeConfigDir(
   return fromEnv ? path.resolve(fromEnv) : path.join(os.homedir(), ".claude");
 }
 
+/**
+ * One entry in the ELI-241 Option B multi-account failover list. `label` is a
+ * human-readable identifier surfaced in the per-account audit trail; `configDir`
+ * is an absolute Claude config directory. The adapter never seeds or creates the
+ * directory — a missing one is recorded as a `config_dir_missing` attempt and the
+ * loop advances.
+ */
+export interface ClaudeAccount {
+  label: string;
+  configDir: string;
+}
+
+/**
+ * ELI-243: resolve the optional, ordered `claudeAccounts` rotation list from the
+ * resolved adapter config. Returns `[]` when the field is absent, empty, or
+ * malformed — in which case the adapter preserves its existing single-account
+ * behavior (auth via `env.CLAUDE_CONFIG_DIR`). When present, ordering is
+ * significant: the first entry is primary, the rest are failover candidates in
+ * declared order. Entries missing a `label` or `configDir` are skipped.
+ */
+export function resolveClaudeAccounts(
+  config: Record<string, unknown>,
+): ClaudeAccount[] {
+  const raw = (config as { claudeAccounts?: unknown }).claudeAccounts;
+  if (!Array.isArray(raw)) return [];
+  const accounts: ClaudeAccount[] = [];
+  for (const entry of raw) {
+    if (!entry || typeof entry !== "object") continue;
+    const record = entry as Record<string, unknown>;
+    const label = nonEmpty(typeof record.label === "string" ? record.label : undefined);
+    const configDir = nonEmpty(typeof record.configDir === "string" ? record.configDir : undefined);
+    if (!label || !configDir) continue;
+    accounts.push({ label, configDir: path.resolve(configDir) });
+  }
+  return accounts;
+}
+
 export function resolveManagedClaudeConfigSeedDir(
   env: NodeJS.ProcessEnv,
   companyId?: string,

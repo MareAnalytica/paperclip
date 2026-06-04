@@ -52,11 +52,16 @@ import {
   describeClaudeFailure,
   detectClaudeLoginRequired,
   extractClaudeRetryNotBefore,
+  isClaudeAuthClassFailure,
   isClaudeMaxTurnsResult,
   isClaudeTransientUpstreamError,
   isClaudeUnknownSessionError,
 } from "./parse.js";
-import { prepareClaudeConfigSeed } from "./claude-config.js";
+import {
+  prepareClaudeConfigSeed,
+  resolveClaudeAccounts,
+  type ClaudeAccount,
+} from "./claude-config.js";
 import { resolveClaudeDesiredSkillNames } from "./skills.js";
 import { isBedrockModelId } from "./models.js";
 import { prepareClaudePromptBundle } from "./prompt-cache.js";
@@ -64,6 +69,24 @@ import { buildClaudeExecutionPermissionArgs } from "./permissions.js";
 import { SANDBOX_INSTALL_COMMAND } from "../index.js";
 
 const __moduleDir = path.dirname(fileURLToPath(import.meta.url));
+
+// ELI-243: one row of the multi-account failover audit trail, appended to
+// `resultJson.claudeAccountAttempts`. Shape per spec
+// docs/specs/2026-05-24-claude-multi-account-failover.md §3.3.
+interface ClaudeAccountAttempt {
+  attemptIndex: number;
+  label: string;
+  configDir: string;
+  startedAt: string;
+  completedAt: string;
+  outcome: "success" | "auth_required" | "config_dir_missing" | "skipped";
+  errorMessage?: string;
+  advancedTo: string | null;
+}
+
+async function claudeConfigDirExists(candidate: string): Promise<boolean> {
+  return fs.access(candidate).then(() => true).catch(() => false);
+}
 
 interface ClaudeExecutionInput {
   runId: string;
@@ -982,23 +1005,69 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       await onLog("stderr", `[paperclip] budget preflight note: ${preflightErr}\n`);
     }
 
-    const initial = await runAttempt(sessionId ?? null);
-    if (
-      sessionId &&
-      !initial.proc.timedOut &&
-      (initial.proc.exitCode ?? 0) !== 0 &&
-      initial.parsed &&
-      isClaudeUnknownSessionError(initial.parsed)
-    ) {
-      await onLog(
-        "stdout",
-        `[paperclip] Claude resume session "${sessionId}" is unavailable; retrying with a fresh session.\n`,
-      );
-      const retry = await runAttempt(null);
-      // charge for retry path also via withBudget-wrapped handle (ensures dims + idempotency)
+    // ELI-243: the single-attempt body (initial run + unknown-session retry +
+    // cost charging) is factored into executeOnceForAccount() so the multi-account
+    // failover loop can invoke it once per configured account against whatever
+    // env.CLAUDE_CONFIG_DIR is currently pointed at. It returns the normal
+    // AdapterExecutionResult plus the raw parsed/stdout/stderr so the loop can
+    // classify auth-class failures via the documented allowlist without re-running
+    // the CLI. With no `claudeAccounts` list this runs exactly once, identical to
+    // the historical single-account path.
+    const executeOnceForAccount = async (): Promise<{
+      result: AdapterExecutionResult;
+      parsed: Record<string, unknown> | null;
+      stdout: string;
+      stderr: string;
+    }> => {
+      const initial = await runAttempt(sessionId ?? null);
+      if (
+        sessionId &&
+        !initial.proc.timedOut &&
+        (initial.proc.exitCode ?? 0) !== 0 &&
+        initial.parsed &&
+        isClaudeUnknownSessionError(initial.parsed)
+      ) {
+        await onLog(
+          "stdout",
+          `[paperclip] Claude resume session "${sessionId}" is unavailable; retrying with a fresh session.\n`,
+        );
+        const retry = await runAttempt(null);
+        // charge for retry path also via withBudget-wrapped handle (ensures dims + idempotency)
+        try {
+          await withBudget(ctx, async (b) => {
+            const ps = (retry as any).parsedStream || {};
+            const u = ps.usage || { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 };
+            const chCost = typeof ps.costUsd === "number"
+              ? Math.ceil(ps.costUsd * 1_000_000)
+              : Math.ceil(((u.inputTokens || 0) + (u.outputTokens || 0)) * 3);
+            await b.charge({
+              provider: "anthropic",
+              model: ps.model || "claude",
+              kind: "tokens",
+              inputTokens: u.inputTokens || 0,
+              cachedInputTokens: u.cachedInputTokens || 0,
+              outputTokens: u.outputTokens || 0,
+              costMicros: chCost,
+              requestId: ps.sessionId || undefined,
+              idempotencyKey: `anthropic:${ps.sessionId || ctx.runId}`,
+              qty: (u.inputTokens || 0) + (u.outputTokens || 0) || 0,
+            });
+          }, budgetOpts);
+        } catch (chargeErr) {
+          await onLog("stderr", `[paperclip] cost charge note (non-fatal): ${chargeErr}\n`);
+        }
+        return {
+          result: toAdapterResult(retry, { fallbackSessionId: null, clearSessionOnMissingSession: true }),
+          parsed: retry.parsed,
+          stdout: retry.proc.stdout,
+          stderr: retry.proc.stderr,
+        };
+      }
+
+      // ELI-78: charge using the withBudget SDK helper (wraps post-provider charge; ensures ctx dims + idempotencyKey rule).
       try {
         await withBudget(ctx, async (b) => {
-          const ps = (retry as any).parsedStream || {};
+          const ps = initial.parsedStream || {};
           const u = ps.usage || { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 };
           const chCost = typeof ps.costUsd === "number"
             ? Math.ceil(ps.costUsd * 1_000_000)
@@ -1019,35 +1088,130 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       } catch (chargeErr) {
         await onLog("stderr", `[paperclip] cost charge note (non-fatal): ${chargeErr}\n`);
       }
-      return toAdapterResult(retry, { fallbackSessionId: null, clearSessionOnMissingSession: true });
+
+      return {
+        result: toAdapterResult(initial, { fallbackSessionId: runtimeSessionId || runtime.sessionId }),
+        parsed: initial.parsed,
+        stdout: initial.proc.stdout,
+        stderr: initial.proc.stderr,
+      };
+    };
+
+    // ELI-243: attach the per-account audit trail to resultJson without disturbing
+    // any other terminal fields. Skipped when there were no rotation rows so the
+    // single-account path's resultJson stays byte-for-byte unchanged.
+    const mergeAccountAttempts = (
+      result: AdapterExecutionResult,
+      rows: ClaudeAccountAttempt[],
+    ): AdapterExecutionResult =>
+      rows.length === 0
+        ? result
+        : { ...result, resultJson: { ...(result.resultJson ?? {}), claudeAccountAttempts: rows } };
+
+    const claudeAccounts = resolveClaudeAccounts(config);
+
+    // No rotation list configured → identical to the historical single-account
+    // path (auth via the already-resolved env.CLAUDE_CONFIG_DIR).
+    if (claudeAccounts.length === 0) {
+      return (await executeOnceForAccount()).result;
     }
 
-    // ELI-78: charge using the withBudget SDK helper (wraps post-provider charge; ensures ctx dims + idempotencyKey rule).
-    try {
-      await withBudget(ctx, async (b) => {
-        const ps = initial.parsedStream || {};
-        const u = ps.usage || { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 };
-        const chCost = typeof ps.costUsd === "number"
-          ? Math.ceil(ps.costUsd * 1_000_000)
-          : Math.ceil(((u.inputTokens || 0) + (u.outputTokens || 0)) * 3);
-        await b.charge({
-          provider: "anthropic",
-          model: ps.model || "claude",
-          kind: "tokens",
-          inputTokens: u.inputTokens || 0,
-          cachedInputTokens: u.cachedInputTokens || 0,
-          outputTokens: u.outputTokens || 0,
-          costMicros: chCost,
-          requestId: ps.sessionId || undefined,
-          idempotencyKey: `anthropic:${ps.sessionId || ctx.runId}`,
-          qty: (u.inputTokens || 0) + (u.outputTokens || 0) || 0,
+    // Multi-account failover. Try each account in declared order, pointing
+    // env.CLAUDE_CONFIG_DIR at its configDir. Advance to the next account only on
+    // an auth-class failure (allowlist) or a missing config dir; any other outcome
+    // (success or a non-auth failure) terminates the loop and preserves the
+    // existing terminal result.
+    const attempts: ClaudeAccountAttempt[] = [];
+    for (let index = 0; index < claudeAccounts.length; index++) {
+      const account: ClaudeAccount = claudeAccounts[index];
+      const advancedTo = index + 1 < claudeAccounts.length ? claudeAccounts[index + 1].label : null;
+      const startedAt = new Date().toISOString();
+
+      // Missing config dir: record and advance WITHOUT invoking the CLI.
+      if (!(await claudeConfigDirExists(account.configDir))) {
+        attempts.push({
+          attemptIndex: index,
+          label: account.label,
+          configDir: account.configDir,
+          startedAt,
+          completedAt: new Date().toISOString(),
+          outcome: "config_dir_missing",
+          errorMessage: `Config directory not found: ${account.configDir}`,
+          advancedTo,
         });
-      }, budgetOpts);
-    } catch (chargeErr) {
-      await onLog("stderr", `[paperclip] cost charge note (non-fatal): ${chargeErr}\n`);
+        await onLog(
+          "stdout",
+          `[paperclip] Claude account "${account.label}" config dir "${account.configDir}" not found; advancing${advancedTo ? ` to "${advancedTo}"` : " (exhausted)"}.\n`,
+        );
+        continue;
+      }
+
+      env.CLAUDE_CONFIG_DIR = account.configDir;
+      loggedEnv.CLAUDE_CONFIG_DIR = account.configDir;
+
+      const attempt = await executeOnceForAccount();
+      const completedAt = new Date().toISOString();
+      const authClass =
+        Boolean(attempt.result.errorCode) &&
+        isClaudeAuthClassFailure({
+          parsed: attempt.parsed,
+          stdout: attempt.stdout,
+          stderr: attempt.stderr,
+        });
+
+      if (authClass) {
+        attempts.push({
+          attemptIndex: index,
+          label: account.label,
+          configDir: account.configDir,
+          startedAt,
+          completedAt,
+          outcome: "auth_required",
+          errorMessage: attempt.result.errorMessage ?? "Not logged in",
+          advancedTo,
+        });
+        await onLog(
+          "stdout",
+          `[paperclip] Claude account "${account.label}" requires login; advancing${advancedTo ? ` to "${advancedTo}"` : " (exhausted)"}.\n`,
+        );
+        continue;
+      }
+
+      // Success or non-auth terminal failure: stop rotating. A success records a
+      // final audit row; a non-auth failure keeps its existing terminal shape
+      // (detail already carried by errorCode/errorMessage) and only carries the
+      // prior rotation rows, if any.
+      if (!attempt.result.errorCode) {
+        attempts.push({
+          attemptIndex: index,
+          label: account.label,
+          configDir: account.configDir,
+          startedAt,
+          completedAt,
+          outcome: "success",
+          advancedTo: null,
+        });
+      }
+      return mergeAccountAttempts(attempt.result, attempts);
     }
 
-    return toAdapterResult(initial, { fallbackSessionId: runtimeSessionId || runtime.sessionId });
+    // Exhaustion: every configured account produced an auth-class failure (or a
+    // missing config dir). Surface the terminal claude_auth_required outcome with
+    // the full audit array and an errorMessage listing all attempted labels.
+    const exhaustedLabels = claudeAccounts.map((account) => account.label);
+    return {
+      exitCode: 1,
+      signal: null,
+      timedOut: false,
+      errorMessage: `Auth required on all ${claudeAccounts.length} configured Claude accounts: ${exhaustedLabels.join(", ")}`,
+      errorCode: "claude_auth_required",
+      errorFamily: null,
+      provider: "anthropic",
+      biller: isBedrockAuth(effectiveEnv) ? "aws_bedrock" : "anthropic",
+      billingType,
+      resultJson: { claudeAccountAttempts: attempts },
+      clearSession: false,
+    };
   } finally {
     if (paperclipBridge) {
       await paperclipBridge.stop();
