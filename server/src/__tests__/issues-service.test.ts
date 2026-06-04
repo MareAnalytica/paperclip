@@ -890,6 +890,72 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
     expect(advancedIssueIds).toContain(legacyContentMachineOperationIssueId);
   });
 
+  it("persists a caller-supplied originFingerprint and filters by it exactly (eli-board ELI-972)", async () => {
+    const companyId = randomUUID();
+    const fpA = `vir:${randomUUID()}`;
+    const fpB = `vir:${randomUUID()}`;
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    // create() accepts and persists the fingerprint; absent → "default" sentinel.
+    const created = await svc.create(companyId, {
+      title: "Invoice variance: anthropic/claude 2026-06-01",
+      status: "todo",
+      priority: "medium",
+      billingCode: "governance/billing",
+      originFingerprint: fpA,
+    });
+    expect(created.originFingerprint).toBe(fpA);
+    const plain = await svc.create(companyId, { title: "Plain issue", status: "todo", priority: "medium" });
+    expect(plain.originFingerprint).toBe("default");
+
+    // A second emission for the same cell that has since been resolved — the
+    // filter must still surface it (recently-resolved emissions preserve the
+    // audit trail and drive the re-arm decision).
+    const resolvedSameCellId = randomUUID();
+    const otherCellId = randomUUID();
+    await db.insert(issues).values([
+      {
+        id: resolvedSameCellId,
+        companyId,
+        title: "Invoice variance (prior, resolved)",
+        status: "done",
+        priority: "medium",
+        billingCode: "governance/billing",
+        originFingerprint: fpA,
+        completedAt: new Date(),
+      },
+      {
+        id: otherCellId,
+        companyId,
+        title: "Invoice variance: openai/gpt 2026-06-01",
+        status: "todo",
+        priority: "medium",
+        billingCode: "governance/billing",
+        originFingerprint: fpB,
+      },
+    ]);
+
+    // Exact, cap-independent match: only the two fpA issues (open + resolved),
+    // never the fpB cell or the "default"-fingerprint plain issue.
+    const fpAResults = await svc.list(companyId, { originFingerprint: fpA });
+    expect(fpAResults.map((i) => i.id).sort()).toEqual([created.id, resolvedSameCellId].sort());
+
+    const fpBResults = await svc.list(companyId, { originFingerprint: fpB });
+    expect(fpBResults.map((i) => i.id)).toEqual([otherCellId]);
+
+    // The "default" sentinel is shared by ~every issue, so it is never used as a
+    // lookup key — but the filter still works and excludes the tagged emissions.
+    const defaultResults = await svc.list(companyId, { originFingerprint: "default" });
+    expect(defaultResults.map((i) => i.id)).toContain(plain.id);
+    expect(defaultResults.map((i) => i.id)).not.toContain(created.id);
+  });
+
   it("excludes plugin operation issues from unread inbox counts", async () => {
     const companyId = randomUUID();
     const userId = "board-user";

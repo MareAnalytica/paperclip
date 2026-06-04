@@ -1993,6 +1993,7 @@ export function issueRoutes(
       originKind: req.query.originKind as string | undefined,
       originKindPrefix: req.query.originKindPrefix as string | undefined,
       originId: req.query.originId as string | undefined,
+      originFingerprint: req.query.originFingerprint as string | undefined,
       includeRoutineExecutions:
         req.query.includeRoutineExecutions === "true" || req.query.includeRoutineExecutions === "1",
       excludeRoutineExecutions:
@@ -2061,6 +2062,7 @@ export function issueRoutes(
       originKind: req.query.originKind as string | undefined,
       originKindPrefix: req.query.originKindPrefix as string | undefined,
       originId: req.query.originId as string | undefined,
+      originFingerprint: req.query.originFingerprint as string | undefined,
       includeRoutineExecutions:
         req.query.includeRoutineExecutions === "true" || req.query.includeRoutineExecutions === "1",
       excludeRoutineExecutions:

@@ -715,6 +715,13 @@
       "when": 1780471437500,
       "tag": "0101_marvelous_klaw",
       "breakpoints": true
+    },
+    {
+      "idx": 102,
+      "version": "7",
+      "when": 1780560592327,
+      "tag": "0102_tidy_thunderbolt_ross",
+      "breakpoints": true
     }
   ]
 }

@@ -84,6 +84,13 @@ export const issues = pgTable(
     parentIdx: index("issues_company_parent_idx").on(table.companyId, table.parentId),
     projectIdx: index("issues_company_project_idx").on(table.companyId, table.projectId),
     originIdx: index("issues_company_origin_idx").on(table.companyId, table.originKind, table.originId),
+    // Supports exact, cap-independent lookup of issues carrying a caller-supplied
+    // origin fingerprint (e.g. the vendor-invoice reconciler's per-cell idempotency
+    // key — eli-board ELI-972). Partial on the non-default sentinel so the index
+    // stays small: the vast majority of issues keep the 'default' fingerprint.
+    originFingerprintIdx: index("issues_company_origin_fingerprint_idx")
+      .on(table.companyId, table.originFingerprint)
+      .where(sql`${table.originFingerprint} <> 'default'`),
     projectWorkspaceIdx: index("issues_company_project_workspace_idx").on(table.companyId, table.projectWorkspaceId),
     executionWorkspaceIdx: index("issues_company_execution_workspace_idx").on(table.companyId, table.executionWorkspaceId),
     dueMonitorIdx: index("issues_company_monitor_due_idx").on(table.companyId, table.monitorNextCheckAt),
