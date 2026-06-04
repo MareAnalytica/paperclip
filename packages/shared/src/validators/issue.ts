@@ -384,6 +384,12 @@ const createIssueBaseSchema = z.object({
   assigneeUserId: z.string().optional().nullable(),
   requestDepth: issueRequestDepthInputSchema.optional().default(0),
   billingCode: z.string().optional().nullable(),
+  // Caller-supplied idempotency key, surfaced as a first-class filterable field
+  // (eli-board ELI-972). A neutral opaque string — keep it generic/portable, no
+  // company ids baked in. Stored on issues.origin_fingerprint (defaults to
+  // "default" when absent) and exact-matchable via `GET …/issues?originFingerprint=`.
+  // originKind/originId stay server-controlled to protect internal dedup indexes.
+  originFingerprint: z.string().trim().min(1).max(256).optional().nullable(),
   assigneeAdapterOverrides: issueAssigneeAdapterOverridesSchema.optional().nullable(),
   executionPolicy: issueExecutionPolicySchema.optional().nullable(),
   executionWorkspaceId: z.string().uuid().optional().nullable(),

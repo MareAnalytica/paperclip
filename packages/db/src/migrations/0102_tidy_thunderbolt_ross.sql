@@ -1,0 +1,1 @@
+CREATE INDEX "issues_company_origin_fingerprint_idx" ON "issues" USING btree ("company_id","origin_fingerprint") WHERE "issues"."origin_fingerprint" <> 'default';
