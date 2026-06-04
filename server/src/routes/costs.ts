@@ -37,6 +37,28 @@ export function parseCostDateRange(query: Record<string, unknown>) {
   return (from || to) ? { from, to } : undefined;
 }
 
+export function parseProviders(query: Record<string, unknown>): string[] | undefined {
+  const raw = Array.isArray(query.providers) ? query.providers[0] : query.providers;
+  if (raw == null || raw === "") return undefined;
+  const list = String(raw)
+    .split(",")
+    .map((p) => p.trim())
+    .filter((p) => p.length > 0);
+  return list.length > 0 ? list : undefined;
+}
+
+export function parseSampleRequestIdLimit(query: Record<string, unknown>) {
+  const raw = Array.isArray(query.sampleRequestIdLimit)
+    ? query.sampleRequestIdLimit[0]
+    : query.sampleRequestIdLimit;
+  if (raw == null || raw === "") return undefined;
+  const limit = typeof raw === "number" ? raw : Number.parseInt(String(raw), 10);
+  if (!Number.isFinite(limit) || limit <= 0 || limit > 100) {
+    throw badRequest("invalid 'sampleRequestIdLimit' value (1-100)");
+  }
+  return limit;
+}
+
 export function parseCostLimit(query: Record<string, unknown>) {
   const raw = Array.isArray(query.limit) ? query.limit[0] : query.limit;
   if (raw == null || raw === "") return 100;
@@ -208,6 +230,19 @@ export function costRoutes(
     const excludeRoot = req.query.excludeRoot === "true" || req.query.excludeRoot === "1";
     const summary = await costs.issueTreeSummary(issue.companyId, issue.id, { excludeRoot });
     res.json(summary);
+  });
+
+  // Vendor-invoice reconciliation aggregate (budgeting §6.3, ELI-969). Read-only:
+  // SUM(costMicros) + a bounded sampled cost_event id list per (provider, model,
+  // UTC day) cell. Consumed by the eli-board reconcile run driver.
+  router.get("/companies/:companyId/costs/invoice-reconcile", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    const range = parseCostDateRange(req.query);
+    const providers = parseProviders(req.query);
+    const sampleRequestIdLimit = parseSampleRequestIdLimit(req.query);
+    const cells = await costs.reconcileCells(companyId, range, { providers, sampleRequestIdLimit });
+    res.json({ cells });
   });
 
   router.get("/companies/:companyId/costs/by-agent", async (req, res) => {
