@@ -48,6 +48,7 @@ const KIND_LABEL: Record<IssueRecoveryActionKind, string> = {
   stranded_assigned_issue: "Stranded Issue",
   active_run_watchdog: "Active Watchdog",
   issue_graph_liveness: "Graph Liveness",
+  provider_unhealthy: "Provider Unhealthy",
 };
 
 const KIND_HEADLINE: Record<IssueRecoveryActionKind, string> = {
@@ -58,6 +59,8 @@ const KIND_HEADLINE: Record<IssueRecoveryActionKind, string> = {
     "The active run has been silent. Recovery is observing without interrupting it.",
   issue_graph_liveness:
     "Paperclip detected this issue lost a live action path. A recovery owner needs to act.",
+  provider_unhealthy:
+    "A provider has been unresponsive across consecutive runs with no healthy fallback. A recovery owner needs to run the adapter CLI health check or pin a healthy provider.",
 };
 
 const STATE_TONE: Record<RecoveryCardCardState, {
