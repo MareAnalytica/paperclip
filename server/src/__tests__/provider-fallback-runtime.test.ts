@@ -371,6 +371,28 @@ describe("isProviderFallbackEligibleError — auth-model-aware detection precede
     expect(isProviderFallbackEligibleError(run("claude_session_limit"), "oauth-session", MARKERS)).toBe(true);
     expect(isProviderFallbackEligibleError(run("claude_session_limit"), "oauth-session", [])).toBe(true);
   });
+
+  // ELI-1075: the org/subscription-disabled block is a permanent-per-account
+  // class (errorCode `claude_provider_disabled` / errorFamily `provider_disabled`)
+  // that previously hard-failed with no hop. It must consume the chain so the run
+  // advances to a working provider, regardless of auth model.
+  it("provider-disabled hops via errorCode and via the persisted family", () => {
+    expect(isProviderFallbackEligibleError(run("claude_provider_disabled"), "oauth-session")).toBe(true);
+    expect(isProviderFallbackEligibleError(run("claude_provider_disabled"), "raw-key")).toBe(true);
+    expect(
+      isProviderFallbackEligibleError(run("whatever", { errorFamily: "provider_disabled" }), "raw-key"),
+    ).toBe(true);
+  });
+
+  it("provider-disabled is not flipped to false by the auth gate or empty markers", () => {
+    // `claude_provider_disabled` contains neither "auth" nor "session", so it must
+    // be caught by the (1b) provider-disabled branch before the auth gate and hop
+    // even with no limit markers configured.
+    expect(isProviderFallbackEligibleError(run("claude_provider_disabled"), "raw-key", [])).toBe(true);
+    expect(
+      isProviderFallbackEligibleError(run("whatever", { errorFamily: "provider_disabled" }), "raw-key", []),
+    ).toBe(true);
+  });
 });
 
 describe("resolveFailedProviderAuthMode — threads PROVIDER_AUTH_MODES into the gate (ELI-901)", () => {

@@ -10,6 +10,19 @@ import { parseProviderResetTimestamp } from "@paperclipai/adapter-utils/provider
 const CLAUDE_AUTH_REQUIRED_RE = /(?:not\s+logged\s+in|please\s+log\s+in|please\s+run\s+`?claude\s+login`?|login\s+required|requires\s+login|unauthorized|authentication\s+required)/i;
 const URL_RE = /(https?:\/\/[^\s'"`<>()[\]{};,!?]+[^\s'"`<>()[\]{};,!.?:]+)/gi;
 
+// ELI-1075: the org/admin-level subscription block the Claude CLI surfaces when
+// an account's Claude-Code subscription access has been disabled:
+//   "Your organization has disabled Claude subscription access for Claude Code ·
+//    Use an Anthropic API key instead, or ask your admin to enable access."
+// This is a *permanent-per-account* failure (errorFamily `provider_disabled`),
+// distinct from both the transient usage-limit class (self-heals on reset) and
+// the auth-required class (a `claude login` fixes it). It will not self-heal in
+// the 60m transient window and no login flow clears it, so it must be classified
+// on its own so provider-fallback can hop to a working account. Any one of these
+// markers is sufficient; they are matched case-insensitively per-line.
+const CLAUDE_PROVIDER_DISABLED_RE =
+  /(?:disabled\s+claude\s+subscription\s+access|ask\s+your\s+admin\s+to\s+enable\s+access|use\s+an\s+anthropic\s+api\s+key\s+instead)/i;
+
 // Subscription limit wording the Claude CLI surfaces. "reached" is optional for
 // the session/weekly/5-hour variants because the CLI also prints the shorter
 // "weekly limit · resets <when>" form (ELI-864). `quota exceeded/reached` covers
@@ -286,5 +299,24 @@ export function isClaudeTransientUpstreamError(input: {
 
   const haystack = buildClaudeTransientHaystack(input);
   if (!haystack) return false;
+  // The provider-disabled block is its own permanent-per-account class — never
+  // fold it into the transient (self-healing) bucket (ELI-1075).
+  if (CLAUDE_PROVIDER_DISABLED_RE.test(haystack)) return false;
   return CLAUDE_TRANSIENT_UPSTREAM_RE.test(haystack);
+}
+
+// ELI-1075: whether the failure is the org/admin subscription-disabled block.
+// Checked *before* the auth/transient classifiers in execute.ts so it is routed
+// to its own `provider_disabled` family rather than swallowed as
+// `claude_auth_required` (no login fixes it) or `claude_transient_upstream` (it
+// does not self-heal in the transient window).
+export function isClaudeProviderDisabledError(input: {
+  parsed?: Record<string, unknown> | null;
+  stdout?: string | null;
+  stderr?: string | null;
+  errorMessage?: string | null;
+}): boolean {
+  const haystack = buildClaudeTransientHaystack(input);
+  if (!haystack) return false;
+  return CLAUDE_PROVIDER_DISABLED_RE.test(haystack);
 }

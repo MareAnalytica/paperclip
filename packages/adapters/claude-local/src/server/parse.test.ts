@@ -1,8 +1,14 @@
 import { describe, expect, it } from "vitest";
 import {
   extractClaudeRetryNotBefore,
+  isClaudeProviderDisabledError,
   isClaudeTransientUpstreamError,
 } from "./parse.js";
+
+// The exact org/subscription-disabled block the Claude CLI surfaces (ELI-1075).
+const DISABLED_SUBSCRIPTION_MESSAGE =
+  "Your organization has disabled Claude subscription access for Claude Code · " +
+  "Use an Anthropic API key instead, or ask your admin to enable access.";
 
 describe("isClaudeTransientUpstreamError", () => {
   it("classifies the 'out of extra usage' subscription window failure as transient", () => {
@@ -93,6 +99,62 @@ describe("isClaudeTransientUpstreamError", () => {
         errorMessage: "Invalid request_error: Unknown parameter 'foo'.",
       }),
     ).toBe(false);
+  });
+
+  it("does not classify the org/subscription-disabled block as transient (ELI-1075)", () => {
+    // It is permanent-per-account, not a self-healing limit — must route to the
+    // provider_disabled family instead of being swallowed as transient.
+    expect(
+      isClaudeTransientUpstreamError({ errorMessage: DISABLED_SUBSCRIPTION_MESSAGE }),
+    ).toBe(false);
+    expect(
+      isClaudeTransientUpstreamError({
+        parsed: { is_error: true, result: DISABLED_SUBSCRIPTION_MESSAGE },
+      }),
+    ).toBe(false);
+  });
+});
+
+describe("isClaudeProviderDisabledError", () => {
+  it("classifies the exact org subscription-disabled block (ELI-1075)", () => {
+    expect(
+      isClaudeProviderDisabledError({ errorMessage: DISABLED_SUBSCRIPTION_MESSAGE }),
+    ).toBe(true);
+    expect(
+      isClaudeProviderDisabledError({
+        parsed: { is_error: true, result: DISABLED_SUBSCRIPTION_MESSAGE },
+      }),
+    ).toBe(true);
+    expect(
+      isClaudeProviderDisabledError({
+        parsed: { is_error: true, errors: [{ message: DISABLED_SUBSCRIPTION_MESSAGE }] },
+      }),
+    ).toBe(true);
+  });
+
+  it("matches each documented marker independently and case-insensitively", () => {
+    expect(
+      isClaudeProviderDisabledError({ stderr: "ask your admin to enable access" }),
+    ).toBe(true);
+    expect(
+      isClaudeProviderDisabledError({ stderr: "Use an Anthropic API key instead" }),
+    ).toBe(true);
+    expect(
+      isClaudeProviderDisabledError({
+        errorMessage: "ORG HAS DISABLED CLAUDE SUBSCRIPTION ACCESS",
+      }),
+    ).toBe(true);
+  });
+
+  it("does not fire on rate-limit, login, or generic failures (no bucket bleed)", () => {
+    expect(
+      isClaudeProviderDisabledError({ errorMessage: "Claude usage limit reached — weekly limit reached." }),
+    ).toBe(false);
+    expect(
+      isClaudeProviderDisabledError({ stderr: "Please log in. Run `claude login` first." }),
+    ).toBe(false);
+    expect(isClaudeProviderDisabledError({ errorMessage: "HTTP 429: Too Many Requests" })).toBe(false);
+    expect(isClaudeProviderDisabledError({})).toBe(false);
   });
 });
 
