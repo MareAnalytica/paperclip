@@ -83,6 +83,17 @@ export const PROVIDER_FALLBACK_RETRY_AFTER_MINUTES_MIN = 1;
 export const PROVIDER_FALLBACK_RETRY_AFTER_MINUTES_MAX = 1440;
 export const PROVIDER_FALLBACK_RETRY_AFTER_MINUTES_DEFAULT = 60;
 
+// ELI-1076 (follow-up to ELI-1075): the dedicated `provider_disabled` cooldown
+// window, in minutes. The org/subscription-disabled block is permanent-per-account
+// — it self-heals only when an admin re-enables access — so the dead account is
+// parked far longer than the transient ~60m back-off to stop a fresh root run
+// re-probing + re-parking it every cycle. The default (24h) re-probes the account
+// once a day (a bounded "until-cleared" approximation) instead of hourly; the max
+// (14 days) bounds the worst-case staleness after access is restored.
+export const PROVIDER_FALLBACK_DISABLED_COOLDOWN_MINUTES_MIN = 1;
+export const PROVIDER_FALLBACK_DISABLED_COOLDOWN_MINUTES_MAX = 20_160; // 14 days
+export const PROVIDER_FALLBACK_DISABLED_COOLDOWN_MINUTES_DEFAULT = 1_440; // 24h
+
 // Spec §2.1 default `limitDetection.limitMarkers` list. These are the engine's
 // advisory safety-net markers (ELI-902 / G2): case-insensitive substrings tested
 // against an adapter failure message/status *only when* the active adapter
@@ -109,10 +120,15 @@ export interface ProviderFallbackAccountCooldown {
   // new root runs skip providers still cooling down (ticket ELI-855). Set false
   // to fall back to legacy behaviour (every root run starts on the primary).
   enabled: boolean;
+  // ELI-1076: the dedicated park window (minutes) for a `provider_disabled`
+  // org/subscription-disabled block — a permanent-per-account class that does not
+  // self-heal on the transient `retryAfterMinutesDefault` timer. Defaults to 24h.
+  providerDisabledCooldownMinutes: number;
 }
 
 const DEFAULT_ACCOUNT_COOLDOWN: ProviderFallbackAccountCooldown = {
   enabled: true,
+  providerDisabledCooldownMinutes: PROVIDER_FALLBACK_DISABLED_COOLDOWN_MINUTES_DEFAULT,
 };
 
 // Provider-health fail-fast + recovery loop-breaker policy (blueprint spec
@@ -456,7 +472,14 @@ function parseAccountCooldown(accountCooldown: unknown): ProviderFallbackAccount
   }
   const o = accountCooldown as Record<string, unknown>;
   const enabled = o.enabled === undefined ? DEFAULT_ACCOUNT_COOLDOWN.enabled : Boolean(o.enabled);
-  return { enabled };
+  const providerDisabledCooldownMinutes = parseBoundedInteger(
+    o.providerDisabledCooldownMinutes,
+    PROVIDER_FALLBACK_DISABLED_COOLDOWN_MINUTES_MIN,
+    PROVIDER_FALLBACK_DISABLED_COOLDOWN_MINUTES_MAX,
+    DEFAULT_ACCOUNT_COOLDOWN.providerDisabledCooldownMinutes,
+    "providerFallback.accountCooldown.providerDisabledCooldownMinutes",
+  );
+  return { enabled, providerDisabledCooldownMinutes };
 }
 
 // Validate an optional bounded integer field. `undefined`/`null` ⇒ `fallback`.

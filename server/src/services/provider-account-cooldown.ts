@@ -24,7 +24,17 @@ export type ProviderCooldownSource =
   // A `provider_unresponsive` health demerit (ELI-952 / spec §3.2): a no-output
   // adapter hang cooled the provider down for `providerHealth.cooldownMs` so the
   // next root run skips it. Distinct provenance from a usage-limit cooldown.
-  | "provider_unresponsive";
+  | "provider_unresponsive"
+  // A `provider_disabled` org/subscription-disabled block (ELI-1076, follow-up to
+  // ELI-1075). Unlike a usage limit, this failure is permanent-per-account: it
+  // does not self-heal on a timer and clears only when an admin re-enables
+  // subscription access. We park the dead account for a long, dedicated window
+  // (`providerDisabledCooldownMinutes`) instead of re-probing it every transient
+  // `retryAfterMinutesDefault` (~60m), which would burn one hop + re-park each
+  // cycle. The window still self-expires (DB readers filter on `cooldown_until`),
+  // so the account re-probes once per long window — a bounded "until-cleared"
+  // approximation that needs no separate clear marker.
+  | "provider_disabled";
 
 // Structural shape of a fallback chain entry — kept local so this module does
 // not depend on heartbeat.ts internals.
@@ -50,8 +60,21 @@ export interface ProviderCooldownRecord {
 /**
  * Decide the cooldown to record for a provider that just failed with a limit
  * error (acceptance #1). When the provider supplied an explicit reset we honour
- * it; otherwise we back off by the configured `retryAfterMinutesDefault`. The
- * computed window is never in the past.
+ * it; otherwise we back off by the configured window. The computed window is
+ * never in the past.
+ *
+ * Window selection (highest precedence first):
+ *  1. An explicit provider-supplied reset in the future → honour it verbatim
+ *     (`provider_header`). A `provider_disabled` block never carries one, so this
+ *     branch is a no-op for it in practice, but a future reset always wins.
+ *  2. `errorFamily === "provider_disabled"` (ELI-1076) → the dedicated long
+ *     `providerDisabledCooldownMinutes` window (`provider_disabled`). This class
+ *     is permanent-per-account (an admin must re-enable access); the long window
+ *     stops a fresh root run from re-probing + re-parking the dead account every
+ *     transient ~60m. A bounded "until-cleared" approximation: the window still
+ *     self-expires, so the account simply re-probes once per long window.
+ *  3. Otherwise → the transient `retryAfterMinutesDefault` back-off
+ *     (`retryAfterMinutesDefault`), unchanged from ELI-855.
  */
 export function computeProviderCooldownRecord(input: {
   providerId: string | null;
@@ -60,6 +83,14 @@ export function computeProviderCooldownRecord(input: {
   failedProviderReset: Date | null;
   now: Date;
   retryAfterMinutesDefault: number;
+  // The classified failure family for this run (ELI-1076). Only
+  // `"provider_disabled"` changes the window; any other value (incl. null,
+  // `"transient_upstream"`, etc.) keeps the transient default — regression-safe.
+  errorFamily?: string | null;
+  // The dedicated long window (minutes) for the `provider_disabled` class.
+  // Omitted/non-positive ⇒ falls back to the transient default, so a caller that
+  // does not yet supply it never gets a shorter-than-default window.
+  providerDisabledCooldownMinutes?: number;
 }): ProviderCooldownRecord | null {
   const providerId = input.providerId?.trim();
   if (!providerId) return null;
@@ -74,15 +105,32 @@ export function computeProviderCooldownRecord(input: {
     };
   }
 
-  const minutes =
+  const transientMinutes =
     Number.isFinite(input.retryAfterMinutesDefault) && input.retryAfterMinutesDefault > 0
       ? input.retryAfterMinutesDefault
       : 60;
+
+  if (input.errorFamily === "provider_disabled") {
+    const disabledMinutes =
+      typeof input.providerDisabledCooldownMinutes === "number" &&
+      Number.isFinite(input.providerDisabledCooldownMinutes) &&
+      input.providerDisabledCooldownMinutes > 0
+        ? input.providerDisabledCooldownMinutes
+        : transientMinutes;
+    return {
+      providerId,
+      adapterType: input.adapterType,
+      account: input.account,
+      cooldownUntil: new Date(input.now.getTime() + disabledMinutes * 60_000),
+      source: "provider_disabled",
+    };
+  }
+
   return {
     providerId,
     adapterType: input.adapterType,
     account: input.account,
-    cooldownUntil: new Date(input.now.getTime() + minutes * 60_000),
+    cooldownUntil: new Date(input.now.getTime() + transientMinutes * 60_000),
     source: "retryAfterMinutesDefault",
   };
 }

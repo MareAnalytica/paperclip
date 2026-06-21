@@ -6200,6 +6200,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const accountCooldown = resolveProviderFallbackAccountCooldown(run.companyId);
       if (accountCooldown.enabled) {
         const failedEntry = findProviderFallbackEntry(providerFallbackChain, failedProviderId);
+        // ELI-1076: a `provider_disabled` block is permanent-per-account, so it
+        // parks on the dedicated long window instead of the transient ~60m
+        // back-off that a self-healing usage limit uses.
+        const failedErrorFamily = readHeartbeatRunErrorFamily(run);
         const cooldownRecord = computeProviderCooldownRecord({
           providerId: failedProviderId,
           adapterType: failedEntry?.adapter ?? agent.adapterType,
@@ -6208,13 +6212,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           now,
           retryAfterMinutesDefault: resolveProviderFallbackEscalation(run.companyId)
             .retryAfterMinutesDefault,
+          errorFamily: failedErrorFamily,
+          providerDisabledCooldownMinutes: accountCooldown.providerDisabledCooldownMinutes,
         });
         if (cooldownRecord) {
           try {
             await upsertProviderAccountCooldown(db, {
               ...cooldownRecord,
               companyId: run.companyId,
-              reason: "provider_fallback_limit",
+              reason:
+                cooldownRecord.source === "provider_disabled"
+                  ? "provider_disabled"
+                  : "provider_fallback_limit",
               lastRunId: run.id,
               lastIssueId: readNonEmptyString(parseObject(run.contextSnapshot).issueId),
               now,

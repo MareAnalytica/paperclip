@@ -370,7 +370,11 @@ providerFallback:
         schemaVersion: "1",
         providerFallback: { default: { chain: [{ id: "codex-local", adapter: "codex_local" }] } },
       });
-      expect(def.accountCooldown).toEqual({ enabled: true });
+      // ELI-1076: the long provider_disabled window defaults to 24h alongside enabled.
+      expect(def.accountCooldown).toEqual({
+        enabled: true,
+        providerDisabledCooldownMinutes: 1440,
+      });
 
       const off = parseProviderFallbackPolicy({
         schemaVersion: "1",
@@ -379,7 +383,45 @@ providerFallback:
           accountCooldown: { enabled: false },
         },
       });
-      expect(off.accountCooldown).toEqual({ enabled: false });
+      expect(off.accountCooldown).toEqual({
+        enabled: false,
+        providerDisabledCooldownMinutes: 1440,
+      });
+    });
+
+    it("parses an explicit accountCooldown.providerDisabledCooldownMinutes (ELI-1076)", () => {
+      const resolved = parseProviderFallbackPolicy({
+        schemaVersion: "1",
+        providerFallback: {
+          default: { chain: [{ id: "codex-local", adapter: "codex_local" }] },
+          accountCooldown: { providerDisabledCooldownMinutes: 4320 },
+        },
+      });
+      expect(resolved.accountCooldown).toEqual({
+        enabled: true,
+        providerDisabledCooldownMinutes: 4320,
+      });
+    });
+
+    it("rejects an out-of-range providerDisabledCooldownMinutes (ELI-1076)", () => {
+      expect(() =>
+        parseProviderFallbackPolicy({
+          schemaVersion: "1",
+          providerFallback: {
+            default: { chain: [{ id: "codex-local", adapter: "codex_local" }] },
+            accountCooldown: { providerDisabledCooldownMinutes: 0 },
+          },
+        }),
+      ).toThrow(/providerDisabledCooldownMinutes must be an integer/);
+      expect(() =>
+        parseProviderFallbackPolicy({
+          schemaVersion: "1",
+          providerFallback: {
+            default: { chain: [{ id: "codex-local", adapter: "codex_local" }] },
+            accountCooldown: { providerDisabledCooldownMinutes: 20_161 },
+          },
+        }),
+      ).toThrow(/providerDisabledCooldownMinutes must be an integer/);
     });
 
     it("rejects an out-of-range retryAfterMinutesDefault", () => {

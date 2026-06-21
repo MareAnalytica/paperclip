@@ -77,6 +77,74 @@ describe("computeProviderCooldownRecord", () => {
       }),
     ).toBeNull();
   });
+
+  // ELI-1076 — a `provider_disabled` block (no reset) parks on the dedicated long
+  // window, NOT the transient retryAfterMinutesDefault.
+  it("uses the dedicated provider_disabled window for a provider_disabled failure", () => {
+    const record = computeProviderCooldownRecord({
+      providerId: "claude-code-personal",
+      adapterType: "claude_local",
+      account: "personal",
+      failedProviderReset: null,
+      now: NOW,
+      retryAfterMinutesDefault: 60,
+      errorFamily: "provider_disabled",
+      providerDisabledCooldownMinutes: 1440,
+    });
+    expect(record?.source).toBe("provider_disabled");
+    expect(record?.cooldownUntil).toEqual(new Date(NOW.getTime() + 1440 * 60_000));
+  });
+
+  // Regression — a transient/limit failure is unchanged even when the long window
+  // is supplied: only the provider_disabled family selects it.
+  it("keeps the transient default window for a non-disabled family", () => {
+    const record = computeProviderCooldownRecord({
+      providerId: "claude-code-personal",
+      adapterType: "claude_local",
+      account: "personal",
+      failedProviderReset: null,
+      now: NOW,
+      retryAfterMinutesDefault: 60,
+      errorFamily: "transient_upstream",
+      providerDisabledCooldownMinutes: 1440,
+    });
+    expect(record?.source).toBe("retryAfterMinutesDefault");
+    expect(record?.cooldownUntil).toEqual(new Date(NOW.getTime() + 60 * 60_000));
+  });
+
+  // An explicit provider-supplied reset still wins over the disabled window — the
+  // header reset is the most authoritative signal regardless of family.
+  it("honours an explicit future reset over the provider_disabled window", () => {
+    const reset = new Date(NOW.getTime() + 15 * 60_000);
+    const record = computeProviderCooldownRecord({
+      providerId: "claude-code-personal",
+      adapterType: "claude_local",
+      account: "personal",
+      failedProviderReset: reset,
+      now: NOW,
+      retryAfterMinutesDefault: 60,
+      errorFamily: "provider_disabled",
+      providerDisabledCooldownMinutes: 1440,
+    });
+    expect(record?.source).toBe("provider_header");
+    expect(record?.cooldownUntil).toEqual(reset);
+  });
+
+  // Defensive — a provider_disabled family without a configured long window falls
+  // back to the transient default rather than yielding a shorter/zero window.
+  it("falls back to the transient default when no disabled window is configured", () => {
+    const record = computeProviderCooldownRecord({
+      providerId: "claude-code-personal",
+      adapterType: "claude_local",
+      account: "personal",
+      failedProviderReset: null,
+      now: NOW,
+      retryAfterMinutesDefault: 60,
+      errorFamily: "provider_disabled",
+    });
+    expect(record?.source).toBe("provider_disabled");
+    expect(record?.cooldownUntil).toEqual(new Date(NOW.getTime() + 60 * 60_000));
+  });
 });
 
 // ELI-864 end-to-end: a real provider limit message is parsed to its reset
