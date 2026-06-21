@@ -54,6 +54,7 @@ import {
   extractClaudeRetryNotBefore,
   isClaudeAuthClassFailure,
   isClaudeMaxTurnsResult,
+  isClaudeProviderDisabledError,
   isClaudeTransientUpstreamError,
   isClaudeUnknownSessionError,
 } from "./parse.js";
@@ -827,7 +828,19 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
     if (!parsed) {
       const fallbackErrorMessage = parseFallbackErrorMessage(proc);
+      // ELI-1075: the org/subscription-disabled block is checked before the
+      // transient classifier so it is never swallowed as transient/auth — it is
+      // a permanent-per-account failure with its own `provider_disabled` family.
+      const providerDisabled =
+        (proc.exitCode ?? 0) !== 0 &&
+        isClaudeProviderDisabledError({
+          parsed: null,
+          stdout: proc.stdout,
+          stderr: proc.stderr,
+          errorMessage: fallbackErrorMessage,
+        });
       const transientUpstream =
+        !providerDisabled &&
         !loginMeta.requiresLogin &&
         (proc.exitCode ?? 0) !== 0 &&
         isClaudeTransientUpstreamError({
@@ -844,10 +857,17 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             errorMessage: fallbackErrorMessage,
           })
         : null;
-      const errorCode = loginMeta.requiresLogin
+      const errorCode = providerDisabled
+        ? "claude_provider_disabled"
+        : loginMeta.requiresLogin
         ? "claude_auth_required"
         : transientUpstream
         ? "claude_transient_upstream"
+        : null;
+      const errorFamily = providerDisabled
+        ? "provider_disabled"
+        : transientUpstream
+        ? "transient_upstream"
         : null;
       return {
         exitCode: proc.exitCode,
@@ -855,13 +875,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         timedOut: false,
         errorMessage: fallbackErrorMessage,
         errorCode,
-        errorFamily: transientUpstream ? "transient_upstream" : null,
+        errorFamily,
         retryNotBefore: transientRetryNotBefore ? transientRetryNotBefore.toISOString() : null,
         errorMeta,
         resultJson: {
           stdout: proc.stdout,
           stderr: proc.stderr,
-          ...(transientUpstream ? { errorFamily: "transient_upstream" } : {}),
+          ...(errorFamily ? { errorFamily } : {}),
           ...(transientRetryNotBefore
             ? { retryNotBefore: transientRetryNotBefore.toISOString() }
             : {}),
@@ -909,8 +929,21 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const errorMessage = failed
       ? describeClaudeFailure(parsed) ?? `Claude exited with code ${proc.exitCode ?? -1}`
       : null;
+    // ELI-1075: classify the org/subscription-disabled block before transient —
+    // it is permanent-per-account (`provider_disabled`), not a self-healing
+    // limit, and must not be swallowed as transient/auth.
+    const providerDisabled =
+      failed &&
+      !clearSessionForMaxTurns &&
+      isClaudeProviderDisabledError({
+        parsed,
+        stdout: proc.stdout,
+        stderr: proc.stderr,
+        errorMessage,
+      });
     const transientUpstream =
       failed &&
+      !providerDisabled &&
       !loginMeta.requiresLogin &&
       !clearSessionForMaxTurns &&
       isClaudeTransientUpstreamError({
@@ -927,17 +960,24 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           errorMessage,
         })
       : null;
-    const resolvedErrorCode = loginMeta.requiresLogin
+    const resolvedErrorCode = providerDisabled
+      ? "claude_provider_disabled"
+      : loginMeta.requiresLogin
       ? "claude_auth_required"
       : failed && clearSessionForMaxTurns
       ? "max_turns_exhausted"
       : transientUpstream
       ? "claude_transient_upstream"
       : null;
+    const resolvedErrorFamily = providerDisabled
+      ? "provider_disabled"
+      : transientUpstream
+      ? "transient_upstream"
+      : null;
     const mergedResultJson: Record<string, unknown> = {
       ...parsed,
       ...(failed && clearSessionForMaxTurns ? { stopReason: "max_turns_exhausted" } : {}),
-      ...(transientUpstream ? { errorFamily: "transient_upstream" } : {}),
+      ...(resolvedErrorFamily ? { errorFamily: resolvedErrorFamily } : {}),
       ...(transientRetryNotBefore ? { retryNotBefore: transientRetryNotBefore.toISOString() } : {}),
       ...(transientRetryNotBefore ? { transientRetryNotBefore: transientRetryNotBefore.toISOString() } : {}),
     };
@@ -948,7 +988,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       timedOut: false,
       errorMessage,
       errorCode: resolvedErrorCode,
-      errorFamily: transientUpstream ? "transient_upstream" : null,
+      errorFamily: resolvedErrorFamily,
       retryNotBefore: transientRetryNotBefore ? transientRetryNotBefore.toISOString() : null,
       errorMeta,
       usage,

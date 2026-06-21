@@ -64,7 +64,11 @@ export interface AdapterRuntimeServiceReport {
   healthStatus?: "unknown" | "healthy" | "unhealthy";
 }
 
-export type AdapterExecutionErrorFamily = "transient_upstream";
+// `transient_upstream` — a self-healing usage/rate limit that retries on reset.
+// `provider_disabled` — an org/subscription-disabled block (ELI-1075): a
+// permanent-per-account failure that is provider-fallback-eligible (hop to a
+// working provider) but does NOT self-heal in the transient retry window.
+export type AdapterExecutionErrorFamily = "transient_upstream" | "provider_disabled";
 
 export interface AdapterExecutionResult {
   exitCode: number | null;

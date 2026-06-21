@@ -329,6 +329,12 @@ function readHeartbeatRunErrorFamily(
   if (run.errorCode === "codex_transient_upstream" || run.errorCode === "claude_transient_upstream") {
     return "transient_upstream";
   }
+  // ELI-1075: the org/subscription-disabled block is a permanent-per-account
+  // class with its own family. Map the errorCode back to the family so a
+  // persisted run whose resultJson dropped `errorFamily` still classifies.
+  if (run.errorCode === "claude_provider_disabled") {
+    return "provider_disabled";
+  }
   return null;
 }
 
@@ -454,9 +460,15 @@ export function isProviderFallbackEligibleError(
   opts: { onFallbackHop?: boolean } = {},
 ) {
   const errorCode = readNonEmptyString(run.errorCode);
+  const errorFamily = readHeartbeatRunErrorFamily(run);
   // (1) Native usage-limit class — always hops, before the auth gate.
-  if (readHeartbeatRunErrorFamily(run) === "transient_upstream") return true;
+  if (errorFamily === "transient_upstream") return true;
   if (errorCode === "claude_usage_limit") return true;
+  // (1b) Provider-disabled class (ELI-1075): the org/subscription-disabled block
+  // is permanent-per-account, not a self-healing limit and not fixable by a
+  // login. It must still hop the chain to a working provider. Tested before the
+  // auth/transient buckets so it is never swallowed as `claude_auth_required`.
+  if (errorFamily === "provider_disabled" || errorCode === "claude_provider_disabled") return true;
   // (2) Native auth classification — short-circuits on the auth model.
   if (errorCode && (errorCode.includes("auth") || errorCode.includes("session"))) {
     return authMode !== "raw-key";
