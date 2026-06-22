@@ -89,6 +89,20 @@ RUN npm install --global --omit=dev @anthropic-ai/claude-code@latest
 RUN npm install --global --omit=dev @openai/codex@latest
 RUN npm install --global --omit=dev opencode-ai
 
+# grok_local CLI in its own layer (~125 MB), checksum-verified — DEE-745 / DEE-707.
+# Bake the pinned build into the image so a fresh HOME PVC or a new tenant can never
+# silently (re)install a drifting grok via its internal updater. The runtime adapter
+# resolves `grok` from PATH (server/src/adapters/registry.ts: installCommand=null), so a
+# baked /usr/local/bin/grok is the only install path and can no longer re-skew the
+# --output-format vocabulary (root cause: DEE-707; dev-only PVC pin: DEE-709).
+# Pinned to grok 0.2.13 (3509a8da4). Upstream publishes no checksum file, so we pin the
+# exact bytes verified against the DEE-709 build. amd64-only, matching the kubectl line.
+ARG GROK_VERSION=0.2.13
+ARG GROK_SHA256=f82449fabe188d7fe4cd43e35fab3cd464684d8b1a34f6e3fa05fd414c430edc
+RUN curl -fsSL "https://storage.googleapis.com/grok-build-public-artifacts/cli/grok-${GROK_VERSION}-linux-x86_64" -o /usr/local/bin/grok \
+  && echo "${GROK_SHA256}  /usr/local/bin/grok" | sha256sum -c - \
+  && chmod +x /usr/local/bin/grok
+
 COPY scripts/docker-entrypoint.sh /usr/local/bin/
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
@@ -104,7 +118,8 @@ ENV NODE_ENV=production \
   PAPERCLIP_CONFIG=/paperclip/instances/default/config.json \
   PAPERCLIP_DEPLOYMENT_MODE=authenticated \
   PAPERCLIP_DEPLOYMENT_EXPOSURE=private \
-  OPENCODE_ALLOW_ALL_MODELS=true
+  OPENCODE_ALLOW_ALL_MODELS=true \
+  GROK_DISABLE_UPDATE_CHECK=1
 
 VOLUME ["/paperclip"]
 EXPOSE 3100
