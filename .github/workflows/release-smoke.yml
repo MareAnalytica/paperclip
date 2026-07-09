@@ -58,9 +58,6 @@ jobs:
       - name: Install dependencies
         run: pnpm install --no-frozen-lockfile
 
-      - name: Install Playwright browser
-        run: npx playwright install --with-deps chromium
-
       - name: Launch Docker smoke harness
         run: |
           metadata_file="$RUNNER_TEMP/release-smoke.env"
