@@ -36,6 +36,9 @@ const ACTIVE_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const MAX_CANDIDATE_ISSUES = 250;
 const MAX_RUNS_FOR_STREAK = 100;
 const MAX_PARENT_WALK_DEPTH = 25;
+// DEE-432: buffer around a run's wall-clock window when matching assignee-authored
+// comments that were not stamped with X-Paperclip-Run-Id (createdByRunId is null).
+const RUN_COMMENT_WINDOW_BUFFER_MS = 2 * 60 * 1000;
 export const PRODUCTIVITY_REVIEW_REFRESH_COMMENT_PREFIX = "Productivity review evidence refreshed.";
 
 type IssueRow = typeof issues.$inferSelect;
@@ -274,7 +277,10 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
           eq(issues.companyId, companyId),
           eq(issues.originKind, PRODUCTIVITY_REVIEW_ORIGIN_KIND),
           eq(issues.originId, sourceIssueId),
-          eq(issues.status, "done"),
+          // DEE-432: snooze after a review is resolved as done OR cancelled. The
+          // supervisor loop spawned 90+ reviews because false positives auto-closed
+          // as `cancelled` were not treated as a recent resolution.
+          inArray(issues.status, ["done", "cancelled"]),
           gt(issues.updatedAt, cutoff),
         ),
       )
@@ -420,12 +426,59 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       }
     }
 
+    // DEE-432: widen the streak heuristic beyond runId-tagged comments. Several
+    // comment-post paths (the DM helper, the CEO PATCH-with-`comment` path) do not
+    // propagate X-Paperclip-Run-Id to issueComments.createdByRunId, so a productive
+    // run with untagged comments would otherwise read as silent and spawn a
+    // false-positive productivity review. Also break the streak when the assignee
+    // authored any comment that falls within a terminal run's wall-clock window
+    // [startedAt, finishedAt] (+/- a small buffer), regardless of createdByRunId.
+    const earliestRunStart = latestRuns.reduce<Date | null>((earliest, run) => {
+      const start = coerceDate(run.startedAt) ?? coerceDate(run.createdAt);
+      if (!start) return earliest;
+      return !earliest || start < earliest ? start : earliest;
+    }, null);
+    const authoredCommentTimes: Date[] = [];
+    if (latestRuns.length > 0) {
+      const authoredRows = await db
+        .select({ createdAt: issueComments.createdAt })
+        .from(issueComments)
+        .where(
+          and(
+            eq(issueComments.companyId, sourceIssue.companyId),
+            eq(issueComments.issueId, sourceIssue.id),
+            eq(issueComments.authorAgentId, sourceAgent.id),
+            earliestRunStart
+              ? sql`${issueComments.createdAt} >= ${new Date(
+                  earliestRunStart.getTime() - RUN_COMMENT_WINDOW_BUFFER_MS,
+                ).toISOString()}::timestamptz`
+              : undefined,
+          ),
+        );
+      for (const row of authoredRows) {
+        const at = coerceDate(row.createdAt);
+        if (at) authoredCommentTimes.push(at);
+      }
+    }
+
+    const runHasAuthorComment = (run: HeartbeatRunRow) => {
+      const start = coerceDate(run.startedAt) ?? coerceDate(run.createdAt);
+      if (!start) return false;
+      const end = coerceDate(run.finishedAt) ?? coerceDate(run.updatedAt) ?? start;
+      const lower = start.getTime() - RUN_COMMENT_WINDOW_BUFFER_MS;
+      const upper = end.getTime() + RUN_COMMENT_WINDOW_BUFFER_MS;
+      return authoredCommentTimes.some((at) => {
+        const t = at.getTime();
+        return t >= lower && t <= upper;
+      });
+    };
+
     const terminalRuns = latestRuns.filter((run) =>
       TERMINAL_RUN_STATUSES.includes(run.status as (typeof TERMINAL_RUN_STATUSES)[number]),
     );
     let noCommentStreak = 0;
     for (const run of terminalRuns) {
-      if (commentRunIds.has(run.id)) break;
+      if (commentRunIds.has(run.id) || runHasAuthorComment(run)) break;
       noCommentStreak += 1;
     }
 
