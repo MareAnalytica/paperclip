@@ -1,0 +1,341 @@
+// Server-side mirror of the eli-board blueprint's vendor-invoice reconciler
+// (budgeting policy §6.3, src/budgeting/reconciler.ts in the blueprint).
+//
+// The blueprint owns the canonical, unit-tested diff/parse logic; this module is
+// the @paperclipai/shared copy so the Paperclip server (the route + routine that
+// binds it to the DB and issue creation) can reuse it without importing the
+// blueprint repo. Mirrored faithfully — keep it byte-for-byte equivalent in
+// behaviour to the blueprint, same as audit-sink-guard / ceo-flow-policy. If you
+// change the math here, change it in the blueprint too (and vice-versa); the
+// invoice-reconcile.test.ts vectors are shared with the blueprint suite.
+//
+// This module is PURE: the caller supplies the parsed invoice lines and the
+// pre-aggregated cost_events cells, and turns the returned subtasks into real
+// issues. Keeping the diff side-effect-free makes it testable without a DB.
+
+const MICROS_PER_UNIT = 1_000_000;
+const DEFAULT_SAMPLE_REQUEST_IDS = 10;
+const DAY_MS = 24 * 60 * 60 * 1000;
+const DAY_RE = /^\d{4}-\d{2}-\d{2}$/;
+const INVOICE_VARIANCE_DEFAULT_PERCENT = 3;
+
+/** The `governance/billing` billing code every reconciliation subtask carries. */
+export const BILLING_REVIEW_CODE = "governance/billing";
+
+/** One normalized vendor-invoice line. Amounts are micro-units of currency. */
+export interface InvoiceLine {
+  provider: string;
+  model: string;
+  /** Calendar day the charge belongs to, `YYYY-MM-DD` (UTC). */
+  day: string;
+  /** Vendor-invoiced amount for this line, in micro-units (1 USD = 1e6). */
+  amountMicros: number;
+  /** Vendor request id, when the invoice itemizes per request. */
+  requestId?: string | null;
+}
+
+/**
+ * Pre-aggregated `cost_events` for one `(provider, model, day)` cell — the
+ * "expected" side of the diff. Produced server-side by
+ * `SUM(cost_micros) ... GROUP BY provider, model, date_trunc('day', occurred_at)`.
+ */
+export interface CostEventsCell {
+  provider: string;
+  model: string;
+  /** `YYYY-MM-DD` (UTC), matching the invoice grouping. */
+  day: string;
+  expectedMicros: number;
+  /** Contributing request ids (a bounded server-side sample is fine). */
+  requestIds?: string[];
+}
+
+export interface ReconcileOptions {
+  /** Variance threshold %. Defaults to `pricebook.invoiceVariancePercent`. */
+  thresholdPercent?: number;
+  /** Day-lock delay hours. Defaults to `pricebook.invoiceDayLockDelayHours`. */
+  dayLockDelayHours?: number;
+  /** Reconciliation clock (injected for determinism/testing). */
+  now: Date | number;
+  /** Max `requestId`s sampled into each subtask. Default 10. */
+  sampleRequestIdLimit?: number;
+  /** Currency label used in subtask bodies (e.g. "USD"). Default "USD". */
+  currency?: string;
+  /**
+   * Pricebook defaults for threshold + day-lock when not overridden per-call.
+   * Mirrors the blueprint's `Pricebook` parameter; only the two fields the
+   * reconciler reads are required here.
+   */
+  pricebook?: { invoiceVariancePercent?: number; invoiceDayLockDelayHours?: number; currency?: string };
+}
+
+/** A `(provider, model, day)` cell after diffing invoice vs. cost_events. */
+export interface ReconcileCell {
+  provider: string;
+  model: string;
+  day: string;
+  expectedMicros: number;
+  observedMicros: number;
+  variancePercent: number;
+  thresholdPercent: number;
+  overThreshold: boolean;
+  sampleRequestIds: string[];
+}
+
+/** A ready-to-create `governance/billing` review issue for an over-threshold cell. */
+export interface BillingReviewSubtask {
+  billingCode: typeof BILLING_REVIEW_CODE;
+  title: string;
+  body: string;
+  cell: { provider: string; model: string; day: string };
+  expectedMicros: number;
+  observedMicros: number;
+  variancePercent: number;
+  thresholdPercent: number;
+  sampleRequestIds: string[];
+}
+
+export interface ReconcileResult {
+  /** Over-threshold, day-locked cells → emit these as review subtasks. */
+  subtasks: BillingReviewSubtask[];
+  /** Locked cells whose variance was within threshold (audit / report). */
+  withinThreshold: ReconcileCell[];
+  /** Cells whose day is not yet locked — deferred to a later run, never emitted. */
+  deferred: ReconcileCell[];
+}
+
+export interface InvoiceVariance {
+  expectedMicros: number;
+  observedMicros: number;
+  variancePercent: number;
+  thresholdPercent: number;
+  overThreshold: boolean;
+}
+
+export class InvoiceReconcileError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "InvoiceReconcileError";
+  }
+}
+
+/**
+ * Absolute percent variance of observed vs. expected micros (mirror of the
+ * blueprint pricebook helper). 0 when both are 0; Infinity when expected is 0
+ * but observed is not (no baseline → always alert).
+ */
+export function invoiceVariance(
+  expectedMicros: number,
+  observedMicros: number,
+  thresholdPercent: number = INVOICE_VARIANCE_DEFAULT_PERCENT,
+): InvoiceVariance {
+  let variancePercent: number;
+  if (expectedMicros === 0) {
+    variancePercent = observedMicros === 0 ? 0 : Infinity;
+  } else {
+    variancePercent = (Math.abs(observedMicros - expectedMicros) / Math.abs(expectedMicros)) * 100;
+  }
+  return {
+    expectedMicros,
+    observedMicros,
+    variancePercent,
+    thresholdPercent,
+    overThreshold: variancePercent > thresholdPercent,
+  };
+}
+
+/** Convert a decimal amount in the major currency unit (e.g. USD) to micros. */
+export function amountToMicros(amount: number): number {
+  if (!Number.isFinite(amount)) {
+    throw new InvoiceReconcileError(`invoice amount is not finite: ${amount}`);
+  }
+  return Math.round(amount * MICROS_PER_UNIT);
+}
+
+function cellKey(provider: string, model: string, day: string): string {
+  // Escaped separator (not a raw NUL) so any serialized form of this key stays
+  // plain-text and diffable — see the blueprint's PR #205 NUL-byte fix.
+  return `${provider}\u0000${model}\u0000${day}`;
+}
+
+function assertDay(day: string, where: string): void {
+  if (!DAY_RE.test(day)) {
+    throw new InvoiceReconcileError(
+      `${where} day must be YYYY-MM-DD (UTC), got ${JSON.stringify(day)}`,
+    );
+  }
+}
+
+/** True once `now` is at least `delayHours` past the END of `day` (UTC). */
+export function isDayLocked(day: string, now: Date | number, delayHours: number): boolean {
+  assertDay(day, "isDayLocked");
+  const dayStartMs = Date.parse(`${day}T00:00:00Z`);
+  if (Number.isNaN(dayStartMs)) {
+    throw new InvoiceReconcileError(`isDayLocked could not parse day ${JSON.stringify(day)}`);
+  }
+  const dayEndMs = dayStartMs + DAY_MS;
+  const nowMs = now instanceof Date ? now.getTime() : now;
+  return nowMs >= dayEndMs + delayHours * 60 * 60 * 1000;
+}
+
+/**
+ * Diff parsed invoice lines against pre-aggregated `cost_events` cells and
+ * return the over-threshold review subtasks (plus the within-threshold and
+ * day-deferred cells for reporting). Threshold and day-lock delay default to the
+ * supplied pricebook values but can be overridden per call.
+ */
+export function reconcileInvoice(
+  invoiceLines: InvoiceLine[],
+  costEvents: CostEventsCell[],
+  options: ReconcileOptions,
+): ReconcileResult {
+  const thresholdPercent =
+    options.thresholdPercent ??
+    options.pricebook?.invoiceVariancePercent ??
+    INVOICE_VARIANCE_DEFAULT_PERCENT;
+  const dayLockDelayHours =
+    options.dayLockDelayHours ?? options.pricebook?.invoiceDayLockDelayHours ?? 48;
+  const sampleLimit = options.sampleRequestIdLimit ?? DEFAULT_SAMPLE_REQUEST_IDS;
+  const currency = options.currency ?? options.pricebook?.currency ?? "USD";
+  const now = options.now;
+
+  // Group the invoice (observed) side, accumulating per-line request ids.
+  const observed = new Map<
+    string,
+    { provider: string; model: string; day: string; micros: number; requestIds: string[] }
+  >();
+  for (const line of invoiceLines) {
+    assertDay(line.day, "invoice line");
+    if (!Number.isFinite(line.amountMicros)) {
+      throw new InvoiceReconcileError(
+        `invoice line (${line.provider}, ${line.model}, ${line.day}) amountMicros is not finite`,
+      );
+    }
+    const key = cellKey(line.provider, line.model, line.day);
+    let cell = observed.get(key);
+    if (!cell) {
+      cell = { provider: line.provider, model: line.model, day: line.day, micros: 0, requestIds: [] };
+      observed.set(key, cell);
+    }
+    cell.micros += line.amountMicros;
+    if (line.requestId) cell.requestIds.push(line.requestId);
+  }
+
+  // Index the expected (cost_events) side.
+  const expected = new Map<string, CostEventsCell>();
+  for (const ce of costEvents) {
+    assertDay(ce.day, "cost_events cell");
+    const key = cellKey(ce.provider, ce.model, ce.day);
+    const prior = expected.get(key);
+    if (prior) {
+      // Merge duplicate cells defensively (callers should pre-aggregate).
+      prior.expectedMicros += ce.expectedMicros;
+      prior.requestIds = [...(prior.requestIds ?? []), ...(ce.requestIds ?? [])];
+    } else {
+      expected.set(key, { ...ce, requestIds: [...(ce.requestIds ?? [])] });
+    }
+  }
+
+  const subtasks: BillingReviewSubtask[] = [];
+  const withinThreshold: ReconcileCell[] = [];
+  const deferred: ReconcileCell[] = [];
+
+  // Every cell present on either side gets diffed.
+  for (const key of new Set([...observed.keys(), ...expected.keys()])) {
+    const obs = observed.get(key);
+    const exp = expected.get(key);
+    const provider = (obs ?? exp)!.provider;
+    const model = (obs ?? exp)!.model;
+    const day = (obs ?? exp)!.day;
+
+    const observedMicros = obs?.micros ?? 0;
+    const expectedMicros = exp?.expectedMicros ?? 0;
+    const variance = invoiceVariance(expectedMicros, observedMicros, thresholdPercent);
+
+    // Prefer cost_events request ids (the system-of-record) for the sample,
+    // falling back to invoice-line request ids.
+    const sample = dedupe([...(exp?.requestIds ?? []), ...(obs?.requestIds ?? [])]).slice(
+      0,
+      sampleLimit,
+    );
+
+    const cell: ReconcileCell = {
+      provider,
+      model,
+      day,
+      expectedMicros,
+      observedMicros,
+      variancePercent: variance.variancePercent,
+      thresholdPercent,
+      overThreshold: variance.overThreshold,
+      sampleRequestIds: sample,
+    };
+
+    if (!isDayLocked(day, now, dayLockDelayHours)) {
+      deferred.push(cell);
+      continue;
+    }
+    if (variance.overThreshold) {
+      subtasks.push(toSubtask(cell, currency));
+    } else {
+      withinThreshold.push(cell);
+    }
+  }
+
+  const order = (a: ReconcileCell, b: ReconcileCell) =>
+    a.day.localeCompare(b.day) ||
+    a.provider.localeCompare(b.provider) ||
+    a.model.localeCompare(b.model);
+  withinThreshold.sort(order);
+  deferred.sort(order);
+  subtasks.sort(
+    (a, b) =>
+      a.cell.day.localeCompare(b.cell.day) ||
+      a.cell.provider.localeCompare(b.cell.provider) ||
+      a.cell.model.localeCompare(b.cell.model),
+  );
+
+  return { subtasks, withinThreshold, deferred };
+}
+
+function toSubtask(cell: ReconcileCell, currency: string): BillingReviewSubtask {
+  const signed = cell.observedMicros >= cell.expectedMicros ? "+" : "−";
+  const pct = Number.isFinite(cell.variancePercent)
+    ? `${signed}${cell.variancePercent.toFixed(1)}%`
+    : "no cost_events baseline";
+  const title = `Invoice variance: ${cell.provider}/${cell.model} ${cell.day} (${pct})`;
+
+  const fmt = (m: number) => `${(m / MICROS_PER_UNIT).toFixed(6)} ${currency} (${m} micros)`;
+  const sampleLine = cell.sampleRequestIds.length
+    ? cell.sampleRequestIds.map((r) => `\`${r}\``).join(", ")
+    : "_none on the cost_events rows_";
+
+  const body = [
+    `Vendor invoice reconciliation (budgeting policy §6.3) flagged a ${pct} variance.`,
+    "",
+    `| field | value |`,
+    `| --- | --- |`,
+    `| cell | \`${cell.provider} / ${cell.model} / ${cell.day}\` |`,
+    `| expected (cost_events) | ${fmt(cell.expectedMicros)} |`,
+    `| observed (invoice) | ${fmt(cell.observedMicros)} |`,
+    `| variance | ${pct} (threshold ${cell.thresholdPercent}%) |`,
+    `| sample requestIds | ${sampleLine} |`,
+    "",
+    "Investigate the gap: a missed/duplicated charge, a pricebook revision lag, or a vendor billing error. Resolve or escalate per §6.3.",
+  ].join("\n");
+
+  return {
+    billingCode: BILLING_REVIEW_CODE,
+    title,
+    body,
+    cell: { provider: cell.provider, model: cell.model, day: cell.day },
+    expectedMicros: cell.expectedMicros,
+    observedMicros: cell.observedMicros,
+    variancePercent: cell.variancePercent,
+    thresholdPercent: cell.thresholdPercent,
+    sampleRequestIds: cell.sampleRequestIds,
+  };
+}
+
+function dedupe(xs: string[]): string[] {
+  return [...new Set(xs)];
+}

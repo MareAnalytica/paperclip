@@ -349,8 +349,10 @@ export {
 export {
   createCostEventSchema,
   updateBudgetSchema,
+  invoiceReconcileRequestSchema,
   type CreateCostEvent,
   type UpdateBudget,
+  type InvoiceReconcileRequest,
 } from "./cost.js";
 
 export {

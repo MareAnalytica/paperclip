@@ -32,6 +32,13 @@ export { budgetService } from "./budgets.js";
 export { secretService } from "./secrets.js";
 export { routineService } from "./routines.js";
 export { costService } from "./costs.js";
+export {
+  invoiceReconcileService,
+  INVOICE_RECONCILE_ORIGIN_KIND,
+  type InvoiceReconcileService,
+  type InvoiceReconcileInput,
+  type InvoiceReconcileSummary,
+} from "./invoice-reconcile.js";
 export { financeService } from "./finance.js";
 export { heartbeatService } from "./heartbeat.js";
 export {
