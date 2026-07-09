@@ -36,6 +36,12 @@ const ACTIVE_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const MAX_CANDIDATE_ISSUES = 250;
 const MAX_RUNS_FOR_STREAK = 100;
 const MAX_PARENT_WALK_DEPTH = 25;
+// Several agent comment-post paths (DM helper, CEO PATCH-with-`comment` field) do not
+// propagate X-Paperclip-Run-Id onto comments.createdByRunId, so a productive agent's
+// comments can carry a null/foreign runId and never break the no-comment streak. To keep
+// the streak honest we also credit author-matched comments that land within a terminal
+// run's wall-clock window, padded by this buffer for post-flush/clock-skew lag (DEE-432).
+const STREAK_COMMENT_WINDOW_BUFFER_MS = 2 * 60 * 1000;
 export const PRODUCTIVITY_REVIEW_REFRESH_COMMENT_PREFIX = "Productivity review evidence refreshed.";
 
 type IssueRow = typeof issues.$inferSelect;
@@ -420,12 +426,43 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       }
     }
 
+    // Author-match fallback (DEE-432): collect timestamps of every comment authored by the
+    // source agent on this issue at/after the earliest sampled run window (minus buffer),
+    // regardless of createdByRunId. A run whose wall-clock window contains such a comment is
+    // treated as having produced a comment even when the runId never propagated.
+    const runWindowStartMs = (run: HeartbeatRunRow) => (run.startedAt ?? run.createdAt).getTime();
+    const runWindowEndMs = (run: HeartbeatRunRow) => (run.finishedAt ?? run.startedAt ?? run.createdAt).getTime();
+    const authorCommentTimes: number[] = [];
+    if (latestRuns.length > 0) {
+      const earliestRunStartMs = Math.min(...latestRuns.map(runWindowStartMs));
+      const lowerBound = new Date(earliestRunStartMs - STREAK_COMMENT_WINDOW_BUFFER_MS);
+      const authorRows = await db
+        .select({ createdAt: issueComments.createdAt })
+        .from(issueComments)
+        .where(
+          and(
+            eq(issueComments.companyId, sourceIssue.companyId),
+            eq(issueComments.issueId, sourceIssue.id),
+            eq(issueComments.authorAgentId, sourceAgent.id),
+            gt(issueComments.createdAt, lowerBound),
+          ),
+        );
+      for (const row of authorRows) authorCommentTimes.push(row.createdAt.getTime());
+    }
+
+    const runHasComment = (run: HeartbeatRunRow) => {
+      if (commentRunIds.has(run.id)) return true;
+      const windowStart = runWindowStartMs(run) - STREAK_COMMENT_WINDOW_BUFFER_MS;
+      const windowEnd = runWindowEndMs(run) + STREAK_COMMENT_WINDOW_BUFFER_MS;
+      return authorCommentTimes.some((ts) => ts >= windowStart && ts <= windowEnd);
+    };
+
     const terminalRuns = latestRuns.filter((run) =>
       TERMINAL_RUN_STATUSES.includes(run.status as (typeof TERMINAL_RUN_STATUSES)[number]),
     );
     let noCommentStreak = 0;
     for (const run of terminalRuns) {
-      if (commentRunIds.has(run.id)) break;
+      if (runHasComment(run)) break;
       noCommentStreak += 1;
     }
 

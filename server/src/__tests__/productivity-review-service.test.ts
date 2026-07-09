@@ -120,11 +120,13 @@ describeEmbeddedPostgres("productivity review service", () => {
     count: number;
     now: Date;
     withRunComments?: boolean;
+    spacingMs?: number;
   }) {
+    const spacingMs = input.spacingMs ?? 60_000;
     const runs: Array<typeof heartbeatRuns.$inferInsert> = [];
     for (let index = 0; index < input.count; index += 1) {
       const runId = randomUUID();
-      const createdAt = new Date(input.now.getTime() - index * 60_000);
+      const createdAt = new Date(input.now.getTime() - index * spacingMs);
       runs.push({
         id: runId,
         companyId: input.companyId,
@@ -208,6 +210,42 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(reviews[0]?.description).toContain("No-comment completed-run streak: 10");
 
     expect(await listRefreshComments(reviews[0]!.id)).toHaveLength(0);
+  });
+
+  it("does not flag no_comment_streak when author-matched comments land in run windows without a runId (DEE-432)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    const runs = await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now,
+      // Space runs 10 min apart so neither the hourly nor 6h high-churn trigger fires;
+      // this isolates the no_comment_streak trigger under test.
+      spacingMs: 10 * 60_000,
+    });
+
+    // Productive agent: each run posted a substantive comment, but the post path dropped
+    // X-Paperclip-Run-Id so createdByRunId is null. The comment still lands mid-window
+    // (startedAt + 15s), so author-match must credit the run and keep the streak short.
+    await db.insert(issueComments).values(
+      runs.map((run, index) => ({
+        companyId: seeded.companyId,
+        issueId: seeded.issueId,
+        authorAgentId: seeded.coderId,
+        createdByRunId: null,
+        body: `Untagged progress update ${index}`,
+        createdAt: new Date((run.startedAt as Date).getTime() + 15_000),
+        updatedAt: new Date((run.startedAt as Date).getTime() + 15_000),
+      })),
+    );
+
+    const service = productivityReviewService(db);
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(0);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
   });
 
   it("refreshes open productivity reviews only once per interval and caps refresh comments", async () => {
