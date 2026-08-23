@@ -1,6 +1,6 @@
 # .github/workflows/dev-push.yml
 # ─────────────────────────────────────────────────────────────
-# Push to main → build all images → deploy to dev (paperclip-dev namespace).
+# Push to main → build all images. ArgoCD deploys.
 # ─────────────────────────────────────────────────────────────
 name: CI → Dev
 
@@ -22,16 +22,3 @@ jobs:
         ]
       registry: ${{ vars.DOCKER_REGISTRY_HOST }}
 
-  deploy:
-    needs: build
-    uses: ./.github/workflows/_deploy.yml
-    with:
-      environment: dev
-      namespace: paperclip-dev
-      deployments: "paperclip"
-      rollout_timeout: "600s"
-      # DEE-706: promote the exact image just built. The dev overlay pins an image
-      # digest (for deterministic rollouts / no mutable-:latest re-pull churn); passing
-      # the build's digest map makes the deploy pin THAT digest before apply, so code
-      # merged to main actually reaches paperclip-dev instead of re-applying a stale pin.
-      image_digests: ${{ needs.build.outputs.digests }}

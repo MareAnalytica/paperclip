@@ -19,7 +19,7 @@ on:
         description: "Registry host:port (in-cluster or external)"
         required: false
         type: string
-        default: "${{ vars.DOCKER_REGISTRY_HOST }}"
+        default: "harbor.dev.mareanalytica.com/mare-dev"
       filter:
         description: "Optional substring filter — only build images whose name contains this. Empty = all."
         required: false
@@ -29,14 +29,14 @@ on:
       digests:
         description: >
           DEE-706: compact JSON map of { "<registry>/<name>": "<sha256:digest>" } for every
-          image actually built this run. A caller can feed this into _deploy.yml's
+          image actually built this run. A caller can feed this into a promote step.s
           `image_digests` input to promote the exact, content-addressed build it just
           produced (instead of relying on a static overlay pin that never moves).
         value: ${{ jobs.build.outputs.digests }}
 
 jobs:
   build:
-    runs-on: arc-runner-set
+    runs-on: liquidmetal-dev
     outputs:
       digests: ${{ steps.build.outputs.digests }}
     steps:
@@ -53,12 +53,6 @@ jobs:
           done
           docker info > /dev/null 2>&1 || { echo "Docker not ready after 60s"; exit 1; }
           echo "✓ Docker is ready"
-
-      - name: Verify registry connectivity
-        run: |
-          set -euo pipefail
-          echo "Testing registry at ${{ inputs.registry }}..."
-          curl -sf --cacert /etc/ssl/certs/registry-ca.crt https://${{ inputs.registry }}/v2/ > /dev/null && echo "✓ Registry reachable"
 
       - name: Build and push images
         id: build

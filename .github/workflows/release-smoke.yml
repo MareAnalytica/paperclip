@@ -37,7 +37,7 @@ on:
 
 jobs:
   smoke:
-    runs-on: arc-runner-set
+    runs-on: liquidmetal-dev
     timeout-minutes: 45
 
     steps:

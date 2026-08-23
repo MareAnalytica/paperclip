@@ -12,7 +12,7 @@ concurrency:
 
 jobs:
   refresh:
-    runs-on: arc-runner-set
+    runs-on: liquidmetal-dev
     timeout-minutes: 10
     permissions:
       contents: write

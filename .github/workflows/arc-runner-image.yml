@@ -32,7 +32,7 @@ permissions:
 
 jobs:
   build:
-    runs-on: arc-runner-set
+    runs-on: liquidmetal-dev
     timeout-minutes: 30
     env:
       REGISTRY: ${{ vars.DOCKER_REGISTRY_HOST || 'registry.mareanalytica.com' }}
