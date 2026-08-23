@@ -20,5 +20,10 @@ jobs:
         [
           { "name": "paperclip", "context": ".", "dockerfile": "./Dockerfile" }
         ]
-      registry: ${{ vars.DOCKER_REGISTRY_HOST }}
-
+      # Intentionally NOT passing `registry:` — the org variable
+      # DOCKER_REGISTRY_HOST still points at the retired unauthenticated
+      # registry, which would send dev builds to the old host. Falling through
+      # to the reusable workflow default targets Harbor (mare-dev).
+    # The reusable workflow needs the Harbor push credentials; a called
+    # workflow sees no caller secrets unless they are inherited.
+    secrets: inherit

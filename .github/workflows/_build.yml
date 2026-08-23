@@ -54,6 +54,35 @@ jobs:
           docker info > /dev/null 2>&1 || { echo "Docker not ready after 60s"; exit 1; }
           echo "✓ Docker is ready"
 
+      # Harbor requires auth on push; the old in-cluster registry did not, which is
+      # why this workflow never had a login step. `inputs.registry` carries host +
+      # project path (harbor.dev.mareanalytica.com/mare-dev) but `docker login`
+      # takes the bare host, so strip the path. The login is gated on the secret
+      # being present so a caller that does not pass `secrets: inherit` (or a
+      # target registry that needs no auth) still builds instead of hard-failing.
+      - name: Resolve registry host
+        id: registry
+        env:
+          REGISTRY: ${{ inputs.registry }}
+          REGISTRY_USERNAME: ${{ secrets.HARBOR_CI_USERNAME }}
+        run: |
+          set -euo pipefail
+          echo "host=${REGISTRY%%/*}" >> "$GITHUB_OUTPUT"
+          if [ -n "${REGISTRY_USERNAME:-}" ]; then
+            echo "login=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "login=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::No registry credentials available; skipping docker login."
+          fi
+
+      - name: Log in to the registry
+        if: steps.registry.outputs.login == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ steps.registry.outputs.host }}
+          username: ${{ secrets.HARBOR_CI_USERNAME }}
+          password: ${{ secrets.HARBOR_CI_PASSWORD }}
+
       - name: Build and push images
         id: build
         env:
