@@ -19,7 +19,7 @@ on:
         description: "Registry host:port (in-cluster or external)"
         required: false
         type: string
-        default: "harbor.dev.mareanalytica.com/mare-dev"
+        default: "harbor.mareanalytica.com/mare-dev"
       filter:
         description: "Optional substring filter — only build images whose name contains this. Empty = all."
         required: false
@@ -36,7 +36,7 @@ on:
 
 jobs:
   build:
-    runs-on: liquidmetal-dev
+    runs-on: liquidmetal
     outputs:
       digests: ${{ steps.build.outputs.digests }}
     steps:
@@ -56,7 +56,7 @@ jobs:
 
       # Harbor requires auth on push; the old in-cluster registry did not, which is
       # why this workflow never had a login step. `inputs.registry` carries host +
-      # project path (harbor.dev.mareanalytica.com/mare-dev) but `docker login`
+      # project path (harbor.mareanalytica.com/mare-dev) but `docker login`
       # takes the bare host, so strip the path. The login is gated on the secret
       # being present so a caller that does not pass `secrets: inherit` (or a
       # target registry that needs no auth) still builds instead of hard-failing.

@@ -42,7 +42,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: paperclip
-          image: harbor.dev.mareanalytica.com/mare-dev/paperclip:latest
+          image: harbor.mareanalytica.com/mare-dev/paperclip:latest
           # DEE-695 (DEE-694/DEE-692 class): pull policy IfNotPresent so a digest-pinned
           # image (set per-overlay via kustomize `images:`) is not re-pulled (~1.3GB) on
           # every pod start/rollout and rollouts stay deterministic. With a digest, the

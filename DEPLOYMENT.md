@@ -4,7 +4,7 @@ CI builds and pushes an image. **ArgoCD deploys.** CI holds no cluster
 credentials — that is the point of the split.
 
 - push to `main` → `dev-push.yml` builds `paperclip` into
-  `harbor.dev.mareanalytica.com/mare-dev/`
+  `harbor.mareanalytica.com/mare-dev/`
 - tag `v*`       → `prod-tag.yml`, the release build
 - ArgoCD watches `MareAnalytica/gitops` → `apps/dev/paperclip.yaml`, which points
   back at this repo's `kube/overlays/dev`
@@ -17,9 +17,11 @@ now deleted), so CI could write to the cluster and nothing described what was
 actually deployed. Under the Jove model the cluster pulls its own desired state
 and nothing pushes into it.
 
-Every `runs-on:` moved from `arc-runner-set` to `liquidmetal-dev` — not just the
+Every `runs-on:` moved from `arc-runner-set` to `liquidmetal` — not just the
 build jobs. The old scale set died with the previous cluster, so the test, PR,
 e2e and release workflows were all pointing at runners that no longer exist.
+The scale set now runs on the prod cluster under the helm release `liquidmetal`
+(it was briefly `liquidmetal-dev` on the dev cluster).
 
 ## Target cluster
 The **Liquid Metal** dev cluster (`liquidmetal-dev` control plane +

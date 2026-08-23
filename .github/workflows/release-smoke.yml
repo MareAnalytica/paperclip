@@ -37,7 +37,7 @@ on:
 
 jobs:
   smoke:
-    runs-on: liquidmetal-dev
+    runs-on: liquidmetal
     timeout-minutes: 45
 
     steps:

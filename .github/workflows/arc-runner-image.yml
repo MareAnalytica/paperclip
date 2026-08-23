@@ -32,7 +32,7 @@ permissions:
 
 jobs:
   build:
-    runs-on: liquidmetal-dev
+    runs-on: liquidmetal
     timeout-minutes: 30
     env:
       REGISTRY: ${{ vars.DOCKER_REGISTRY_HOST || 'registry.mareanalytica.com' }}

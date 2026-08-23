@@ -12,7 +12,7 @@ concurrency:
 
 jobs:
   refresh:
-    runs-on: liquidmetal-dev
+    runs-on: liquidmetal
     timeout-minutes: 10
     permissions:
       contents: write
