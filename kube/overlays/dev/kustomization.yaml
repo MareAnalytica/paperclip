@@ -38,17 +38,28 @@ patches:
         path: /metadata/labels/environment
         value: dev
 
-  # Override ingress host for dev (wildcard-tls from base applies to all subdomains)
+  # Override ingress host for dev.
+  #
+  # Dev services now live under dev.mareanalytica.com rather than carrying a
+  # -dev suffix on the prod name, so dev and prod are told apart by domain.
+  #
+  # The secretName stays wildcard-tls, but note the old comment here was wrong
+  # even before this move and is doubly wrong now: a Let's Encrypt wildcard is
+  # single-label, so *.mareanalytica.com never covered this name and certainly
+  # does not cover paperclip.dev.mareanalytica.com. It does not matter for
+  # reachability - this host is fronted by the Cloudflare Tunnel, which
+  # terminates TLS at the edge and reaches Traefik over plain HTTP, so the
+  # origin certificate is never validated by a client.
   - target:
       kind: Ingress
       name: paperclip
     patch: |
       - op: replace
         path: /spec/tls/0/hosts/0
-        value: paperclip-dev.mareanalytica.com
+        value: paperclip.dev.mareanalytica.com
       - op: replace
         path: /spec/rules/0/host
-        value: paperclip-dev.mareanalytica.com
+        value: paperclip.dev.mareanalytica.com
 
   # Reduce app deployment resources and fix DB URL for dev namespace
   - target:
@@ -100,9 +111,9 @@ patches:
                   - name: DATABASE_URL
                     value: "postgresql://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@paperclip-db.paperclip-dev.svc.cluster.local:5432/$(POSTGRES_DB)"
                   - name: PAPERCLIP_ALLOWED_HOSTNAMES
-                    value: "paperclip-dev.mareanalytica.com"
+                    value: "paperclip.dev.mareanalytica.com"
                   - name: BETTER_AUTH_BASE_URL
-                    value: "https://paperclip-dev.mareanalytica.com"
+                    value: "https://paperclip.dev.mareanalytica.com"
                   # DEE-696: turn ON the heartbeat-scheduler single-leader guard.
                   # The flag defaults OFF in config.ts (per-pod gate); it MUST be
                   # true wherever replicas>1 or a second pod would double-run the

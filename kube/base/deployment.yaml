@@ -58,7 +58,7 @@ spec:
             - name: DATABASE_URL
               value: "postgresql://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@paperclip-db.paperclip.svc.cluster.local:5432/$(POSTGRES_DB)"
             - name: PAPERCLIP_ALLOWED_HOSTNAMES
-              value: "paperclip.mareanalytica.com,paperclip-dev.mareanalytica.com"
+              value: "paperclip.mareanalytica.com,paperclip.dev.mareanalytica.com"
             - name: BETTER_AUTH_BASE_URL
               value: "https://paperclip.mareanalytica.com"
           envFrom:
