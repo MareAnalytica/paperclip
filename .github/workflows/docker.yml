@@ -5,7 +5,12 @@ on:
     branches:
       - "main"
     tags:
-      - "v*"
+      # Narrowed 2026-08-24, anchored whole-ref: "v*" also matched the estate's
+      # dev tags (vX.Y.Z-dev.N), so every internal dev release also fired this
+      # public ghcr publish - on the shared liquidmetal pool. A real release
+      # (bare vX.Y.Z) still publishes here. See MareAnalytica/gitops
+      # docs/DEPLOY-STRATEGY.md section 3.
+      - "v[0-9]+.[0-9]+.[0-9]+"
 
 permissions:
   contents: read
