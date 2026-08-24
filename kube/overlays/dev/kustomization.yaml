@@ -22,8 +22,27 @@ images:
   # HEAD 827f960d (the #103/DEE-700 merge), which is a superset of #102/DEE-699
   # (pg_advisory_lock leader election) + #103/DEE-700 (inline run-execution gate).
   # Source: CI→Dev build job for 827f960d pushed `latest: digest: sha256:6436ef4…`.
-  - name: registry.mareanalytica.com/paperclip
-    digest: sha256:6436ef4b8c8616aaef06c8341f2f0480e11223d989ad5b2406a394e470b6cb76
+  #
+  # 2026-08-24: THIS TRANSFORMER WAS A NO-OP AND HAD NEVER APPLIED. The name
+  # read `registry.mareanalytica.com/paperclip`, but kube/base/deployment.yaml
+  # requests `registry.mareanalytica.com/mare-dev/paperclip:latest`. A kustomize
+  # image transformer matches on the image name exactly, so it never fired and
+  # dev has been running the moving :latest tag the whole time - the very thing
+  # DEE-695 set out to stop. The name is corrected below.
+  #
+  # The version line is seeded `newTag: latest` rather than restoring the digest
+  # above, because that digest (the :latest of main HEAD 827f960d) is very
+  # likely gone: mare-dev retention keeps only the 2 most recent artifacts per
+  # image. Restoring it unverified would ImagePullBackOff the deployment.
+  # `newTag: latest` preserves exactly what runs today; the first vX.Y.Z-dev.N
+  # tag replaces it with a real, just-built digest and the intent of DEE-695 is
+  # finally satisfied - automatically, on every release.
+  #
+  # The dev-tag lane rewrites the line below by literal path: it matches
+  # `- name: <image>` exactly, then the first newTag:/digest: under it. Keep the
+  # `- name:` line byte-exact.
+  - name: registry.mareanalytica.com/mare-dev/paperclip
+    newTag: latest
 
 patches:
   # Override namespace name for dev

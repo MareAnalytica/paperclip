@@ -1,0 +1,251 @@
+# Dev release lane.
+#
+# Spec: MareAnalytica/gitops docs/DEPLOY-STRATEGY.md
+#
+#   git tag vX.Y.Z-dev.N
+#     -> build -> registry.mareanalytica.com/mare-dev -> pin -> ArgoCD auto-syncs = deployed
+#
+# Modelled on the Aflabox estate (qboxx/ironbox
+# docs/plans/2026-07-28-gitops-reimage/03-ci-tags-release-promotion.md, board
+# resolution 2026-07-28): the tag suffix IS the routing, the trigger filter is
+# an anchored whole-ref glob, and validate-tag re-checks the grammar inside the
+# job as defence in depth if that filter is ever loosened.
+#
+# NO CLUSTER CREDENTIALS LIVE HERE, and none may be added. There is no kubectl.
+# ArgoCD pulls the pinned desired state out of git; a kubectl step here would
+# simply fail, which is the guard rail rather than an oversight.
+#
+# Branch pushes deliberately build NOTHING (plan 03 section 3.4). Here that is
+# also forced by Harbor retention: mare-dev keeps only the 2 most recent
+# artifacts per image, so a branch-push build lane would evict the
+# :dev-<sha12> artifact that a later vX.Y.Z tag has to promote.
+
+name: dev tag
+
+"on":
+  push:
+    tags:
+      # Anchored whole-ref match: cannot match a bare vX.Y.Z, -stg.N or -rc.N.
+      - "v[0-9]+.[0-9]+.[0-9]+-dev.[0-9]+"
+
+concurrency:
+  group: dev-tag-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # registry.mareanalytica.com is the docker/kubelet endpoint. Never
+  # harbor.mareanalytica.com - that is the human UI, behind Cloudflare Access.
+  REGISTRY: registry.mareanalytica.com
+  PROJECT: mare-dev
+
+jobs:
+  validate-tag:
+    name: validate the dev tag grammar
+    runs-on: liquidmetal
+    steps:
+      - name: Enforce vX.Y.Z-dev.N
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          case "${TAG}" in
+            *_*)
+              echo "::error::${TAG}: underscores are not part of the tag grammar"
+              exit 1 ;;
+            *-stg.*|*-staging.*)
+              echo "::error::${TAG}: this estate has no staging lane; dev tags are vX.Y.Z-dev.N"
+              exit 1 ;;
+            *-rc.*)
+              echo "::error::${TAG}: -rc.N is retired estate-wide; dev tags are vX.Y.Z-dev.N"
+              exit 1 ;;
+          esac
+          printf '%s' "${TAG}" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+-dev\.[0-9]+$' || {
+            echo "::error::${TAG} is not a dev tag (expected vX.Y.Z-dev.N)"
+            exit 1
+          }
+          echo "dev tag accepted: ${TAG}"
+
+  build:
+    name: build and push to mare-dev
+    needs: validate-tag
+    runs-on: liquidmetal
+    permissions:
+      contents: read
+    outputs:
+      digests: ${{ steps.push.outputs.digests }}
+      sha12: ${{ steps.push.outputs.sha12 }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # The ARC runner's docker daemon is a sidecar and is not always up when the
+      # job starts.
+      - name: Wait for the docker daemon
+        run: |
+          for i in $(seq 1 30); do
+            docker info >/dev/null 2>&1 && break
+            sleep 2
+          done
+          docker info >/dev/null 2>&1 || { echo "::error::docker daemon never came up"; exit 1; }
+
+      # HARBOR_CI_USERNAME / HARBOR_CI_PASSWORD are PER-REPO secrets. This org is
+      # on the GitHub Free plan, where org-level Actions secrets are invisible to
+      # private repositories. docker login takes the bare registry host, never
+      # the project path.
+      - name: Log in to Harbor
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.HARBOR_CI_USERNAME }}
+          password: ${{ secrets.HARBOR_CI_PASSWORD }}
+
+      # Classic docker build + docker push ONLY - never buildx, never
+      # build-push-action. The classic CLI path honours the daemon's registry
+      # trust; buildkit's own token fetch ignores it and dies x509. Proven live
+      # on Jove, and re-proven here by every harbor.yml lane this replaces.
+      - name: Build and push
+        id: push
+        env:
+          IMAGES: |
+            [
+              {
+                "name": "paperclip",
+                "context": ".",
+                "dockerfile": "./Dockerfile"
+              }
+            ]
+        run: |
+          set -euo pipefail
+          SHA12="${GITHUB_SHA:0:12}"
+          REL="${GITHUB_REF_NAME}"
+          OUT="{}"
+          COUNT="$(printf '%s' "${IMAGES}" | jq 'length')"
+
+          for i in $(seq 0 $((COUNT - 1))); do
+            NAME="$(printf '%s' "${IMAGES}" | jq -r ".[${i}].name")"
+            CTX="$(printf '%s' "${IMAGES}" | jq -r ".[${i}].context")"
+            DF="$(printf '%s' "${IMAGES}" | jq -r ".[${i}].dockerfile")"
+            IMG="${REGISTRY}/${PROJECT}/${NAME}"
+
+            echo "=== ${NAME} -> ${IMG}"
+            # Four refs, one artifact:
+            #   :dev            moves, what a human reads
+            #   :dev-<sha12>    never moves; what promotion copies and what you roll back to
+            #   :<git tag>      never moves; traces the artifact back to its release
+            #   :latest         COMPATIBILITY ALIAS for manifests that still say latest
+            #                   (platform/hermes, platform/postiz, platform/cheesecake).
+            #                   Never pin to it.
+            docker build \
+              -t "${IMG}:dev" \
+              -t "${IMG}:dev-${SHA12}" \
+              -t "${IMG}:${REL}" \
+              -t "${IMG}:latest" \
+              -f "${DF}" "${CTX}"
+
+            for T in dev "dev-${SHA12}" "${REL}" latest; do
+              docker push "${IMG}:${T}"
+            done
+
+            D="$(docker inspect --format='{{index .RepoDigests 0}}' "${IMG}:dev" | cut -d@ -f2)"
+            OUT="$(printf '%s' "${OUT}" | jq -c --arg k "${NAME}" --arg v "${D}" '. + {($k): $v}')"
+            echo "- \`${NAME}\` -> \`${D}\`" >> "$GITHUB_STEP_SUMMARY"
+          done
+
+          echo "sha12=${SHA12}" >> "$GITHUB_OUTPUT"
+          echo "digests=${OUT}" >> "$GITHUB_OUTPUT"
+
+  pin:
+    name: pin the dev desired state
+    needs: build
+    runs-on: liquidmetal
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The branch ArgoCD reads, not the tag: a detached HEAD cannot be
+          # pushed, and ArgoCD never looks at tags.
+          ref: main
+          fetch-depth: 0
+
+      - name: Pin the dev overlay to the digests this run built
+        env:
+          DIGESTS: ${{ needs.build.outputs.digests }}
+        run: |
+          set -euo pipefail
+
+          # Two pin shapes, both line-anchored on purpose. A YAML round-trip
+          # would reformat and reorder files that humans maintain, and a regex
+          # over the whole document needs escapes that this file's own quoting
+          # would eat.
+          #
+          # The python below sits at the YAML block margin, not at the shell
+          # indentation around it: YAML strips exactly the block's indentation,
+          # so these lines - and the PY terminator - reach the shell at column 0,
+          # which is what a quoted heredoc requires. Indenting them to match the
+          # surrounding shell would leave the terminator indented and the
+          # heredoc would swallow the rest of the script.
+          pin_kustomize() {
+            python3 - "$1" "$2" "$3" <<'PY'
+          import sys
+          path, image, digest = sys.argv[1:4]
+          lines = open(path).read().split("\n")
+          anchors = [n for n, l in enumerate(lines) if l.strip() == "- name: " + image]
+          if not anchors:
+              sys.exit("no images: entry for " + image + " in " + path)
+          # The entry's version line is whichever of newTag:/digest: comes first
+          # after the anchor. newTag: latest is the seeded no-op an entry starts
+          # life with, so that adding the block changes nothing until a real
+          # release replaces it here with a digest.
+          j = None
+          for n in range(anchors[0] + 1, len(lines)):
+              s = lines[n].strip()
+              if s.startswith("- name: "):
+                  break
+              if s.startswith("digest:") or s.startswith("newTag:"):
+                  j = n
+                  break
+          if j is None:
+              sys.exit("the images: entry for " + image + " in " + path +
+                       " has neither a digest: nor a newTag: line")
+          indent = lines[j][:len(lines[j]) - len(lines[j].lstrip())]
+          lines[j] = indent + "digest: " + digest
+          open(path, "w").write("\n".join(lines))
+          PY
+          }
+
+          pin_plain() {
+            python3 - "$1" "$2" "$3" <<'PY'
+          import re, sys
+          path, image, digest = sys.argv[1:4]
+          lines = open(path).read().split("\n")
+          pat = re.compile(r"^(\s*image:\s*)" + re.escape(image) + r"(?:[:@]\S*)?\s*$")
+          hits = [n for n, l in enumerate(lines) if pat.match(l)]
+          if not hits:
+              sys.exit("no image: line for " + image + " in " + path)
+          for n in hits:
+              lines[n] = pat.match(lines[n]).group(1) + image + "@" + digest
+          open(path, "w").write("\n".join(lines))
+          PY
+          }
+
+          D="$(printf '%s' "${DIGESTS}" | jq -er '.["paperclip"]')"
+          pin_kustomize "kube/overlays/dev/kustomization.yaml" "registry.mareanalytica.com/mare-dev/paperclip" "${D}"
+          echo "pinned paperclip -> ${D}"
+
+          git config user.name  "mare-ci"
+          git config user.email "ci@mareanalytica.com"
+          git diff --quiet && { echo "already pinned to these digests"; exit 0; }
+          git add -A
+          # [skip ci] so the pin does not re-run this repo's test workflows. It
+          # cannot loop regardless: nothing in this scheme triggers on a branch push.
+          git commit -q -m "chore: pin dev to ${GITHUB_REF_NAME} [skip ci]"
+          # Rebase and retry, never force.
+          for attempt in 1 2 3 4 5; do
+            git push origin "HEAD:main" && exit 0
+            echo "push rejected, rebasing (attempt ${attempt})"
+            git fetch origin "main" && git rebase "origin/main" || {
+              echo "::error::rebase conflict while pinning dev"
+              exit 1
+            }
+          done
+          echo "::error::could not push the pin after 5 attempts"
+          exit 1

@@ -1,20 +1,144 @@
-# .github/workflows/prod-tag.yml
-# ─────────────────────────────────────────────────────────────
-# Tag v* → build all images. ArgoCD deploys.
-# ─────────────────────────────────────────────────────────────
-name: Release → Prod
+# Production release lane.
+#
+# Spec: MareAnalytica/gitops docs/DEPLOY-STRATEGY.md
+#
+#   git tag vX.Y.Z
+#     -> copy the exact dev artifact into mare-prod - no rebuild
+#
+# Modelled on the Aflabox estate (qboxx/ironbox
+# docs/plans/2026-07-28-gitops-reimage/03-ci-tags-release-promotion.md, board
+# resolution 2026-07-28): the tag suffix IS the routing, the trigger filter is
+# an anchored whole-ref glob, and validate-tag re-checks the grammar inside the
+# job as defence in depth if that filter is ever loosened.
+#
+# NO CLUSTER CREDENTIALS LIVE HERE, and none may be added. There is no kubectl.
+# ArgoCD pulls the pinned desired state out of git; a kubectl step here would
+# simply fail, which is the guard rail rather than an oversight.
+#
+# Branch pushes deliberately build NOTHING (plan 03 section 3.4). Here that is
+# also forced by Harbor retention: mare-dev keeps only the 2 most recent
+# artifacts per image, so a branch-push build lane would evict the
+# :dev-<sha12> artifact that a later vX.Y.Z tag has to promote.
 
-on:
+name: prod tag
+
+"on":
   push:
-    tags: ["v*"]
+    tags:
+      # Anchored whole-ref match: CANNOT match vX.Y.Z-dev.N. The unqualified
+      # "v*" this replaces matched dev tags too, and fired production for them.
+      - "v[0-9]+.[0-9]+.[0-9]+"
+
+# Repo-wide on purpose: production releases are serial, and this bounds the blast
+# radius on the shared runner pool if a batch of tags ever lands at once - a real
+# risk on the forks, which carry upstream vX.Y.Z tags.
+concurrency:
+  group: prod-tag
+  cancel-in-progress: false
+
+env:
+  REGISTRY: registry.mareanalytica.com
 
 jobs:
-  build:
-    uses: ./.github/workflows/_build.yml
-    with:
-      images: >-
-        [
-          { "name": "paperclip", "context": ".", "dockerfile": "./Dockerfile" }
-        ]
-      registry: ${{ vars.DOCKER_REGISTRY_HOST }}
+  validate-tag:
+    name: validate the production tag grammar
+    runs-on: liquidmetal
+    steps:
+      - name: Enforce a bare vX.Y.Z
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          case "${TAG}" in
+            *_*)
+              echo "::error::${TAG}: underscores are not part of the tag grammar"
+              exit 1 ;;
+            *-dev.*)
+              echo "::error::${TAG}: a dev tag must never reach the production lane"
+              exit 1 ;;
+            *-stg.*|*-staging.*|*-rc.*)
+              echo "::error::${TAG}: not a production tag; production is a bare vX.Y.Z"
+              exit 1 ;;
+          esac
+          printf '%s' "${TAG}" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$' || {
+            echo "::error::${TAG} is not a production tag (expected vX.Y.Z)"
+            exit 1
+          }
+          echo "production tag accepted: ${TAG}"
 
+  promote:
+    name: copy the dev artifact into mare-prod
+    needs: validate-tag
+    runs-on: liquidmetal
+    permissions:
+      contents: read
+    steps:
+      # The ARC runner's docker daemon is a sidecar and is not always up when the
+      # job starts.
+      - name: Wait for the docker daemon
+        run: |
+          for i in $(seq 1 30); do
+            docker info >/dev/null 2>&1 && break
+            sleep 2
+          done
+          docker info >/dev/null 2>&1 || { echo "::error::docker daemon never came up"; exit 1; }
+
+      # HARBOR_CI_USERNAME / HARBOR_CI_PASSWORD are PER-REPO secrets. This org is
+      # on the GitHub Free plan, where org-level Actions secrets are invisible to
+      # private repositories. docker login takes the bare registry host, never
+      # the project path.
+      - name: Log in to Harbor
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.HARBOR_CI_USERNAME }}
+          password: ${{ secrets.HARBOR_CI_PASSWORD }}
+
+      # A production tag PROMOTES; it never builds. Aflabox plan 03 section 6:
+      # promotion copies by digest, so what was tested is what ships. The source
+      # is the artifact the matching dev tag produced for this exact commit,
+      # which makes the invariant mechanical - you can only ship to prod a
+      # commit that was already built and deployed to dev.
+      - name: Promote
+        env:
+          IMAGES: |
+            [
+              {
+                "name": "paperclip",
+                "context": ".",
+                "dockerfile": "./Dockerfile"
+              }
+            ]
+        run: |
+          set -euo pipefail
+          SHA12="${GITHUB_SHA:0:12}"
+          REL="${GITHUB_REF_NAME}"
+          COUNT="$(printf '%s' "${IMAGES}" | jq 'length')"
+
+          for i in $(seq 0 $((COUNT - 1))); do
+            NAME="$(printf '%s' "${IMAGES}" | jq -r ".[${i}].name")"
+            SRC="${REGISTRY}/mare-dev/${NAME}:dev-${SHA12}"
+            DST="${REGISTRY}/mare-prod/${NAME}"
+
+            echo "=== ${NAME}: ${SRC} -> ${DST}"
+            if ! docker pull "${SRC}"; then
+              echo "::error::${SRC} does not exist. A production tag promotes a dev artifact and never rebuilds. Cut vX.Y.Z-dev.N on commit ${GITHUB_SHA} first. Note also that mare-dev retention keeps only the 2 most recent artifacts per image, so an older dev build may already have been swept - re-cutting a -dev.N tag on the same commit rebuilds and re-materialises it."
+              exit 1
+            fi
+
+            for T in prod "prod-${SHA12}" "${REL}"; do
+              docker tag "${SRC}" "${DST}:${T}"
+              docker push "${DST}:${T}"
+            done
+
+            D="$(docker inspect --format='{{index .RepoDigests 0}}' "${SRC}" | cut -d@ -f2)"
+            echo "- \`${NAME}\` promoted unchanged -> \`${D}\`" >> "$GITHUB_STEP_SUMMARY"
+          done
+
+          {
+            echo ""
+            echo "**No prod deploy happened, and that is expected.**"
+            echo ""
+            echo "apps/prod/ in MareAnalytica/gitops holds platform components only -"
+            echo "there is no ArgoCD Application for this service to pin. The artifact"
+            echo "is in mare-prod and ready. See docs/DEPLOY-STRATEGY.md section 8."
+          } >> "$GITHUB_STEP_SUMMARY"
