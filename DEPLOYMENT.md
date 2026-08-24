@@ -4,7 +4,7 @@ CI builds and pushes an image. **ArgoCD deploys.** CI holds no cluster
 credentials — that is the point of the split.
 
 - push to `main` → `dev-push.yml` builds `paperclip` into
-  `harbor.mareanalytica.com/mare-dev/`
+  `registry.mareanalytica.com/mare-dev/`
 - tag `v*`       → `prod-tag.yml`, the release build
 - ArgoCD watches `MareAnalytica/gitops` → `apps/dev/paperclip.yaml`, which points
   back at this repo's `kube/overlays/dev`

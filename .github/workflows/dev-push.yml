@@ -20,10 +20,12 @@ jobs:
         [
           { "name": "paperclip", "context": ".", "dockerfile": "./Dockerfile" }
         ]
-      # Intentionally NOT passing `registry:` — the org variable
-      # DOCKER_REGISTRY_HOST still points at the retired unauthenticated
-      # registry, which would send dev builds to the old host. Falling through
-      # to the reusable workflow default targets Harbor (mare-dev).
+      # Not passing `registry:` — the reusable workflow's default already
+      # targets Harbor's mare-dev project. The org variable
+      # DOCKER_REGISTRY_HOST now resolves to the same value
+      # (registry.mareanalytica.com/mare-dev), so either route lands in the
+      # same place; the default is kept so this build does not depend on an
+      # org-level setting.
     # The reusable workflow needs the Harbor push credentials; a called
     # workflow sees no caller secrets unless they are inherited.
     secrets: inherit
