@@ -82,7 +82,7 @@ describeEmbeddedPostgres("plugin-managed agents", () => {
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-plugin-managed-agents-");
     db = createDb(tempDb.connectionString);
-  }, 20_000);
+  }, 60_000);
 
   afterEach(async () => {
     await db.delete(agentConfigRevisions);

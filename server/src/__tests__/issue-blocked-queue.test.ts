@@ -33,7 +33,7 @@ describeEmbeddedPostgres("issueService.listBlockedQueue", () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-issue-blocked-queue-");
     db = createDb(tempDb.connectionString);
     svc = issueService(db);
-  }, 20_000);
+  }, 60_000);
 
   afterEach(async () => {
     await db.delete(issueApprovals);

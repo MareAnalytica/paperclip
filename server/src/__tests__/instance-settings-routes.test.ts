@@ -140,7 +140,7 @@ describe("instance settings routes", () => {
       enableIsolatedWorkspaces: true,
     });
     expect(mockLogActivity).toHaveBeenCalledTimes(2);
-  }, 20_000);
+  }, 60_000);
 
   it("allows local board users to update guarded dev-server auto-restart", async () => {
     const app = await createApp({

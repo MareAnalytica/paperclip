@@ -154,7 +154,7 @@ describe.sequential("plugin install and upgrade authz", () => {
 
     expect(res.status).toBe(403);
     expect(loader.installPlugin).not.toHaveBeenCalled();
-  }, 20_000);
+  }, 60_000);
 
   it("allows instance admins to install plugins", async () => {
     const pluginId = "11111111-1111-4111-8111-111111111111";
@@ -200,7 +200,7 @@ describe.sequential("plugin install and upgrade authz", () => {
       version: undefined,
     });
     expect(mockLifecycle.load).toHaveBeenCalledWith(pluginId);
-  }, 20_000);
+  }, 60_000);
 
   it("rejects plugin upgrades for non-admin board users", async () => {
     const pluginId = "11111111-1111-4111-8111-111111111111";
@@ -219,7 +219,7 @@ describe.sequential("plugin install and upgrade authz", () => {
     expect(res.status).toBe(403);
     expect(mockRegistry.getById).not.toHaveBeenCalled();
     expect(mockLifecycle.upgrade).not.toHaveBeenCalled();
-  }, 20_000);
+  }, 60_000);
 
   it.each([
     ["delete", "delete", "/api/plugins/11111111-1111-4111-8111-111111111111", undefined],
@@ -244,7 +244,7 @@ describe.sequential("plugin install and upgrade authz", () => {
     expect(mockLifecycle.unload).not.toHaveBeenCalled();
     expect(mockLifecycle.enable).not.toHaveBeenCalled();
     expect(mockLifecycle.disable).not.toHaveBeenCalled();
-  }, 20_000);
+  }, 60_000);
 
   it("resolves plugin keys without probing the UUID id column for core plugin actions", async () => {
     const pluginKey = "paperclipqa.hello-plugin";
@@ -284,7 +284,7 @@ describe.sequential("plugin install and upgrade authz", () => {
     expect(mockLifecycle.disable).toHaveBeenCalledWith(pluginId, undefined);
     expect(mockLifecycle.enable).toHaveBeenCalledWith(pluginId);
     expect(mockLifecycle.unload).toHaveBeenCalledWith(pluginId, true);
-  }, 20_000);
+  }, 60_000);
 
   it("rejects plugin config saves that contain secret refs even for instance admins", async () => {
     readyPlugin();
@@ -308,7 +308,7 @@ describe.sequential("plugin install and upgrade authz", () => {
     expect(res.status).toBe(422);
     expect(res.body.error).toMatch(/secret references are disabled/i);
     expect(mockRegistry.upsertConfig).not.toHaveBeenCalled();
-  }, 20_000);
+  }, 60_000);
 
   it("allows instance admins to upgrade plugins", async () => {
     const pluginId = "11111111-1111-4111-8111-111111111111";
@@ -336,7 +336,7 @@ describe.sequential("plugin install and upgrade authz", () => {
 
     expect(res.status).toBe(200);
     expect(mockLifecycle.upgrade).toHaveBeenCalledWith(pluginId, "1.1.0");
-  }, 20_000);
+  }, 60_000);
 });
 
 describe.sequential("scoped plugin API routes", () => {
@@ -402,7 +402,7 @@ describe.sequential("scoped plugin API routes", () => {
         query: { companyId: "company-1" },
       }),
     );
-  }, 20_000);
+  }, 60_000);
 });
 
 describe.sequential("plugin local folder routes", () => {

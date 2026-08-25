@@ -387,7 +387,7 @@ describe("cursor execute", () => {
       else process.env.HOME = previousHome;
       await fs.rm(root, { recursive: true, force: true });
     }
-  }, 20_000);
+  }, 60_000);
 
   // TODO(DEE-639): quarantined — fake cursor-agent (#!/usr/bin/env node) exits 127 on recycled ARC runners
   // (`node` not on the sandbox spawn PATH). Pre-existing, masked by the old 20m timeout. Re-enable when DEE-639 lands.

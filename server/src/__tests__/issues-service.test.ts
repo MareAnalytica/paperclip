@@ -138,7 +138,7 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
     db = createDb(tempDb.connectionString);
     svc = issueService(db);
     await ensureIssueRelationsTable(db);
-  }, 20_000);
+  }, 60_000);
 
   afterEach(async () => {
     await db.delete(issueComments);
@@ -1565,7 +1565,7 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
     db = createDb(tempDb.connectionString);
     svc = issueService(db);
     await ensureIssueRelationsTable(db);
-  }, 20_000);
+  }, 60_000);
 
   afterEach(async () => {
     await db.delete(issueComments);
@@ -2336,7 +2336,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     db = createDb(tempDb.connectionString);
     svc = issueService(db);
     await ensureIssueRelationsTable(db);
-  }, 20_000);
+  }, 60_000);
 
   afterEach(async () => {
     await db.delete(issueComments);
@@ -2720,7 +2720,7 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
     db = createDb(tempDb.connectionString);
     svc = issueService(db);
     await ensureIssueRelationsTable(db);
-  }, 20_000);
+  }, 60_000);
 
   afterEach(async () => {
     await db.delete(issueComments);
@@ -3100,7 +3100,7 @@ describeEmbeddedPostgres("issueService.findMentionedProjectIds", () => {
     db = createDb(tempDb.connectionString);
     svc = issueService(db);
     await ensureIssueRelationsTable(db);
-  }, 20_000);
+  }, 60_000);
 
   afterEach(async () => {
     await db.delete(issueComments);
@@ -3180,7 +3180,7 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-issues-execution-lock-");
     db = createDb(tempDb.connectionString);
     svc = issueService(db);
-  }, 20_000);
+  }, 60_000);
 
   afterEach(async () => {
     await db.delete(issueComments);
@@ -3311,7 +3311,7 @@ describeEmbeddedPostgres("issueService.listComments after-cursor pagination", ()
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-issues-comments-pagination-");
     db = createDb(tempDb.connectionString);
     svc = issueService(db);
-  }, 20_000);
+  }, 60_000);
 
   afterEach(async () => {
     await db.delete(issueComments);

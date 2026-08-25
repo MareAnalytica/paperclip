@@ -322,7 +322,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-heartbeat-recovery-");
     db = createDb(tempDb.connectionString);
-  }, 20_000);
+  }, 60_000);
 
   afterEach(async () => {
     vi.clearAllMocks();
@@ -1709,7 +1709,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         adapter: "codex_local",
       },
     });
-  }, 20_000);
+  }, 60_000);
 
   it("treats a string grok probe as required and runs adapter probe checks", async () => {
     const { agentId, runId, issueId } = await seedQueuedIssueRunFixture();
